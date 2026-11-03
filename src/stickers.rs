@@ -185,6 +185,20 @@ impl Service {
         if let Some(data) = stored.data {
             return Ok(data);
         }
+        // History/demo stickers may already be in the message media archive
+        // before the catalog has its own cached copy. This also works offline.
+        if !stored.chat.is_empty()
+            && let Some(data) = self
+                .archive
+                .media(
+                    stored.chat.clone(),
+                    stored.sender.clone(),
+                    stored.id.clone(),
+                )
+                .await?
+        {
+            return Ok(data);
+        }
         let proto = wa::Message::decode_from_slice(&stored.encoded)?;
         let sticker = proto
             .sticker_message
