@@ -1,0 +1,16 @@
+# Local upstream source checkouts used by project skills.
+/.references/
+/target/
+/dist/
+/.build-deps/
+/.local/
+*.db
+*.db-wal
+*.db-shm
+*.log
+/instance.json
+/service.lock
+/desktop.lock
+/.brazap-demo
+/cache/
+/logs/

@@ -1,0 +1,9 @@
+CREATE TABLE IF NOT EXISTS brazap_stickers (
+    account INTEGER NOT NULL, hash TEXT NOT NULL, encoded BLOB NOT NULL,
+    label TEXT NOT NULL DEFAULT '', emojis TEXT NOT NULL DEFAULT '',
+    favorite INTEGER NOT NULL DEFAULT 0, recent_at INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL DEFAULT 0,
+    from_me INTEGER NOT NULL DEFAULT 0, chat TEXT NOT NULL DEFAULT '', sender TEXT NOT NULL DEFAULT '', id TEXT NOT NULL DEFAULT '',
+    data BLOB, PRIMARY KEY(account,hash)
+);
+INSERT OR IGNORE INTO brazap_schema(version) VALUES(11);

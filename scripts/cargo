@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$project_root"
+
+# Build from the pinned upstream source plus Brazap's small GPU-memory patch.
+# This does not modify the read-only references used for source consultation.
+"$project_root/scripts/prepare-rune"
+
+# Use the optional, ignored development toolchain on minimal Linux hosts.
+# Ordinary developer machines use their installed compiler and pkg-config.
+if [[ -x .build-deps/cc && -x .build-deps/root/usr/bin/pkgconf ]]; then
+    export CC="$project_root/.build-deps/cc"
+    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$CC"
+    export LD_LIBRARY_PATH="$project_root/.build-deps/root/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export PKG_CONFIG="$project_root/.build-deps/root/usr/bin/pkgconf"
+    export PKG_CONFIG_SYSROOT_DIR="$project_root/.build-deps/root"
+    export PKG_CONFIG_LIBDIR="$project_root/.build-deps/root/usr/lib/x86_64-linux-gnu/pkgconfig"
+fi
+
+exec cargo "$@"

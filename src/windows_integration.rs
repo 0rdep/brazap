@@ -1,0 +1,292 @@
+//! Per-user Windows identity, window icons, and native toast delivery.
+use std::{
+    path::Path,
+    sync::{OnceLock, mpsc},
+};
+
+use anyhow::{Context, Result};
+use windows::{
+    Data::Xml::Dom::XmlDocument,
+    UI::Notifications::{ToastNotification, ToastNotificationManager},
+    Win32::{
+        Foundation::{HINSTANCE, HWND, LPARAM, PROPERTYKEY, WPARAM},
+        System::{
+            Com::{
+                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+                CoUninitialize, IPersistFile,
+                StructuredStorage::{InitPropVariantFromCLSID, PROPVARIANT},
+            },
+            LibraryLoader::GetModuleHandleW,
+            Registry::{
+                HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
+                RegCreateKeyExW, RegSetValueExW,
+            },
+            WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize},
+        },
+        UI::{
+            Shell::{
+                IShellLinkW, PropertiesSystem::IPropertyStore,
+                SetCurrentProcessExplicitAppUserModelID, ShellLink,
+            },
+            WindowsAndMessaging::{IMAGE_ICON, LR_SHARED, LoadImageW, SendMessageW, WM_SETICON},
+        },
+    },
+    core::{GUID, HSTRING, Interface, PCWSTR},
+};
+
+const APP_ID: &str = "Brazap.Desktop";
+const APP_ID_KEY: PROPERTYKEY = PROPERTYKEY {
+    fmtid: GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3),
+    pid: 5,
+};
+const ACTIVATOR_KEY: PROPERTYKEY = PROPERTYKEY {
+    fmtid: APP_ID_KEY.fmtid,
+    pid: 26,
+};
+// Protocol-only activation uses a stub identity to retain toasts in Action Center.
+const ACTIVATOR: GUID = GUID::from_u128(0xc50284da_78b7_45b0_a68d_c89fc01edc21);
+static NOTIFIER: OnceLock<mpsc::SyncSender<(String, String, String, bool)>> = OnceLock::new();
+
+fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    value.as_ref().encode_wide().chain(Some(0)).collect()
+}
+
+pub fn initialize(config: &crate::config::Config) {
+    unsafe {
+        if let Err(error) = SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(APP_ID)) {
+            log::warn!("Could not set Windows application identity: {error}");
+        }
+    }
+    NOTIFIER.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel::<(String, String, String, bool)>(32);
+        let config = config.clone();
+        std::thread::spawn(move || {
+            procwatch::alloc::tag_thread("Windows notifications");
+            if let Err(error) = register(&config) {
+                log::warn!("Windows notification registration failed: {error:#}");
+                return;
+            }
+            if let Err(error) = unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
+                log::warn!("Windows notification runtime failed: {error}");
+                return;
+            }
+            for (title, preview, chat, sound) in receiver {
+                if let Err(error) = show(&config, &title, &preview, &chat, sound) {
+                    log::warn!("Could not show Windows notification: {error:#}");
+                }
+            }
+            unsafe {
+                RoUninitialize();
+            }
+        });
+        sender
+    });
+}
+
+pub fn is_foreground(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let window = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+        let mut foreground = 0;
+        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+            window,
+            Some(&mut foreground),
+        );
+        foreground == pid
+    }
+}
+
+pub fn notify(title: String, preview: String, chat: String, sound: bool) {
+    if let Some(sender) = NOTIFIER.get() {
+        if let Err(error) = sender.try_send((title, preview, chat, sound)) {
+            log::warn!("Windows notification queue unavailable: {error}");
+        }
+    }
+}
+
+pub fn set_window_icon(window: &rune::WindowHandle) {
+    let _ = window.with_raw_handle(|handle| {
+        if let rune::raw_window_handle::RawWindowHandle::Win32(handle) = handle.as_raw() {
+            // Shared resource icons are owned by the module, and live as long as the process.
+            unsafe {
+                let Ok(module) = GetModuleHandleW(None) else {
+                    return;
+                };
+                for (kind, size) in [(0usize, 32), (1, 64)] {
+                    if let Ok(icon) = LoadImageW(
+                        Some(HINSTANCE(module.0)),
+                        PCWSTR(1usize as *const u16),
+                        IMAGE_ICON,
+                        size,
+                        size,
+                        LR_SHARED,
+                    ) {
+                        SendMessageW(
+                            HWND(handle.hwnd.get() as *mut _),
+                            WM_SETICON,
+                            Some(WPARAM(kind)),
+                            Some(LPARAM(icon.0 as isize)),
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+pub fn allow_activation(pid: u32) {
+    // A protocol launch may transfer its foreground permission to the existing UI.
+    if pid != 0 {
+        let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(pid) };
+    }
+}
+
+fn registry_value(path: &str, name: &str, value: &str) -> Result<()> {
+    let mut key = HKEY::default();
+    unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            &HSTRING::from(path),
+            None,
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut key,
+            None,
+        )
+        .ok()?;
+        let data: Vec<u8> = wide(value).into_iter().flat_map(u16::to_le_bytes).collect();
+        let result = RegSetValueExW(key, &HSTRING::from(name), None, REG_SZ, Some(&data)).ok();
+        let _ = RegCloseKey(key);
+        result?;
+    }
+    Ok(())
+}
+
+fn register(config: &crate::config::Config) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let icon = config.data_dir.join("notification-logo.png");
+    let bytes = include_bytes!(concat!(env!("OUT_DIR"), "/notification-logo.png"));
+    if std::fs::read(&icon).ok().as_deref() != Some(bytes) {
+        std::fs::write(&icon, bytes)?;
+    }
+    let app_key = format!("Software\\Classes\\AppUserModelId\\{APP_ID}");
+    registry_value(&app_key, "DisplayName", "Brazap")?;
+    registry_value(&app_key, "IconUri", &icon.to_string_lossy())?;
+    registry_value("Software\\Classes\\brazap", "", "URL:Brazap")?;
+    registry_value("Software\\Classes\\brazap", "URL Protocol", "")?;
+    registry_value(
+        "Software\\Classes\\brazap\\DefaultIcon",
+        "",
+        &format!("\"{}\",0", exe.display()),
+    )?;
+    registry_value(
+        "Software\\Classes\\brazap\\shell\\open\\command",
+        "",
+        &format!(
+            "\"{}\" --open-chat \"%1\" --data-dir \"{}\"",
+            exe.display(),
+            config.data_dir.display()
+        ),
+    )?;
+    let programs = std::env::var_os("APPDATA").context("Missing Windows APPDATA directory")?;
+    let shortcut = Path::new(&programs).join("Microsoft/Windows/Start Menu/Programs/Brazap.lnk");
+    std::fs::create_dir_all(shortcut.parent().unwrap())?;
+    // A dedicated thread owns this STA and all its shell interfaces.
+    unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+        let result = (|| -> Result<()> {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+            link.SetPath(PCWSTR(wide(&exe).as_ptr()))?;
+            link.SetWorkingDirectory(PCWSTR(wide(exe.parent().unwrap()).as_ptr()))?;
+            link.SetIconLocation(PCWSTR(wide(&exe).as_ptr()), 0)?;
+            link.SetArguments(&HSTRING::from(format!(
+                "--data-dir \"{}\"",
+                config.data_dir.display()
+            )))?;
+            let properties: IPropertyStore = link.cast()?;
+            properties.SetValue(&APP_ID_KEY, &PROPVARIANT::from(APP_ID))?;
+            properties.SetValue(&ACTIVATOR_KEY, &InitPropVariantFromCLSID(&ACTIVATOR)?)?;
+            properties.Commit()?;
+            let file: IPersistFile = link.cast()?;
+            file.Save(PCWSTR(wide(&shortcut).as_ptr()), true)?;
+            Ok(())
+        })();
+        CoUninitialize();
+        result?;
+    }
+    Ok(())
+}
+
+fn xml(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| *c >= ' ' || matches!(c, '\n' | '\r' | '\t'))
+        .collect::<String>()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn show(
+    config: &crate::config::Config,
+    title: &str,
+    preview: &str,
+    chat: &str,
+    sound: bool,
+) -> Result<()> {
+    let image = config.data_dir.join("notification-logo.png");
+    let document = XmlDocument::new()?;
+    document.LoadXml(&HSTRING::from(format!(
+        "<toast activationType=\"protocol\" launch=\"brazap://chat/{}\"><visual><binding template=\"ToastGeneric\"><image placement=\"appLogoOverride\" hint-crop=\"circle\" src=\"{}\"/><text>{}</text><text>{}</text></binding></visual>{}</toast>",
+        xml(chat), xml(&image.to_string_lossy()), xml(title), xml(preview), if sound { "<audio src=\"ms-winsoundevent:Notification.IM\"/>" } else { "<audio silent=\"true\"/>" }
+    )))?;
+    let notification = ToastNotification::CreateToastNotification(&document)?;
+    notification.SetTag(&HSTRING::from(
+        &blake3::hash(chat.as_bytes()).to_hex()[..16],
+    ))?;
+    notification.SetGroup(&HSTRING::from("messages"))?;
+    if preview == "Notifications are ready. Click to open your chat." {
+        notification.SetTag(&HSTRING::from("local-preview"))?;
+    }
+    // Keep one current notification per conversation instead of stacking a burst.
+    ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID))?
+        .Show(&notification)?;
+    Ok(())
+}
+
+/// A local preview exercises Windows delivery without sending a WhatsApp message.
+pub fn preview(config: &crate::config::Config, chat: &str) -> Result<()> {
+    register(config)?;
+    unsafe {
+        RoInitialize(RO_INIT_MULTITHREADED)?;
+    }
+    let result = show(
+        config,
+        "Brazap",
+        "Notifications are ready. Click to open your chat.",
+        chat,
+        true,
+    );
+    if result.is_ok() {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        println!(
+            "Notification setting: {:?}; retained notifications: {}",
+            ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID))?
+                .Setting()?,
+            ToastNotificationManager::History()?
+                .GetHistoryWithId(&HSTRING::from(APP_ID))?
+                .Size()?
+        );
+    }
+    unsafe {
+        RoUninitialize();
+    }
+    result
+}

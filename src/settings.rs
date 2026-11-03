@@ -1,0 +1,285 @@
+use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+
+use crate::{service::Service, storage::Archive};
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    pub notifications: NotificationSettings,
+    pub privacy: PrivacySettings,
+    pub appearance: AppearanceSettings,
+    pub updates: UpdateSettings,
+}
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            notifications: Default::default(),
+            privacy: Default::default(),
+            appearance: Default::default(),
+            updates: Default::default(),
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationSettings {
+    pub enabled: bool,
+    pub sound: bool,
+    pub preview: bool,
+}
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sound: true,
+            preview: true,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrivacySettings {
+    pub retain_deleted: bool,
+    pub send_read_receipts: bool,
+    pub send_typing: bool,
+    pub show_online: bool,
+}
+impl Default for PrivacySettings {
+    fn default() -> Self {
+        Self {
+            retain_deleted: true,
+            send_read_receipts: true,
+            send_typing: true,
+            show_online: true,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppearanceSettings {
+    pub font: String,
+    pub font_size: u8,
+    pub language: String,
+}
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        Self {
+            font: "system".into(),
+            font_size: 13,
+            language: "en".into(),
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateSettings {
+    pub automatic: bool,
+}
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self { automatic: true }
+    }
+}
+
+impl Settings {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (11..=19).contains(&self.appearance.font_size),
+            "Font size must be between 11 and 19"
+        );
+        ensure!(
+            ["system", "Inter", "Segoe UI", "Arial", "monospace"]
+                .contains(&self.appearance.font.as_str()),
+            "Unsupported font"
+        );
+        ensure!(
+            ["en", "pt-BR", "es"].contains(&self.appearance.language.as_str()),
+            "Unsupported language"
+        );
+        Ok(())
+    }
+}
+
+impl Archive {
+    pub async fn app_settings(&self) -> Result<Settings> {
+        self.preference("app_settings".into())
+            .await?
+            .map(|s| serde_json::from_str(&s).context("Read app settings"))
+            .transpose()
+            .map(|s| s.unwrap_or_default())
+    }
+}
+
+impl Service {
+    pub async fn settings_view(&self) -> Result<Value> {
+        Ok(
+            json!({"settings": self.settings.read().await.clone(), "storage": self.archive.storage_usage(&self.config).await?, "updates": self.updates.read().await.clone()}),
+        )
+    }
+    pub async fn save_settings(&self, value: Settings) -> Result<()> {
+        value.validate()?;
+        let previous = self.settings.read().await.clone();
+        self.archive
+            .set_preference("app_settings".into(), serde_json::to_string(&value)?)
+            .await?;
+        *self.settings.write().await = value.clone();
+        if let Some(client) = self.client.read().await.clone() {
+            use whatsapp_rust::PresencePolicy;
+            client.set_presence_policy(if value.privacy.show_online {
+                PresencePolicy::Automatic
+            } else {
+                PresencePolicy::Manual
+            });
+            if previous.privacy.show_online != value.privacy.show_online
+                && self.connection.read().await.phase == crate::model::Phase::Connected
+            {
+                let result = if value.privacy.show_online {
+                    client.presence().set_available().await
+                } else {
+                    client.presence().set_unavailable().await
+                };
+                if let Err(error) = result {
+                    log::warn!("Could not update online presence: {error}");
+                }
+            }
+        }
+        self.changed();
+        Ok(())
+    }
+    pub async fn whatsapp_privacy(&self) -> Result<BTreeMap<String, String>> {
+        if self.config.demo {
+            return self
+                .archive
+                .preference("demo_privacy".into())
+                .await?
+                .map(|value| serde_json::from_str(&value).map_err(Into::into))
+                .unwrap_or_else(|| {
+                    Ok([
+                        ("last", "contacts"),
+                        ("online", "match_last_seen"),
+                        ("profile", "contacts"),
+                        ("groupadd", "contacts"),
+                        ("readreceipts", "all"),
+                    ]
+                    .into_iter()
+                    .map(|(k, v)| (k.into(), v.into()))
+                    .collect())
+                });
+        }
+        let response = self.connected().await?.fetch_privacy_settings().await?;
+        Ok(response
+            .settings
+            .into_iter()
+            .map(|s| (s.category.as_str().to_owned(), s.value.as_str().to_owned()))
+            .collect())
+    }
+    pub async fn set_whatsapp_privacy(&self, category: &str, value: &str) -> Result<()> {
+        use whatsapp_rust::wacore::iq::privacy::{PrivacyCategory, PrivacyValue};
+        let category: PrivacyCategory = category.into();
+        let value: PrivacyValue = value.into();
+        ensure!(
+            !matches!(category, PrivacyCategory::Other(_))
+                && !matches!(value, PrivacyValue::Other(_))
+                && category.is_valid_value(&value),
+            "Unsupported WhatsApp privacy setting"
+        );
+        ensure!(
+            !matches!(value, PrivacyValue::ContactBlacklist),
+            "Manage contact exclusions on your phone; existing lists are preserved"
+        );
+        if self.config.demo {
+            let mut settings = self.whatsapp_privacy().await?;
+            settings.insert(category.as_str().into(), value.as_str().into());
+            self.archive
+                .set_preference("demo_privacy".into(), serde_json::to_string(&settings)?)
+                .await?;
+            self.changed();
+            return Ok(());
+        }
+        self.connected()
+            .await?
+            .set_privacy_setting(category, value)
+            .await?;
+        self.changed();
+        Ok(())
+    }
+    pub async fn typing(&self, chat: &str, active: bool) -> Result<()> {
+        if self.config.demo {
+            return Ok(());
+        }
+        if !self.settings.read().await.privacy.send_typing {
+            return Ok(());
+        }
+        let client = self.connected().await?;
+        let jid = chat.parse()?;
+        if active {
+            client.chatstate().send_composing(&jid).await?;
+        } else {
+            client.chatstate().send_paused(&jid).await?;
+        }
+        Ok(())
+    }
+    pub async fn request_logout(&self) -> Result<()> {
+        let _ = self.connected().await?;
+        let (send, receive) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = self.logout_request.lock().await;
+            ensure!(
+                !self
+                    .logout_in_progress
+                    .swap(true, std::sync::atomic::Ordering::AcqRel),
+                "Logout is already in progress"
+            );
+            *pending = Some(send);
+        }
+        self.restart.notify_one();
+        receive
+            .await
+            .context("The connection stopped during logout")?
+            .map_err(anyhow::Error::msg)
+    }
+}
+
+impl Service {
+    pub async fn mark_chat_read(&self, chat: String) -> Result<()> {
+        let chat = self.archive.canonical_chat(&chat).await?;
+        let unread = self
+            .archive
+            .chats()
+            .await?
+            .into_iter()
+            .find(|c| c.jid == chat)
+            .map_or(0, |c| c.unread);
+        if unread > 0 && self.settings.read().await.privacy.send_read_receipts {
+            if let Ok(client) = self.connected().await {
+                let messages = self
+                    .archive
+                    .messages(chat.clone(), unread.min(500) as usize, None)
+                    .await?;
+                let jid: whatsapp_rust::Jid = chat.parse()?;
+                let mut groups = BTreeMap::<String, Vec<String>>::new();
+                for message in messages.into_iter().filter(|m| !m.from_me && m.visible()) {
+                    groups.entry(message.sender).or_default().push(message.id);
+                }
+                for (sender, ids) in groups {
+                    let participant = if chat.ends_with("@g.us") {
+                        Some(sender.parse::<whatsapp_rust::Jid>()?)
+                    } else {
+                        None
+                    };
+                    client
+                        .mark_as_read(
+                            &jid,
+                            participant.as_ref(),
+                            &ids.iter().map(String::as_str).collect::<Vec<_>>(),
+                        )
+                        .await?;
+                }
+            }
+        }
+        self.archive.mark_read(chat).await
+    }
+}

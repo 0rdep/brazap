@@ -1,0 +1,6 @@
+# scripts/prepare-rune materializes the pinned source and applies the tracked
+# patch. No upstream source is vendored or copied into the reference checkouts.
+[patch."https://github.com/anomalyco/rune"]
+rune = { path = ".build-deps/rune/crates/rune" }
+rune-kit = { path = ".build-deps/rune/crates/rune-kit" }
+procwatch = { path = ".build-deps/rune/crates/procwatch" }

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$project_root"
+
+if [[ -x .build-deps/root/usr/bin/x86_64-w64-mingw32-dlltool ]]; then
+    export PATH="$project_root/.build-deps/root/usr/bin:$PATH"
+fi
+
+windows_cc="${BRAZAP_WINDOWS_CC:-$(command -v x86_64-w64-mingw32-gcc || true)}"
+if [[ -z "$windows_cc" && -x .build-deps/windows-cc ]]; then
+    windows_cc="$project_root/.build-deps/windows-cc"
+fi
+if [[ ! -x "$windows_cc" ]]; then
+    echo 'Install the MinGW-w64 C toolchain or set BRAZAP_WINDOWS_CC to its compiler.' >&2
+    exit 1
+fi
+
+export CC_x86_64_pc_windows_gnu="$windows_cc"
+export AR_x86_64_pc_windows_gnu="${AR_x86_64_pc_windows_gnu:-$(command -v x86_64-w64-mingw32-ar || command -v ar)}"
+export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="$CC_x86_64_pc_windows_gnu"
+
+exec ./scripts/cargo build --target x86_64-pc-windows-gnu "$@"

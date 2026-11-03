@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+source_dir="$project_root/.build-deps/rune"
+patch_file="$project_root/patches/rune-low-memory.patch"
+revision="$(tr -d '\r\n' < "$project_root/patches/rune.rev")"
+origin='https://github.com/anomalyco/rune'
+patch_hash="$(git hash-object "$patch_file")"
+stamp="$source_dir/.git/brazap-patch"
+
+if [[ ! "$revision" =~ ^[a-f0-9]{40}$ ]]; then
+    echo 'The Rune patch revision must match the pinned Cargo.toml dependency.' >&2
+    exit 1
+fi
+while IFS= read -r dependency; do
+    if [[ "$dependency" != *"rev = \"$revision\""* ]]; then
+        echo 'Update every Rune-family manifest pin and patches/rune.rev together.' >&2
+        exit 1
+    fi
+done < <(grep -E '^(rune|rune-kit|procwatch) = ' "$project_root/Cargo.toml")
+
+if [[ ! -d "$source_dir/.git" ]]; then
+    if [[ -e "$source_dir" ]]; then
+        echo "Preserving unexpected files at $source_dir; move them before preparing Rune." >&2
+        exit 1
+    fi
+    mkdir -p "$source_dir"
+    git -C "$source_dir" init --quiet
+    git -C "$source_dir" config core.autocrlf false
+    git -C "$source_dir" remote add origin "$origin"
+fi
+if [[ "$(git -C "$source_dir" remote get-url origin)" != "$origin" ]]; then
+    echo "Unexpected Rune build-source origin at $source_dir" >&2
+    exit 1
+fi
+if [[ -n "$(git -C "$source_dir" ls-files --others --exclude-standard)" ]]; then
+    echo "Preserving untracked files in $source_dir; move them before preparing Rune." >&2
+    exit 1
+fi
+
+if [[ -f "$stamp" ]]; then
+    read -r old_revision old_patch old_diff < "$stamp"
+    current_diff="$(git -C "$source_dir" diff --binary HEAD | git hash-object --stdin)"
+    if [[ "$(git -C "$source_dir" rev-parse HEAD)" != "$old_revision" || "$current_diff" != "$old_diff" || -n "$(git -C "$source_dir" diff --cached --name-only)" ]]; then
+        echo "Preserving modified Rune build sources at $source_dir; move them before preparing Rune." >&2
+        exit 1
+    fi
+    if [[ "$old_revision" == "$revision" && "$old_patch" == "$patch_hash" ]]; then
+        exit 0
+    fi
+    git -C "$source_dir" apply --reverse "$stamp.patch"
+elif git -C "$source_dir" rev-parse --verify HEAD >/dev/null 2>&1 && [[ -n "$(git -C "$source_dir" status --porcelain)" ]]; then
+    echo "Preserving modified Rune build sources at $source_dir" >&2
+    exit 1
+fi
+
+if ! git -C "$source_dir" cat-file -e "$revision^{commit}" 2>/dev/null; then
+    git -C "$source_dir" fetch --quiet --depth 1 origin "$revision"
+fi
+git -C "$source_dir" checkout --quiet --detach "$revision"
+git -C "$source_dir" apply --check "$patch_file"
+git -C "$source_dir" apply "$patch_file"
+cp "$patch_file" "$stamp.patch"
+new_diff="$(git -C "$source_dir" diff --binary HEAD | git hash-object --stdin)"
+printf '%s %s %s\n' "$revision" "$patch_hash" "$new_diff" > "$stamp"

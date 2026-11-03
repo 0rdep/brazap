@@ -1,0 +1,1541 @@
+mod actions;
+mod animation;
+mod audio;
+mod details;
+mod diagnostics;
+mod locale;
+mod mcp;
+mod media;
+mod picker;
+mod preferences;
+mod render;
+mod sidebar;
+mod times;
+mod view;
+
+use crate::playback as video;
+
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::{Arc, mpsc},
+    time::Duration,
+};
+
+use anyhow::Result;
+use rune::{App, AppSpec, Image, ImageCache, TextEdit, Tx, Waker};
+use serde_json::{Value, json};
+
+use crate::{
+    assets::AssetRequest,
+    config::Config,
+    ipc,
+    model::{
+        Chat, MediaPage, Message, MessageCursor, MessagePage, SearchHit, SearchResults, Snapshot,
+    },
+};
+
+static IMAGE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IMAGE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static MESSAGE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static VIDEO_STATUS: std::sync::Mutex<Option<video::Status>> = std::sync::Mutex::new(None);
+static VOICE_STATUS: std::sync::Mutex<Option<video::Status>> = std::sync::Mutex::new(None);
+
+pub(crate) fn memory_report() -> Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    json!({"renderer":render::report(),"decoded_image_estimate_bytes":IMAGE_BYTES.load(Relaxed),"image_count":IMAGE_COUNT.load(Relaxed),"timeline_messages":MESSAGE_COUNT.load(Relaxed),"video":VIDEO_STATUS.lock().unwrap_or_else(|e|e.into_inner()).clone(),"voice":VOICE_STATUS.lock().unwrap_or_else(|e|e.into_inner()).clone(),"sticker_animations":animation::report()})
+}
+
+enum Command {
+    Start,
+    Search(String),
+    Stickers(bool),
+    RememberEmoji(String),
+    Jump(Message, u64),
+    Gallery(String, String, Option<MessageCursor>),
+    Prefetch(String, Vec<(String, String)>),
+    Asset(String, AssetRequest),
+    Video(u64, Message),
+    Audio(u64, Message),
+    Preferences(&'static str, Value),
+    Diagnostics,
+    Select(String),
+    Tool(&'static str, Value),
+    Send(String, String, Option<MessageCursor>),
+    Forward(String, String, Vec<MessageCursor>),
+    Open(String),
+    Older(String, MessageCursor, u64),
+    Newer(String, MessageCursor, u64),
+}
+enum Event {
+    Activate(Option<String>),
+    Snapshot(Snapshot),
+    Search(String, Result<SearchResults, String>),
+    Stickers(bool, Result<Value, String>),
+    Jump(Message, u64, Result<MessagePage, String>),
+    Gallery(String, String, Result<MediaPage, String>),
+    Asset(String, Result<Option<Vec<u8>>, String>),
+    Video(u64, Result<tempfile::TempPath, String>),
+    Audio(u64, Result<tempfile::TempPath, String>),
+    Preferences(&'static str, Result<Value, String>),
+    Diagnostics(Result<Value, String>),
+    Done(Result<Value, String>),
+    Sent(String, String, Option<String>, Result<(), String>),
+    Forward(Result<crate::model::ForwardResult, String>),
+    Opened(Result<String, String>),
+    Older(String, u64, Result<MessagePage, String>),
+    Newer(String, u64, Result<MessagePage, String>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Messages,
+    Calls,
+}
+
+pub(super) struct State {
+    config: Config,
+    preferences: preferences::Panel,
+    picker: picker::Panel,
+    contact: Option<Message>,
+    typing_text: String,
+    typing_sent_at: i64,
+    window: Arc<std::sync::Mutex<Option<rune::WindowHandle>>>,
+    reply: Option<Message>,
+    reaction_menu: Option<Message>,
+    reaction_text: TextEdit,
+    forwarding: Option<actions::Forwarding>,
+    voice: Option<audio::Voice>,
+    voice_generation: u64,
+    voice_next_tick: Option<f64>,
+    voice_rate: f64,
+    diagnostics: diagnostics::Panel,
+    section: Section,
+    sidebar: rune_kit::shell::PaneState,
+    search_results: SearchResults,
+    search_requested: String,
+    search_at: Option<f64>,
+    searching: bool,
+    history_focus: bool,
+    highlighted: Option<String>,
+    history_notice: Option<String>,
+    attachments_open: bool,
+    viewer: Option<Message>,
+    chat_bounds: [f32; 4],
+    viewer_generation: u64,
+    video: Option<video::Player>,
+    video_status: Option<video::Status>,
+    video_next_tick: Option<f64>,
+    video_error: Option<String>,
+    avatars: HashMap<String, Image>,
+    avatar_versions: HashMap<String, i64>,
+    images: HashMap<String, Image>,
+    animations: animation::Player,
+    image_sizes: HashMap<String, [u32; 2]>,
+    image_order: VecDeque<String>,
+    image_pending: HashSet<String>,
+    image_failures: HashMap<String, (i64, Option<String>)>,
+    logo: Option<Image>,
+    snapshot: Snapshot,
+    selected: Option<String>,
+    search: TextEdit,
+    draft: TextEdit,
+    phone: TextEdit,
+    address: TextEdit,
+    drafts: HashMap<String, String>,
+    phone_mode: bool,
+    new_chat: bool,
+    details: bool,
+    gallery: Vec<Message>,
+    gallery_kind: String,
+    gallery_next: Option<MessageCursor>,
+    gallery_loading: bool,
+    media_menu: Option<(String, Message)>,
+    detached: bool,
+    show_archived: bool,
+    visible_media: Vec<(String, String)>,
+    prefetched: HashSet<String>,
+    scroll_height: std::rc::Rc<std::cell::Cell<f32>>,
+    scroll_thumb: rune::Live<[f32; 4]>,
+    scroll_metrics: rune::Live<[f32; 2]>,
+    busy: bool,
+    authenticated: bool,
+    second: i64,
+    next_tick: Option<f64>,
+    timeline: Vec<crate::model::Message>,
+    loading_older: bool,
+    has_older: bool,
+    has_newer: bool,
+    loading_newer: bool,
+    history_generation: u64,
+    error: Option<String>,
+    tx: tokio::sync::mpsc::UnboundedSender<Command>,
+    rx: mpsc::Receiver<Event>,
+    image_cache: Option<ImageCache>,
+    qr: Option<Image>,
+    qr_payload: Option<String>,
+    wake: Arc<std::sync::Mutex<Option<Waker>>>,
+}
+
+pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
+    let window_title = if config.demo {
+        "Brazap — Demo"
+    } else {
+        "Brazap"
+    };
+    #[cfg(target_os = "windows")]
+    if !config.demo {
+        crate::windows_integration::initialize(&config);
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (events, incoming) = mpsc::channel();
+    let wake = Arc::new(std::sync::Mutex::new(None::<Waker>));
+    let thread_wake = wake.clone();
+    let ui_config = config.clone();
+    let worker = std::thread::Builder::new()
+        .name("brazap-service".into())
+        .spawn(move || {
+            procwatch::alloc::tag_thread("service");
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .on_thread_start(|| procwatch::alloc::tag_thread("async workers"))
+                .enable_all()
+                .build();
+            match runtime {
+                Ok(runtime) => {
+                    runtime.block_on(worker(config, rx, events, thread_wake, initial_chat))
+                }
+                Err(error) => {
+                    log::error!("Could not start application runtime: {error}");
+                }
+            }
+        })?;
+    let start = tx.clone();
+    let window = Arc::new(std::sync::Mutex::new(None));
+    let window_created = window.clone();
+    let state = State {
+        config: ui_config,
+        preferences: Default::default(),
+        picker: Default::default(),
+        contact: None,
+        typing_text: String::new(),
+        typing_sent_at: 0,
+        window,
+        reply: None,
+        reaction_menu: None,
+        reaction_text: TextEdit::new(""),
+        forwarding: None,
+        voice: None,
+        voice_generation: 0,
+        voice_next_tick: None,
+        voice_rate: 1.0,
+        diagnostics: diagnostics::Panel::default(),
+        section: Section::Messages,
+        sidebar: rune_kit::shell::PaneState::new(305.0).range(260.0, 440.0),
+        search_results: SearchResults::default(),
+        search_requested: String::new(),
+        search_at: None,
+        searching: false,
+        history_focus: false,
+        highlighted: None,
+        history_notice: None,
+        attachments_open: false,
+        viewer: None,
+        chat_bounds: [333.0, 16.0, 831.0, 768.0],
+        viewer_generation: 0,
+        video: None,
+        video_status: None,
+        video_next_tick: None,
+        video_error: None,
+        avatars: HashMap::new(),
+        avatar_versions: HashMap::new(),
+        images: HashMap::new(),
+        animations: Default::default(),
+        image_sizes: HashMap::new(),
+        image_order: VecDeque::new(),
+        image_pending: HashSet::new(),
+        image_failures: HashMap::new(),
+        logo: None,
+        snapshot: Snapshot::default(),
+        selected: None,
+        search: TextEdit::new(""),
+        draft: TextEdit::new(""),
+        phone: TextEdit::new(""),
+        address: TextEdit::new(""),
+        drafts: HashMap::new(),
+        phone_mode: false,
+        new_chat: false,
+        details: false,
+        gallery: Vec::new(),
+        gallery_kind: "media".into(),
+        gallery_next: None,
+        gallery_loading: false,
+        media_menu: None,
+        detached: false,
+        show_archived: false,
+        visible_media: Vec::new(),
+        prefetched: HashSet::new(),
+        scroll_height: std::rc::Rc::new(std::cell::Cell::new(1.0)),
+        scroll_thumb: rune::Live::new([0.0; 4]),
+        scroll_metrics: rune::Live::new([0.0; 2]),
+        busy: false,
+        authenticated: false,
+        second: crate::model::now(),
+        next_tick: None,
+        timeline: Vec::new(),
+        loading_older: false,
+        has_older: true,
+        has_newer: false,
+        loading_newer: false,
+        history_generation: 0,
+        error: None,
+        tx,
+        rx: incoming,
+        image_cache: None,
+        qr: None,
+        qr_payload: None,
+        wake,
+    };
+    let spec = AppSpec {
+        min_size: Some((860.0, 620.0)),
+        setup: Some(setup),
+        poll: Some(poll),
+        on_key: Some(on_key),
+        ..AppSpec::new(window_title, (1180.0, 800.0), unreachable_state, view::view)
+    };
+    App::new(spec)
+        .init(move || state)
+        .compositor(render::Renderer::default())
+        .on_window(move |handle| {
+            #[cfg(target_os = "windows")]
+            crate::windows_integration::set_window_icon(handle);
+            if let Ok(mut window) = window_created.lock() {
+                *window = Some(handle.clone());
+            }
+        })
+        .on_ready(move |_| {
+            let _ = start.send(Command::Start);
+        })
+        .try_run()
+        .map_err(|error| anyhow::anyhow!("Could not open the desktop window: {error}"))?;
+    // The window owns the last command sender; closing it asks the worker to flush its session.
+    let _ = worker.join();
+    Ok(())
+}
+
+fn unreachable_state() -> State {
+    unreachable!("App::init supplies the application state")
+}
+
+fn setup(state: &mut State, wake: Waker) {
+    let cache = ImageCache::new(wake.clone());
+    // The logo is displayed at 40 points; retaining its 1536-pixel source costs ~8 MiB.
+    state.logo = image::load_from_memory(include_bytes!("../../assets/logo.png"))
+        .ok()
+        .map(|image| {
+            let pixels = image.thumbnail(192, 192).into_rgba8();
+            cache.rgba(pixels.width(), pixels.height(), pixels.into_raw())
+        });
+    state.image_cache = Some(cache);
+    if let Ok(mut slot) = state.wake.lock() {
+        *slot = Some(wake);
+    }
+}
+
+fn emit(sender: &mpsc::Sender<Event>, wake: &Arc<std::sync::Mutex<Option<Waker>>>, event: Event) {
+    if sender.send(event).is_ok()
+        && let Ok(slot) = wake.lock()
+        && let Some(wake) = slot.as_ref()
+    {
+        wake();
+    }
+}
+
+async fn worker(
+    config: Config,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
+    events: mpsc::Sender<Event>,
+    wake: Arc<std::sync::Mutex<Option<Waker>>>,
+    initial_chat: Option<String>,
+) {
+    if !matches!(commands.recv().await, Some(Command::Start)) {
+        return;
+    }
+    let instance = match ipc::start_or_connect(config).await {
+        Ok(instance) => instance,
+        Err(error) => {
+            emit(&events, &wake, Event::Done(Err(format!("{error:#}"))));
+            return;
+        }
+    };
+    let remote = instance.remote.clone();
+    if let Some(chat) = initial_chat {
+        emit(&events, &wake, Event::Activate(Some(chat)));
+    }
+    let mut selected = None;
+    let avatar_slots = Arc::new(tokio::sync::Semaphore::new(2));
+    let media_slots = Arc::new(tokio::sync::Semaphore::new(4));
+    let mut assets = tokio::task::JoinSet::new();
+    let mut interval = tokio::time::interval(Duration::from_millis(700));
+    loop {
+        tokio::select! {
+            command=commands.recv()=>{
+                match command {
+                    None=>break,
+                    Some(Command::Start)=>continue,
+                    Some(Command::Gallery(chat,kind,cursor))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=remote.call("chat_media",json!({"chat":chat,"kind":kind,"cursor":cursor})).await.and_then(|v|Ok(serde_json::from_value(v)?)).map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Gallery(chat,kind,result));
+                        });continue;
+                    }
+                    Some(Command::Prefetch(chat,items))=>{
+                        let remote=remote.clone();
+                        assets.spawn(async move {if let Err(error)=remote.call("prepare_media",json!({"chat":chat,"items":items})).await{log::debug!("Could not prepare media: {error}");}});
+                        continue;
+                    }
+                    Some(Command::Search(query))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=remote.call("search",json!({"query":query})).await.and_then(|v|Ok(serde_json::from_value(v)?)).map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Search(query,result));
+                        });continue;
+                    }
+                    Some(Command::Jump(message, generation))=>{
+                        selected=Some(message.chat.clone());
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=remote.call("message_window",json!({"chat":message.chat,"sender":message.sender,"id":message.id})).await.and_then(|v|Ok(serde_json::from_value(v)?)).map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Jump(message,generation,result));
+                        });continue;
+                    }
+                    Some(Command::Stickers(sync))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {let result=remote.call("sticker_catalog",json!({"sync":sync})).await.map_err(|e|format!("{e:#}"));emit(&events,&wake,Event::Stickers(sync,result));});continue;
+                    }
+                    Some(Command::RememberEmoji(emoji))=>{
+                        let remote=remote.clone();assets.spawn(async move {let _=remote.call("remember_emoji",json!({"emoji":emoji})).await;});continue;
+                    }
+                    Some(Command::Asset(key,request))=>{
+                        let slots=if matches!(&request,AssetRequest::Avatar{..}|AssetRequest::Profile{..}) {avatar_slots.clone()} else {media_slots.clone()};
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let _permit=slots.acquire_owned().await;
+                            let result=remote.asset(request).await.map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Asset(key,result));
+                        });
+                        continue;
+                    },
+                    Some(Command::Video(generation,message))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=async {
+                                let file=tempfile::Builder::new().prefix("brazap-video-").suffix(".mp4").tempfile()?.into_temp_path();
+                                remote.call("save_attachment",json!({"chat":message.chat,"sender":message.sender,"id":message.id,"path":file.to_string_lossy()})).await?;
+                                Ok::<_,anyhow::Error>(file)
+                            }.await.map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Video(generation,result));
+                        });continue;
+                    }
+                    Some(Command::Audio(generation,message))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=async {
+                                let suffix=match message.mime.as_deref(){Some("audio/mpeg")=>".mp3",Some("audio/mp4")=>".m4a",Some("audio/wav")=>".wav",_=>".ogg"};
+                                let file=tempfile::Builder::new().prefix("brazap-audio-").suffix(suffix).tempfile()?.into_temp_path();
+                                remote.call("save_attachment",json!({"chat":message.chat,"sender":message.sender,"id":message.id,"path":file.to_string_lossy()})).await?;
+                                tokio::task::spawn_blocking(move||crate::playback::prepare_audio(file)).await?
+                            }.await.map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Audio(generation,result));
+                        });continue;
+                    }
+                    Some(Command::Preferences(action,args))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let method=match action {"get"=>"brazap/settings","save"=>"brazap/settings/save","privacy"=>"brazap/privacy","privacy_set"=>"brazap/privacy/set","clear"=>"brazap/cache/clear","logout"=>"brazap/logout","typing"=>"brazap/typing",_=>"brazap/updates"};
+                            let args=if action=="update_download"{json!({"download":true})}else{args};
+                            let mut result=remote.request(method,args).await.map_err(|e|format!("{e:#}"));
+                            if action=="privacy_set" && result.is_ok(){result=remote.request("brazap/privacy",json!({})).await.map_err(|e|format!("{e:#}"));}
+                            if action!="typing" {emit(&events,&wake,Event::Preferences(action,result));}
+                        });continue;
+                    }
+                    Some(Command::Diagnostics)=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=remote.request("brazap/diagnostics",json!({})).await.map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Diagnostics(result));
+                        });continue;
+                    }
+                    Some(Command::Select(chat))=>{
+                        selected=Some(chat.clone());
+                        if let Err(error)=remote.call("mark_read",json!({"chat":chat})).await {log::warn!("Could not mark local chat read: {error}");}
+                    }
+                    Some(Command::Tool(name,args))=>{
+                        let result=remote.call(name,args).await.map_err(|e|format!("{e:#}"));
+                        emit(&events,&wake,Event::Done(result));
+                    }
+                    Some(Command::Send(chat,text,reply))=>{
+                        let result=remote.call("send_message",json!({"chat":chat,"text":text,"reply_to":reply})).await.map(|_|()).map_err(|e|format!("{e:#}"));
+                        emit(&events,&wake,Event::Sent(chat,text,reply.map(|r|r.id),result));
+                    }
+                    Some(Command::Forward(source,destination,targets))=>{
+                        let result=remote.call("forward_messages",json!({"source":source,"destination":destination,"targets":targets})).await.and_then(|v|Ok(serde_json::from_value(v)?)).map_err(|e|format!("{e:#}"));
+                        emit(&events,&wake,Event::Forward(result));
+                    }
+                    Some(Command::Open(address))=>{
+                        let result=remote.call("open_chat",json!({"address":address})).await.and_then(|value|value["chat"].as_str().map(str::to_owned).ok_or_else(||anyhow::anyhow!("Missing chat address"))).map_err(|e|format!("{e:#}"));
+                        if let Ok(chat)=&result {selected=Some(chat.clone());}
+                        emit(&events,&wake,Event::Opened(result));
+                    }
+                    Some(Command::Newer(chat,cursor,generation))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=remote.call("newer_messages",json!({"chat":chat,"cursor":cursor})).await
+                                .and_then(|value|Ok(serde_json::from_value(value)?)).map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Newer(chat,generation,result));
+                        });continue;
+                    }
+                    Some(Command::Older(chat,cursor,generation))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=remote.call("older_messages",json!({"chat":chat,"cursor":cursor})).await
+                                .and_then(|value|Ok(serde_json::from_value(value)?)).map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Older(chat,generation,result));
+                        });continue;
+                    }
+                }
+                interval.reset_immediately();
+            }
+            Some(_)=assets.join_next(), if !assets.is_empty()=>{},
+            _=interval.tick()=>{
+                if let Ok(activation) = remote.request("brazap/desktop",json!({"pid":std::process::id(),"chat":selected})).await
+                    && activation["activate"].as_bool() == Some(true) {
+                    emit(&events,&wake,Event::Activate(activation["chat"].as_str().map(str::to_owned)));
+                }
+                match remote.snapshot(selected.as_deref()).await {
+                    Ok(snapshot)=>emit(&events,&wake,Event::Snapshot(snapshot)),
+                    Err(error)=>emit(&events,&wake,Event::Done(Err(format!("{error:#}")))),
+                }
+            }
+        }
+    }
+    assets.abort_all();
+    while assets.join_next().await.is_some() {}
+    if let Some(service) = instance.owned {
+        service.shutdown().await;
+    }
+}
+
+fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    IMAGE_BYTES.store(
+        state
+            .images
+            .values()
+            .chain(state.avatars.values())
+            .chain(state.logo.iter())
+            .chain(state.picker.images.values())
+            .filter_map(|image| image.size())
+            .map(|[w, h]| u64::from(w) * u64::from(h) * 16 / 3)
+            .sum::<u64>()
+            + animation::report()["estimated_bytes"].as_u64().unwrap_or(0),
+        Relaxed,
+    );
+    IMAGE_COUNT.store(
+        state.images.len() + state.avatars.len() + state.picker.images.len(),
+        Relaxed,
+    );
+    MESSAGE_COUNT.store(state.timeline.len(), Relaxed);
+    crate::diagnostics::IMAGE_TEXTURES.set(IMAGE_BYTES.load(Relaxed) as usize);
+    let mut changed = false;
+    while let Ok(event) = state.rx.try_recv() {
+        match event {
+            Event::Activate(chat) => {
+                if let Some(chat) = chat {
+                    state.select(chat);
+                }
+                if let Ok(window) = state.window.lock()
+                    && let Some(window) = window.as_ref()
+                {
+                    window.open();
+                }
+                changed = true;
+            }
+            Event::Preferences(action, result) => {
+                state.receive_preferences(action, result);
+                changed = true;
+            }
+            Event::Diagnostics(result) => {
+                state.diagnostics.receive(result);
+                changed = true;
+            }
+            Event::Snapshot(snapshot) => {
+                if snapshot.selected_chat != state.selected {
+                    let same_person = state.selected.as_ref().is_some_and(|old| {
+                        snapshot
+                            .current_chat
+                            .as_ref()
+                            .is_some_and(|chat| chat.matches_jid(old))
+                    });
+                    if !same_person {
+                        if snapshot.selected_chat.is_none()
+                            && state.selected.as_ref().is_some_and(|jid| {
+                                !snapshot.chats.iter().any(|chat| chat.matches_jid(jid))
+                            })
+                        {
+                            state.selected = None;
+                            state.timeline.clear();
+                            state.history_focus = false;
+                            state.history_generation = state.history_generation.wrapping_add(1);
+                            state.close_viewer();
+                            state.details = false;
+                            state.picker.open = false;
+                        } else {
+                            continue;
+                        }
+                    }
+                    state.selected = snapshot.selected_chat.clone();
+                    if let Some(chat) = state.selected.as_ref() {
+                        for message in &mut state.timeline {
+                            message.chat = chat.clone();
+                        }
+                    }
+                }
+                if state.snapshot != snapshot {
+                    let initial_messages =
+                        state.timeline.is_empty() && !snapshot.messages.is_empty();
+                    if state.timeline.is_empty() {
+                        state.has_older = snapshot.messages.len() == 100;
+                    }
+                    if !state.history_focus {
+                        state.merge_messages(snapshot.messages.clone());
+                    }
+                    match snapshot.connection.phase {
+                        crate::model::Phase::Connected => state.authenticated = true,
+                        crate::model::Phase::Pairing | crate::model::Phase::LoggedOut => {
+                            state.authenticated = false
+                        }
+                        _ => {}
+                    }
+                    if state.qr_payload != snapshot.connection.qr {
+                        state.qr_payload = snapshot.connection.qr.clone();
+                        state.qr = state
+                            .qr_payload
+                            .as_deref()
+                            .and_then(|payload| make_qr(payload, state.image_cache.as_ref()?));
+                    }
+                    if !state.preferences.saving {
+                        state.preferences.value = snapshot.settings.clone();
+                    }
+                    state
+                        .search_results
+                        .chats
+                        .retain(|hit| snapshot.chats.iter().any(|chat| chat.matches_jid(&hit.jid)));
+                    state.search_results.messages.retain(|hit| {
+                        snapshot
+                            .chats
+                            .iter()
+                            .any(|chat| chat.matches_jid(&hit.chat.jid))
+                    });
+                    let refreshed = state.snapshot.revision != snapshot.revision;
+                    state.snapshot = snapshot;
+                    if refreshed && state.picker.open && !state.picker.loading {
+                        state.load_picker_catalog(false);
+                    }
+                    state.request_chat_media();
+                    if initial_messages {
+                        tx.instant();
+                        tx.scroll_to_bottom_instant("messages");
+                    }
+                    changed = true;
+                }
+            }
+            Event::Gallery(chat, kind, result) => {
+                if state.details
+                    && state.selected.as_deref() == Some(&chat)
+                    && state.gallery_kind == kind
+                {
+                    state.gallery_loading = false;
+                    match result {
+                        Ok(page) => {
+                            state.gallery_next = page.next;
+                            for item in page.items {
+                                if !state
+                                    .gallery
+                                    .iter()
+                                    .any(|m| m.id == item.id && m.sender == item.sender)
+                                {
+                                    state.gallery.push(item);
+                                }
+                            }
+                            state.request_gallery_media();
+                        }
+                        Err(error) => state.error = Some(error),
+                    }
+                    changed = true;
+                }
+            }
+            Event::Stickers(sync, result) => {
+                state.receive_stickers(sync, result);
+                changed = true;
+            }
+            Event::Search(query, result) => {
+                if query == state.search.text.trim() {
+                    state.searching = false;
+                    match result {
+                        Ok(results) => state.search_results = results,
+                        Err(error) => state.error = Some(error),
+                    }
+                    changed = true;
+                }
+            }
+            Event::Jump(message, generation, result) => {
+                if state.selected.as_deref() == Some(&message.chat)
+                    && state.highlighted.as_deref() == Some(&message.id)
+                    && state.history_generation == generation
+                {
+                    state.loading_older = false;
+                    match result {
+                        Ok(page) => {
+                            state.has_older = page.has_older;
+                            state.has_newer = page.has_newer;
+                            state.history_focus = page.has_newer;
+                            state.timeline = page.messages;
+                            state.request_chat_media();
+                            let sender = state
+                                .timeline
+                                .iter()
+                                .find(|m| {
+                                    m.id == message.id
+                                        && (m.sender == message.sender || message.sender.is_empty())
+                                })
+                                .or_else(|| state.timeline.iter().find(|m| m.id == message.id))
+                                .map(|m| m.sender.as_str())
+                                .unwrap_or(&message.sender);
+                            tx.scroll_center_in(
+                                "messages",
+                                format!("message-{}-{}", sender, message.id),
+                            );
+                        }
+                        Err(error) => {
+                            state.history_focus = false;
+                            state.error = Some(error);
+                        }
+                    }
+                    changed = true;
+                }
+            }
+            Event::Asset(key, result) => {
+                state.image_pending.remove(&key);
+                match result {
+                    Ok(Some(bytes)) => {
+                        if let Some(cache) = &state.image_cache {
+                            if let Some(identity) =
+                                key.strip_prefix("avatar:").and_then(|k| k.rsplit_once(':'))
+                            {
+                                state
+                                    .avatars
+                                    .insert(identity.0.to_owned(), cache.load(bytes));
+                                state
+                                    .avatar_versions
+                                    .insert(identity.0.to_owned(), identity.1.parse().unwrap_or(0));
+                            } else {
+                                // Header dimensions are available before Rune's async
+                                // decoder uploads pixels, so layout gets the correct
+                                // aspect ratio in the same state update as the asset.
+                                if let Some((width, height)) =
+                                    image::ImageReader::new(std::io::Cursor::new(&bytes))
+                                        .with_guessed_format()
+                                        .ok()
+                                        .and_then(|r| r.into_dimensions().ok())
+                                {
+                                    state.image_sizes.insert(key.clone(), [width, height]);
+                                }
+                                let bytes: Arc<[u8]> = bytes.into();
+                                if animation::is_animated(&bytes)
+                                    && state.animations.load(key.clone(), bytes.clone())
+                                {
+                                    state.update_animations();
+                                } else {
+                                    state.images.insert(key.clone(), cache.load(bytes));
+                                    state.image_order.retain(|k| k != &key);
+                                    state.image_order.push_back(key);
+                                }
+                                state.trim_images();
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        state
+                            .image_failures
+                            .insert(key, (crate::model::now(), None));
+                    }
+                    Err(error) => {
+                        state
+                            .image_failures
+                            .insert(key, (crate::model::now(), Some(error)));
+                    }
+                }
+                changed = true;
+            }
+            Event::Video(generation, result) => {
+                if generation == state.viewer_generation && state.viewer.is_some() {
+                    match result {
+                        Ok(file) => {
+                            let wake = state.wake.lock().ok().and_then(|w| w.clone());
+                            if let Some(wake) = wake {
+                                state.video = Some(video::Player::new(file, wake));
+                            }
+                        }
+                        Err(error) => state.video_error = Some(error),
+                    }
+                    changed = true;
+                }
+            }
+            Event::Audio(generation, result) => {
+                if generation == state.voice_generation
+                    && let Some(voice) = &mut state.voice
+                {
+                    match result {
+                        Ok(file) => {
+                            if let Some(wake) = state.wake.lock().ok().and_then(|w| w.clone()) {
+                                let player = video::Player::new_audio(file, wake);
+                                player.set_rate(state.voice_rate);
+                                voice.player = Some(player);
+                            }
+                        }
+                        Err(error) => voice.error = Some(error),
+                    }
+                    changed = true;
+                }
+            }
+            Event::Done(result) => {
+                state.busy = false;
+                state.error = result.err();
+                changed = true;
+            }
+            Event::Sent(chat, text, reply_id, result) => {
+                state.busy = false;
+                if result.is_ok() {
+                    if state.selected.as_deref() == Some(&chat) && state.draft.text == text {
+                        state.draft.clear();
+                    }
+                    if state.drafts.get(&chat) == Some(&text) {
+                        state.drafts.remove(&chat);
+                    }
+                    if state.reply.as_ref().map(|r| r.id.as_str()) == reply_id.as_deref() {
+                        state.reply = None;
+                    }
+                    tx.scroll_to_bottom("messages");
+                }
+                state.error = result.err();
+                changed = true;
+            }
+            Event::Forward(result) => {
+                match result {
+                    Ok(result) if result.error.is_none() => {
+                        state.forwarding = None;
+                        state.select(result.destination);
+                        tx.scroll_to_bottom("messages");
+                    }
+                    Ok(result) => {
+                        if let Some(flow) = &mut state.forwarding {
+                            flow.sending = false;
+                            flow.selected.retain(|m| {
+                                !result
+                                    .sent
+                                    .iter()
+                                    .any(|sent| sent.id == m.id && sent.sender == m.sender)
+                            });
+                            flow.error = result.error;
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(flow) = &mut state.forwarding {
+                            flow.sending = false;
+                            flow.error = Some(error);
+                        }
+                    }
+                }
+                changed = true;
+            }
+            Event::Opened(result) => {
+                state.busy = false;
+                match result {
+                    Ok(chat) => {
+                        state.select(chat);
+                        state.new_chat = false;
+                        state.address.clear();
+                    }
+                    Err(e) => state.error = Some(e),
+                }
+                changed = true;
+            }
+            Event::Newer(chat, generation, result) => {
+                if state.selected.as_deref() == Some(&chat)
+                    && state.history_generation == generation
+                {
+                    state.loading_newer = false;
+                    match result {
+                        Ok(page) => {
+                            state.has_newer = page.has_newer;
+                            state.history_focus = page.has_newer;
+                            state.history_notice = None;
+                            state.merge_messages(page.messages);
+                            state.request_chat_media();
+                        }
+                        Err(error) => state.history_notice = Some(error),
+                    }
+                    changed = true;
+                }
+            }
+            Event::Older(chat, generation, result) => {
+                if state.selected.as_deref() == Some(&chat)
+                    && state.history_generation == generation
+                {
+                    state.loading_older = false;
+                    match result {
+                        Ok(page) => {
+                            state.has_older = page.has_older;
+                            state.history_notice = page.notice;
+                            state.merge_messages(page.messages);
+                            state.request_chat_media();
+                        }
+                        Err(error) => state.error = Some(error),
+                    }
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed |= state.update_picker_query(tx);
+    state.update_animations();
+    if state.diagnostics.open
+        && !state.diagnostics.pending
+        && elapsed >= state.diagnostics.next_sample
+    {
+        state.diagnostics.pending = true;
+        state.diagnostics.next_sample = elapsed + 1.0;
+        let _ = state.tx.send(Command::Diagnostics);
+        tx.wake_after(Duration::from_secs(1));
+    }
+    if let Some(voice) = &mut state.voice
+        && let Some(player) = &voice.player
+    {
+        let status = player.status();
+        if status.playing
+            && state
+                .voice_next_tick
+                .is_none_or(|due| elapsed + 0.01 >= due)
+        {
+            state.voice_next_tick = Some(elapsed + 0.1);
+            tx.wake_after(Duration::from_millis(100));
+        } else if !status.playing {
+            state.voice_next_tick = None;
+        }
+        if voice.last_status.as_ref() != Some(&status) {
+            *VOICE_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(status.clone());
+            voice.last_status = Some(status);
+            changed = true;
+        }
+    }
+    if let Some(video) = &state.video {
+        let status = video.status();
+        if status.playing
+            && state
+                .video_next_tick
+                .is_none_or(|due| elapsed + 0.01 >= due)
+        {
+            state.video_next_tick = Some(elapsed + 0.1);
+            tx.wake_after(Duration::from_millis(100));
+        } else if !status.playing {
+            state.video_next_tick = None;
+        }
+        if state.video_status.as_ref() != Some(&status) {
+            *VIDEO_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(status.clone());
+            state.video_status = Some(status);
+            changed = true;
+        }
+    }
+    if state.search_requested != state.search.text.trim() && state.search_at.is_none() {
+        state.search_at = Some(elapsed + 0.2);
+        tx.wake_after(Duration::from_millis(200));
+    }
+    if state.search_at.is_some_and(|at| elapsed >= at) {
+        state.search_at = None;
+        state.search_requested = state.search.text.trim().into();
+        if state.search_requested.is_empty() {
+            state.search_results = SearchResults::default();
+            state.searching = false;
+        } else {
+            state.searching = true;
+            let _ = state
+                .tx
+                .send(Command::Search(state.search_requested.clone()));
+        }
+        changed = true;
+    }
+    let second = crate::model::now();
+    if state.typing_text != state.draft.text {
+        state.typing_text = state.draft.text.clone();
+        if state.preferences.value.privacy.send_typing
+            && second - state.typing_sent_at >= 4
+            && state.authenticated
+        {
+            if let Some(chat) = state.selected.clone() {
+                let _ = state.tx.send(Command::Preferences(
+                    "typing",
+                    json!({"chat":chat,"active":!state.draft.text.is_empty()}),
+                ));
+                state.typing_sent_at = second;
+            }
+        }
+        tx.wake_after(Duration::from_secs(5));
+    } else if state.typing_sent_at > 0 && second - state.typing_sent_at >= 5 {
+        if let Some(chat) = state.selected.clone() {
+            let _ = state.tx.send(Command::Preferences(
+                "typing",
+                json!({"chat":chat,"active":false}),
+            ));
+        }
+        state.typing_sent_at = 0;
+    }
+    if times::day(second) != times::day(state.second) {
+        changed = true;
+    }
+    let connection = &state.snapshot.connection;
+    let ticking = !state.authenticated
+        && [
+            connection.qr_expires_at,
+            connection.code_expires_at,
+            connection.pair_retry_at,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|expires| expires > second);
+    if ticking {
+        // Keep one countdown wake pending. Scheduling on every animation frame
+        // would turn those wakes into a permanent stream of redraws.
+        if state.next_tick.is_none_or(|due| elapsed + 0.01 >= due) {
+            state.next_tick = Some(elapsed + 1.0);
+            tx.wake_after(Duration::from_secs(1));
+        }
+        if second != state.second {
+            state.second = second;
+            changed = true;
+        }
+    } else {
+        if state.next_tick.take().is_some() && state.second != second {
+            changed = true;
+        }
+        state.second = second;
+    }
+    changed
+}
+
+fn make_qr(payload: &str, cache: &ImageCache) -> Option<Image> {
+    let code = qrcode::QrCode::new(payload).ok()?;
+    let side = code.width() + 8;
+    let scale = (280 / side).max(1);
+    let width = side * scale;
+    let mut pixels = vec![255u8; width * width * 4];
+    for y in 0..code.width() {
+        for x in 0..code.width() {
+            if code[(x, y)] == qrcode::Color::Dark {
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let index = (((y + 4) * scale + dy) * width + (x + 4) * scale + dx) * 4;
+                        pixels[index..index + 3].fill(0);
+                    }
+                }
+            }
+        }
+    }
+    Some(cache.rgba(width as u32, width as u32, pixels))
+}
+
+impl State {
+    fn merge_messages(&mut self, incoming: Vec<crate::model::Message>) {
+        for message in incoming {
+            if let Some(existing) = self.timeline.iter_mut().find(|m| {
+                m.chat == message.chat
+                    && m.id == message.id
+                    && if m.chat.ends_with("@g.us") {
+                        m.sender == message.sender
+                    } else {
+                        m.from_me == message.from_me
+                    }
+            }) {
+                *existing = message;
+            } else {
+                self.timeline.push(message);
+            }
+        }
+        self.timeline
+            .sort_by(|a, b| (a.timestamp, &a.id, &a.sender).cmp(&(b.timestamp, &b.id, &b.sender)));
+    }
+
+    fn select(&mut self, chat: String) {
+        let chat = self
+            .snapshot
+            .chats
+            .iter()
+            .find(|c| c.matches_jid(&chat))
+            .map(|c| c.jid.clone())
+            .unwrap_or(chat);
+        if self.forwarding.as_ref().is_some_and(|f| f.sending) {
+            return;
+        }
+        self.preferences.open = false;
+        self.picker.open = false;
+        self.picker.images.clear();
+        self.contact = None;
+        self.stop_voice();
+        self.reply = None;
+        self.reaction_menu = None;
+        self.forwarding = None;
+        if let Some(old) = &self.selected {
+            self.drafts.insert(old.clone(), self.draft.text.clone());
+        }
+        self.draft = TextEdit::new(self.drafts.get(&chat).cloned().unwrap_or_default());
+        self.typing_text = self.draft.text.clone();
+        self.typing_sent_at = 0;
+        self.selected = Some(chat.clone());
+        self.snapshot.current_chat = self.snapshot.chats.iter().find(|c| c.jid == chat).cloned();
+        self.snapshot.messages.clear();
+        self.timeline.clear();
+        self.has_older = true;
+        self.has_newer = false;
+        self.loading_newer = false;
+        self.history_generation = self.history_generation.wrapping_add(1);
+        self.loading_older = false;
+        self.details = false;
+        self.gallery.clear();
+        self.gallery_next = None;
+        self.gallery_loading = false;
+        self.media_menu = None;
+        self.visible_media.clear();
+        self.prefetched.clear();
+        self.detached = false;
+        self.history_focus = false;
+        self.highlighted = None;
+        self.history_notice = None;
+        self.attachments_open = false;
+        self.close_viewer();
+        self.section = Section::Messages;
+        let _ = self.tx.send(Command::Select(chat));
+    }
+    fn tool(&mut self, name: &'static str, args: Value) {
+        self.busy = true;
+        self.error = None;
+        if self.tx.send(Command::Tool(name, args)).is_err() {
+            self.busy = false;
+            self.error = Some("The local service stopped".into());
+        }
+    }
+    fn send(&mut self) {
+        if self.busy || self.draft.text.trim().is_empty() {
+            return;
+        }
+        if let Some(chat) = &self.selected {
+            self.busy = true;
+            self.error = None;
+            let _ = self.tx.send(Command::Send(
+                chat.clone(),
+                self.draft.text.clone(),
+                self.reply.as_ref().map(Message::cursor),
+            ));
+        }
+    }
+}
+
+fn on_key(s: &mut State, event: &rune::KeyEvent, _: &mut Tx) -> bool {
+    if event.is_command('m') && event.mods.shift {
+        s.diagnostics.open = !s.diagnostics.open;
+        s.diagnostics.next_sample = 0.0;
+        return true;
+    }
+    if event.key == rune::Key::Escape {
+        if s.picker.open {
+            s.picker.open = false;
+            s.picker.images.clear();
+            return true;
+        }
+        if s.preferences.logout || s.preferences.confirm_cache {
+            if !s.preferences.logging_out {
+                s.preferences.logout = false;
+                s.preferences.confirm_cache = false;
+            }
+            return true;
+        }
+        if s.contact.take().is_some() {
+            return true;
+        }
+        if s.preferences.open {
+            s.preferences.open = false;
+            return true;
+        }
+        if s.diagnostics.open {
+            s.diagnostics.open = false;
+            return true;
+        }
+        if s.viewer.is_some() {
+            s.close_viewer();
+            return true;
+        }
+        if s.reaction_menu.take().is_some() {
+            return true;
+        }
+        if let Some(flow) = &mut s.forwarding {
+            if !flow.sending {
+                if flow.picker {
+                    flow.picker = false;
+                } else {
+                    s.forwarding = None;
+                }
+                return true;
+            }
+        }
+        if s.reply.take().is_some() {
+            return true;
+        }
+        if s.media_menu.take().is_some() {
+            return true;
+        }
+        if s.details {
+            s.details = false;
+            s.gallery.clear();
+            s.trim_images();
+            return true;
+        }
+        if s.attachments_open {
+            s.attachments_open = false;
+            return true;
+        }
+    }
+    if let Some(video) = &s.video {
+        match &event.key {
+            rune::Key::Text(key) if key == " " => video.toggle(),
+            rune::Key::Text(key) if key.eq_ignore_ascii_case("m") => video.toggle_mute(),
+            rune::Key::Left => video.seek(video.status().position - 5.0),
+            rune::Key::Right => video.seek(video.status().position + 5.0),
+            _ => return false,
+        }
+        return true;
+    }
+    if rune_kit::shell::is_sidebar_toggle(event) {
+        s.sidebar.toggle();
+        return true;
+    }
+    false
+}
+
+impl State {
+    fn jump_to_quote(&mut self, quote: &crate::model::Quote, chat: &str, tx: &mut Tx) {
+        if self.forwarding.is_some() {
+            return;
+        }
+        self.highlighted = Some(quote.id.clone());
+        self.detached = true;
+        if let Some(message) = self
+            .timeline
+            .iter()
+            .find(|m| m.chat == chat && m.id == quote.id)
+        {
+            tx.scroll_center_in(
+                "messages",
+                format!("message-{}-{}", message.sender, message.id),
+            );
+            return;
+        }
+        self.history_focus = true;
+        self.history_generation = self.history_generation.wrapping_add(1);
+        self.loading_newer = false;
+        self.loading_older = true;
+        let message = Message {
+            id: quote.id.clone(),
+            chat: chat.into(),
+            sender: quote.sender.clone(),
+            ..Default::default()
+        };
+        let _ = self
+            .tx
+            .send(Command::Jump(message, self.history_generation));
+    }
+
+    fn visible_chats(&self) -> Vec<&Chat> {
+        if self.search.text.trim().is_empty() {
+            self.snapshot
+                .chats
+                .iter()
+                .filter(|c| c.archived == self.show_archived)
+                .collect()
+        } else {
+            self.search_results.chats.iter().collect()
+        }
+    }
+
+    fn jump(&mut self, hit: SearchHit) {
+        self.select(hit.message.chat.clone());
+        self.history_focus = true;
+        self.highlighted = Some(hit.message.id.clone());
+        self.loading_older = true;
+        let _ = self
+            .tx
+            .send(Command::Jump(hit.message, self.history_generation));
+    }
+
+    fn load_older(&mut self) {
+        if !self.loading_older
+            && let Some(first) = self.timeline.first()
+        {
+            self.loading_older = true;
+            self.history_notice = None;
+            let _ = self.tx.send(Command::Older(
+                first.chat.clone(),
+                first.cursor(),
+                self.history_generation,
+            ));
+        }
+    }
+
+    fn load_newer(&mut self) -> bool {
+        if self.has_newer
+            && !self.loading_newer
+            && !self.loading_older
+            && let Some(last) = self.timeline.last()
+        {
+            self.loading_newer = true;
+            self.history_notice = None;
+            let _ = self.tx.send(Command::Newer(
+                last.chat.clone(),
+                last.cursor(),
+                self.history_generation,
+            ));
+            return true;
+        }
+        false
+    }
+
+    fn request_asset(&mut self, key: String, request: AssetRequest) {
+        let avatar_loaded = key
+            .strip_prefix("avatar:")
+            .and_then(|k| k.rsplit_once(':'))
+            .is_some_and(|(jid, version)| {
+                self.avatar_versions
+                    .get(jid)
+                    .is_some_and(|v| version.parse::<i64>().ok() == Some(*v))
+            });
+        if avatar_loaded
+            || self.images.contains_key(&key)
+            || self.animations.contains(&key)
+            || self.image_pending.contains(&key)
+            || self
+                .image_failures
+                .get(&key)
+                .is_some_and(|(time, _)| crate::model::now() - time < 300)
+        {
+            return;
+        }
+        self.image_failures.remove(&key);
+        self.image_pending.insert(key.clone());
+        if self.tx.send(Command::Asset(key.clone(), request)).is_err() {
+            self.image_pending.remove(&key);
+        }
+    }
+
+    fn request_avatar(&mut self, jid: &str, version: i64) {
+        self.request_asset(
+            media::avatar_key(jid, version),
+            AssetRequest::Avatar {
+                jid: jid.to_owned(),
+                common_group: None,
+            },
+        );
+    }
+
+    fn request_chat_media(&mut self) {
+        if let Some(chat) = self.snapshot.current_chat.clone() {
+            self.request_avatar(&chat.jid, chat.photo_version);
+        }
+        let mut prefetch = Vec::new();
+        for m in &self.timeline {
+            if matches!(m.kind.as_str(), "image" | "video" | "sticker")
+                && !m.has_media
+                && self
+                    .prefetched
+                    .insert(format!("{}:{}:{}", m.chat, m.sender, m.id))
+            {
+                prefetch.push((m.sender.clone(), m.id.clone()));
+            }
+        }
+        if !prefetch.is_empty()
+            && let Some(chat) = self.selected.clone()
+        {
+            for items in prefetch.chunks(100) {
+                let _ = self
+                    .tx
+                    .send(Command::Prefetch(chat.clone(), items.to_vec()));
+            }
+        }
+        let visible: Vec<_> = self
+            .timeline
+            .iter()
+            .filter(|m| {
+                self.visible_media
+                    .iter()
+                    .any(|(sender, id)| *sender == m.sender && *id == m.id)
+            })
+            .cloned()
+            .collect();
+        for m in visible {
+            if !m.from_me && m.chat.ends_with("@g.us") {
+                self.request_asset(
+                    media::avatar_key(&m.sender, m.sender_photo_version),
+                    AssetRequest::Avatar {
+                        jid: m.sender.clone(),
+                        common_group: Some(m.chat.clone()),
+                    },
+                );
+            }
+            self.request_thumbnail(&m);
+        }
+        self.update_animations();
+    }
+
+    fn request_thumbnail(&mut self, m: &Message) {
+        if matches!(m.kind.as_str(), "image" | "video" | "sticker") {
+            if !m.has_media
+                && self
+                    .prefetched
+                    .insert(format!("{}:{}:{}", m.chat, m.sender, m.id))
+            {
+                let _ = self.tx.send(Command::Prefetch(
+                    m.chat.clone(),
+                    vec![(m.sender.clone(), m.id.clone())],
+                ));
+            }
+            self.request_asset(
+                media::thumbnail_key(m),
+                AssetRequest::Thumbnail {
+                    chat: m.chat.clone(),
+                    sender: m.sender.clone(),
+                    id: m.id.clone(),
+                },
+            );
+        }
+    }
+
+    fn request_gallery_media(&mut self) {
+        let items: Vec<_> = self.gallery.iter().take(9).cloned().collect();
+        for m in items {
+            self.request_thumbnail(&m);
+        }
+        self.update_animations();
+    }
+
+    fn open_details(&mut self) {
+        self.details = true;
+        self.error = None;
+        self.gallery.clear();
+        self.gallery_next = None;
+        self.gallery_loading = false;
+        self.gallery_kind = "media".into();
+        self.load_gallery();
+        if let Some(chat) = self.snapshot.current_chat.clone() {
+            let key = format!("profile:{}:{}", chat.jid, chat.photo_version);
+            self.request_asset(key, AssetRequest::Profile { jid: chat.jid });
+        }
+    }
+
+    fn load_gallery(&mut self) {
+        if !self.gallery_loading
+            && let Some(chat) = self.selected.clone()
+        {
+            self.gallery_loading = true;
+            let _ = self.tx.send(Command::Gallery(
+                chat,
+                self.gallery_kind.clone(),
+                self.gallery_next.clone(),
+            ));
+        }
+    }
+
+    fn gallery_tab(&mut self, kind: &str) {
+        if self.gallery_kind != kind {
+            self.gallery_kind = kind.into();
+            self.gallery.clear();
+            self.gallery_next = None;
+            self.gallery_loading = false;
+            self.load_gallery();
+        }
+    }
+
+    fn trim_images(&mut self) {
+        // Bound decoded RGBA/mip data as well as entry count; originals stay in SQLite.
+        let mut bytes: u64 = self
+            .images
+            .values()
+            .filter_map(|i| i.size())
+            .map(|[w, h]| u64::from(w) * u64::from(h) * 16 / 3)
+            .sum();
+        while self.image_order.len() > 96 || bytes > 32 * 1024 * 1024 {
+            let Some(key) = self.image_order.pop_front() else {
+                break;
+            };
+            if let Some(image) = self.images.remove(&key) {
+                if let Some([w, h]) = image.size() {
+                    bytes = bytes.saturating_sub(u64::from(w) * u64::from(h) * 16 / 3);
+                }
+            }
+        }
+        self.image_sizes
+            .retain(|key, _| self.images.contains_key(key) || self.animations.contains(key));
+        self.image_failures
+            .retain(|_, (at, _)| crate::model::now() - *at < 300);
+    }
+
+    fn jump_latest(&mut self, tx: &mut Tx) {
+        if self.history_focus
+            && let Some(chat) = self.selected.clone()
+        {
+            self.select(chat);
+        }
+        self.detached = false;
+        tx.scroll_to_bottom("messages");
+    }
+
+    fn close_viewer(&mut self) {
+        self.viewer_generation = self.viewer_generation.wrapping_add(1);
+        self.viewer = None;
+        self.video = None;
+        self.video_status = None;
+        *VIDEO_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.video_next_tick = None;
+        self.video_error = None;
+        self.images.retain(|key, _| !key.starts_with("image:"));
+        self.image_order.retain(|key| !key.starts_with("image:"));
+    }
+
+    fn open_image(&mut self, message: Message) {
+        self.stop_voice();
+        self.close_viewer();
+        self.attachments_open = false;
+        self.media_menu = None;
+        if message.kind == "video" {
+            let _ = self
+                .tx
+                .send(Command::Video(self.viewer_generation, message.clone()));
+            self.viewer = Some(message);
+            return;
+        }
+        let request = AssetRequest::Image {
+            chat: message.chat.clone(),
+            sender: message.sender.clone(),
+            id: message.id.clone(),
+        };
+        let key = request.key();
+        self.image_failures.remove(&key);
+        self.request_asset(key, request);
+        self.viewer = Some(message);
+    }
+}

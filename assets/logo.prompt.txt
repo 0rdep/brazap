@@ -1,0 +1,4 @@
+Mode: built-in image_gen
+Transparent background: true
+
+Create a polished desktop app icon: a mint-green glass chat bubble with a bold uppercase B centered inside. Transparent background, crisp simple silhouette, subtle depth, legible at small sizes. No other text or decorative objects.

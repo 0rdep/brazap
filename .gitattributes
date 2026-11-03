@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.webp binary
+*.bin binary
+*.ico binary
+# Preserve upstream patch context and license text verbatim.
+patches/*.patch -whitespace
+assets/emoji/LICENSE-* -whitespace

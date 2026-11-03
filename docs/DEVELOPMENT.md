@@ -1,0 +1,97 @@
+# Development
+
+Brazap is a Rust desktop application built with Rune and whatsapp-rust. The UI and
+stdio MCP adapter share one service and one SQLite archive.
+
+## Requirements
+
+- Rust 1.94 or newer, Git and Bash.
+- Windows: Visual Studio C++ build tools and Windows SDK, including `rc.exe`.
+  Run the build from Git Bash with the developer environment loaded.
+- Linux: a C compiler, `pkg-config`, Wayland, xkbcommon and fontconfig headers.
+  On Ubuntu: `sudo apt install build-essential pkg-config libwayland-dev libxkbcommon-dev libfontconfig1-dev`.
+- macOS: Xcode Command Line Tools.
+
+A desktop session and a working GPU driver are needed to run the UI. Linux uses
+Vulkan and desktop portals for native file dialogs.
+
+```sh
+./scripts/cargo run
+./scripts/cargo build --locked --release
+```
+
+The wrapper prepares `.build-deps/rune`, applying the tracked GPU-memory patch to
+the exact upstream revision in `patches/rune.rev`. Do not edit this generated
+checkout or use `.references` as build dependencies. See [the patch guide](../patches/README.md).
+
+## Windows builds from WSL
+
+Install the MinGW-w64 C toolchain and binutils, including `windres` and `dlltool`:
+
+```sh
+rustup target add x86_64-pc-windows-gnu
+./scripts/build-windows --release --features memory-profiling
+```
+
+Output: `target/x86_64-pc-windows-gnu/release/brazap.exe`. Set
+`BRAZAP_WINDOWS_CC` when the cross compiler is outside `PATH`.
+
+## Local profiles and commands
+
+```sh
+brazap --data-dir /path/to/profile
+brazap --headless
+brazap --mcp
+brazap --diagnostics
+brazap --version
+brazap --demo --data-dir /path/to/empty/demo-profile
+```
+
+`BRAZAP_DATA_DIR` also selects the profile. Use the same profile for the UI,
+headless service and MCP client. Each profile has one service owner and one
+active desktop window; a second launch activates the existing window.
+
+Keep database files, logs, cached media, session keys and upstream checkouts out
+of Git. `.local`, `.references`, `.build-deps`, `target` and `dist` are ignored.
+
+## Architecture
+
+- `src/service.rs`: WhatsApp lifecycle, shared operations and durable ingestion.
+- `src/storage.rs`, `migrations/`, `queries/`: application archive and SQLite views.
+- `src/ipc.rs`, `src/mcp.rs`: authenticated local service coordination and stdio MCP.
+- `src/ui/`: Rune layout, interactions, playback and settings.
+- `src/updates.rs`: release discovery, checksum validation and replacement.
+- `locales/`: English, Brazilian Portuguese and Spanish UI strings.
+
+The library manages authentication, encryption/session state and its protocol
+schema. Application-owned tables hold chat history, identities, attachments and
+preferences. Original media lives in SQLite BLOBs; playback may use temporary files.
+
+## Validation
+
+```sh
+./scripts/cargo fmt --all -- --check
+./scripts/cargo check --locked
+./scripts/cargo build --locked --release
+```
+
+Use manual verification for pairing, playback, scrolling, notifications and
+updates. No unit, integration or end-to-end tests should be added unless the user
+explicitly requests them. Read [AGENTS.md](../AGENTS.md) and consult the relevant
+[source skills](../.agents/skills/) before changing Rune or WhatsApp behavior.
+
+## Memory inspection
+
+Open **Settings → Diagnostics → Open memory diagnostics**, or use
+`brazap --diagnostics` while the service runs. For an isolated backend sample,
+close the app and run `brazap --headless-memory`.
+
+Optimized builds need `--features memory-profiling` for Rust allocation counters.
+Image and SDK estimates overlap the counted heap; do not add them to process RAM.
+GPU reservation, actual allocation and process working set are different metrics.
+
+## Documentation screenshots
+
+The README captures the actual Windows UI using fictional fixture conversations
+and the offline `--demo` SQLite profile. Screenshots do not contain a real WhatsApp
+session, personal messages, contact photos or a usable pairing QR code.

@@ -1,0 +1,57 @@
+[package]
+name = "brazap"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "A native WhatsApp desktop client with a local MCP interface"
+license = "MIT"
+
+[features]
+default = ["desktop"]
+memory-profiling = []
+desktop = ["dep:rune", "dep:rune-kit", "dep:qrcode", "dep:tempfile", "dep:windows", "dep:windows-core", "dep:symphonia", "dep:opuscule"]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.23"
+blake3 = "1"
+chrono = { version = "0.4", features = ["serde"] }
+diesel = { version = "2.3.14", features = ["sqlite"] }
+directories = "6"
+env_logger = "0.11"
+fs2 = "0.4"
+flate2 = "1"
+log = "0.4"
+procwatch = { git = "https://github.com/anomalyco/rune", rev = "1213159f9ec300c7a309c67a89176f61a0b47753", features = ["release-gauges"] }
+libsqlite3-sys = "0.38.2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+mime_guess = "2"
+qrcode = { version = "0.14", default-features = false, optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "io-std", "signal", "fs"] }
+tempfile = { version = "3", optional = true }
+symphonia = { version = "0.5.5", default-features = false, features = ["ogg", "mkv"], optional = true }
+opuscule = { version = "0.2.2", optional = true }
+uuid = { version = "1", features = ["v4"] }
+ureq = "3.5"
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "b84f2af3d4029612a3c0cd45823bced1ee4614eb" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "1213159f9ec300c7a309c67a89176f61a0b47753", default-features = false, features = ["embedded-fonts", "native-file-dialog"], optional = true }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "1213159f9ec300c7a309c67a89176f61a0b47753", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", optional = true, features = ["Data_Xml_Dom", "UI_Notifications", "Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D10", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common", "Win32_Media_MediaFoundation", "Win32_Security", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Variant", "Win32_System_WinRT", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_UI_WindowsAndMessaging"] }
+windows-core = { version = "0.62.2", optional = true }
+
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

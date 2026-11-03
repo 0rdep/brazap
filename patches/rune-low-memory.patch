@@ -1,0 +1,89 @@
+diff --git a/crates/rune/Cargo.toml b/crates/rune/Cargo.toml
+index ab76f63..f8e32c7 100644
+--- a/crates/rune/Cargo.toml
++++ b/crates/rune/Cargo.toml
+@@ -145,6 +145,7 @@ x11rb = { version = "0.13", features = ["shape", "xinput", "randr", "allow-unsaf
+ xkbcommon = "0.9"
+ 
+ [target.'cfg(target_os = "windows")'.dependencies]
++windows = { version = "0.62.2", default-features = false, features = ["Win32_Graphics_Dxgi"] }
+ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory"] }
+ 
+ [target.'cfg(target_os = "linux")'.dependencies]
+diff --git a/crates/rune/src/gpu/pick.rs b/crates/rune/src/gpu/pick.rs
+index 2b1a824..9a81009 100644
+--- a/crates/rune/src/gpu/pick.rs
++++ b/crates/rune/src/gpu/pick.rs
+@@ -15,6 +15,8 @@ pub(crate) enum Reason {
+     EnvName,
+     EnvPower,
+     Compositor,
++    #[cfg(target_os = "windows")]
++    Windows,
+     LowPower,
+ }
+ 
+@@ -24,6 +26,8 @@ impl Reason {
+             Reason::EnvName => "WGPU_ADAPTER_NAME",
+             Reason::EnvPower => "WGPU_POWER_PREF",
+             Reason::Compositor => "the compositor's GPU",
++            #[cfg(target_os = "windows")]
++            Reason::Windows => "Windows' default GPU",
+             Reason::LowPower => "lowest power",
+         }
+     }
+@@ -88,10 +92,39 @@ pub(crate) fn pick(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>
+             return Ok(log(Pick { adapter, reason: Reason::Compositor, compositor }, enumerated));
+         }
+     }
++    #[cfg(target_os = "windows")]
++    if let Some(adapter) = windows_default(instance, surface) {
++        return Ok(log(Pick { adapter, reason: Reason::Windows, compositor }, enumerated));
++    }
+     let adapter = request(instance, surface, wgpu::PowerPreference::LowPower)?;
+     Ok(log(Pick { adapter, reason: Reason::LowPower, compositor }, enumerated))
+ }
+ 
++// Adapted from anomalyco/rune#46: DXGI's first hardware adapter follows the
++// Windows default/primary display instead of forcing the lowest-power GPU.
++// Explicit WGPU_ADAPTER_NAME and WGPU_POWER_PREF choices above still win.
++#[cfg(target_os = "windows")]
++fn windows_default(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>) -> Option<wgpu::Adapter> {
++    use windows::Win32::Graphics::Dxgi::*;
++    let factory = unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }.ok()?;
++    let mut card = None;
++    for index in 0.. {
++        let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else { break };
++        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else { continue };
++        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
++            card = Some((desc.VendorId, desc.DeviceId));
++            break;
++        }
++    }
++    let card = card?;
++    pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12))
++        .into_iter().find(|adapter| {
++            let info = adapter.get_info();
++            (info.vendor, info.device) == card
++                && surface.is_none_or(|surface| adapter.is_surface_supported(surface))
++        })
++}
++
+ fn request(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>, power_preference: wgpu::PowerPreference) -> Result<wgpu::Adapter, String> {
+     pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+         power_preference,
+diff --git a/crates/rune/src/render.rs b/crates/rune/src/render.rs
+index 1dc89b9..4237772 100644
+--- a/crates/rune/src/render.rs
++++ b/crates/rune/src/render.rs
+@@ -452,7 +452,9 @@ impl Gpu {
+             required_features,
+             required_limits,
+             experimental_features: Default::default(),
+-            memory_hints: wgpu::MemoryHints::Performance,
++            memory_hints: wgpu::MemoryHints::Manual {
++                suballocated_device_memory_block_size: 4 * 1024 * 1024..8 * 1024 * 1024,
++            },
+             trace: Default::default(),
+         }))
+         .map_err(|error| format!("no GPU device: {error}"))

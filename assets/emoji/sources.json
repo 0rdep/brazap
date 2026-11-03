@@ -1,0 +1,22 @@
+{
+  "twemoji": {
+    "url": "https://codeload.github.com/jdecked/twemoji/tar.gz/b6b55fef1e8636b540a6d016a4729ca8cdf2e60b",
+    "sha256": "705d79de1460e5e775f362f0d0f01fbe3ef8d65bf4648c490e4649704584f747"
+  },
+  "unicode": {
+    "url": "https://unicode.org/Public/17.0.0/emoji/emoji-test.txt",
+    "sha256": "1d8a944f88d7952f7ef7c5167fef3c67995bcae24543949710231b03a201acda"
+  },
+  "portuguese": {
+    "url": "https://raw.githubusercontent.com/unicode-org/cldr/release-48/common/annotations/pt.xml",
+    "sha256": "784be701f969963dc1d8240cd8ae02eb5bad28153bc9d0613e5c5777537e5398"
+  },
+  "portuguese_derived": {
+    "url": "https://raw.githubusercontent.com/unicode-org/cldr/release-48/common/annotationsDerived/pt.xml",
+    "sha256": "8810bb38da561be161413f6292a6ce4a81d815ae9b6906a16a5b38d89f398496"
+  },
+  "unicode_license": {
+    "url": "https://www.unicode.org/license.txt",
+    "sha256": "e7a93b009565cfce55919a381437ac4db883e9da2126fa28b91d12732bc53d96"
+  }
+}
