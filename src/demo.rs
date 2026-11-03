@@ -80,8 +80,8 @@ pub(crate) async fn seed(archive: &Archive) -> Result<()> {
     }
     let base = now() - 1200;
     for (jid, name) in [
-        (ANA, "Ana Martins"),
-        (LUCAS, "Lucas Ferreira"),
+        (ANA, "Ana Martins ✨"),
+        (LUCAS, "Lucas Ferreira 👨🏽‍💻"),
         ("12025550119@s.whatsapp.net", "Sofia Costa"),
     ] {
         archive
@@ -89,14 +89,14 @@ pub(crate) async fn seed(archive: &Archive) -> Result<()> {
             .await?;
     }
     for (jid, name, text) in [
-        (DESIGN, "Brazap Design", "Looks great. Let’s ship it!"),
-        (ANA, "Ana Martins", "Sent you a voice message"),
+        (DESIGN, "Brazap Design 🇧🇷", "Looks great. Let’s ship it! 💚"),
+        (ANA, "Ana Martins ✨", "Sent you a voice message"),
         (
             "120363000000002@g.us",
             "Weekend plans",
-            "Coffee on Saturday?",
+            "Coffee on Saturday? ☕️",
         ),
-        (LUCAS, "Lucas Ferreira", "Thanks! See you tomorrow."),
+        (LUCAS, "Lucas Ferreira 👨🏽‍💻", "Thanks! See you tomorrow. 💚"),
         (
             "120363000000003@g.us",
             "Rust community",
@@ -275,6 +275,44 @@ pub(crate) async fn seed(archive: &Archive) -> Result<()> {
         ));
     }
     archive.store_messages(rows, false).await?;
+    for (id, from_me, video, outcome, duration) in [
+        (
+            "demo-missed-call",
+            false,
+            false,
+            wa::message::call_log_message::CallOutcome::MISSED,
+            0,
+        ),
+        (
+            "demo-video-call",
+            true,
+            true,
+            wa::message::call_log_message::CallOutcome::CONNECTED,
+            83,
+        ),
+    ] {
+        let mut message = wa::Message::default();
+        let mut record = wa::message::CallLogMessage::default();
+        record.is_video = Some(video);
+        record.call_outcome = Some(outcome);
+        record.duration_secs = Some(duration);
+        message.call_log_messsage = MessageField::some(record);
+        archive
+            .store_messages(
+                vec![project_message(
+                    ANA.into(),
+                    if from_me { "self" } else { ANA }.into(),
+                    id.into(),
+                    from_me,
+                    base + if video { 301 } else { 300 },
+                    &message,
+                    String::new(),
+                    "{}".into(),
+                )],
+                false,
+            )
+            .await?;
+    }
     archive
         .set_chat_action(
             DESIGN.into(),
@@ -347,6 +385,12 @@ impl Service {
                 m.mimetype = Some(mime);
                 m.caption = Some(caption);
                 proto.video_message = MessageField::some(m);
+            }
+            "audio" => {
+                let mut m = wa::message::AudioMessage::default();
+                m.mimetype = Some(mime);
+                m.ptt = Some(false);
+                proto.audio_message = MessageField::some(m);
             }
             "sticker" => {
                 ensure!(mime == "image/webp", "Stickers must be WebP files");

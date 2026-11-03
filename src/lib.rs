@@ -18,6 +18,8 @@ pub mod model;
 pub mod notifications;
 #[cfg(feature = "desktop")]
 pub(crate) mod playback;
+#[cfg(feature = "desktop")]
+pub(crate) mod recording;
 pub mod search;
 pub mod service;
 pub mod settings;

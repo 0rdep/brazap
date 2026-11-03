@@ -42,6 +42,18 @@ struct HistoryRow {
     data: Vec<u8>,
 }
 
+#[derive(QueryableByName)]
+struct CallMessageRow {
+    #[diesel(sql_type=BigInt)]
+    cursor: i64,
+    #[diesel(sql_type=Text)]
+    payload: String,
+    #[diesel(sql_type=Binary)]
+    encoded: Vec<u8>,
+    #[diesel(sql_type=Text)]
+    metadata: String,
+}
+
 fn canonical(jid: &str) -> String {
     jid.parse::<whatsapp_rust::Jid>()
         .map(|jid| jid.to_non_ad().to_string())
@@ -49,6 +61,51 @@ fn canonical(jid: &str) -> String {
 }
 
 impl Archive {
+    pub async fn backfill_call_messages(&self) -> Result<()> {
+        let key = "call_message_projection_v1";
+        if self.preference(key.into()).await?.is_some() {
+            return Ok(());
+        }
+        let mut cursor = 0i64;
+        loop {
+            let account = self.account as i64;
+            let rows: Vec<CallMessageRow> = self.backend.shared().read(move |conn| {
+                diesel::sql_query("SELECT rowid AS cursor,payload,encoded,metadata FROM brazap_messages WHERE account=? AND rowid>? AND json_extract(payload,'$.kind') IN ('unsupported','text','placeholder','protocol') ORDER BY rowid LIMIT 256")
+                    .bind::<BigInt,_>(account).bind::<BigInt,_>(cursor).load(conn).map_err(db_error)
+            }).await?;
+            let Some(last) = rows.last() else {
+                break;
+            };
+            cursor = last.cursor;
+            let mut updates = Vec::new();
+            for row in rows {
+                let mut view: crate::model::Message = serde_json::from_str(&row.payload)?;
+                let raw = wa::Message::decode_from_slice(&row.encoded)?;
+                if crate::content::project_call(&mut view, &raw)
+                    || crate::content::project_call_stub(&mut view, &row.metadata)
+                {
+                    updates.push((row.cursor, crate::storage::message_payload(&view)?, view));
+                }
+            }
+            self.backend.shared().run(move |conn| {
+                conn.transaction::<_,diesel::result::Error,_>(|conn| {
+                    for (rowid, payload, view) in updates {
+                        let search = crate::storage::searchable(&view);
+                        // Update only the display projection; original bytes, sender,
+                        // timestamps, delivery status and local annotations stay intact.
+                        diesel::sql_query("UPDATE brazap_messages SET payload=? WHERE account=? AND rowid=?")
+                            .bind::<Text,_>(payload).bind::<BigInt,_>(account).bind::<BigInt,_>(rowid).execute(conn)?;
+                        diesel::sql_query("INSERT INTO brazap_message_search(account,chat,sender,id,text) VALUES(?,?,?,?,?) ON CONFLICT(account,chat,sender,id) DO UPDATE SET text=excluded.text")
+                            .bind::<BigInt,_>(account).bind::<Text,_>(view.chat).bind::<Text,_>(view.sender)
+                            .bind::<Text,_>(view.id).bind::<Text,_>(search).execute(conn)?;
+                    }
+                    Ok(())
+                }).map_err(db_error)
+            }).await?;
+        }
+        self.set_preference(key.into(), "1".into()).await
+    }
+
     pub async fn own_jids(&self) -> Result<Vec<String>> {
         use whatsapp_rust::store::traits::DeviceStore;
         Ok(self

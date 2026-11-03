@@ -1,0 +1,21 @@
+{
+  "metadata": {
+    "crate": "phonenumber 0.3.10+9.0.33",
+    "file": "assets/PhoneNumberMetadata.xml",
+    "sha256": "8235fe573e09770c6cea25b351ea5866999f147051e84c8973c07df87e17fb73"
+  },
+  "names": {
+    "en": {
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr/release-48/common/main/en.xml",
+      "sha256": "416fb34c500e969a9e3e9bd1e363f8af5938df3cdda72aa7e636fa7e72123aae"
+    },
+    "pt-BR": {
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr/release-48/common/main/pt.xml",
+      "sha256": "0c27d3da189672618048c2fdb20659fa99b28509dde3cc8720d7331a32723bdf"
+    },
+    "es": {
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr/release-48/common/main/es.xml",
+      "sha256": "b7c05dadf71f5acafa7f2bc8013f32f03e113d155fe893bdc8e27f8088cbdf0c"
+    }
+  }
+}

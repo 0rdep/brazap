@@ -5,6 +5,8 @@ import hashlib
 import io
 import json
 import re
+import subprocess
+import sys
 import tarfile
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -58,3 +60,6 @@ for line in data["unicode"].decode().splitlines():
 (out / "index.json").write_text(json.dumps(index, ensure_ascii=False, separators=(",", ":")))
 (out / "sources.json").write_text(json.dumps({name: {"url": url, "sha256": hashlib.sha256(data[name]).hexdigest()} for name,url in sources.items()}, indent=2)+"\n")
 print(f"Packed {len(index)} emoji, {len(packed):,} artwork bytes")
+
+# Keep text rendering and the picker on the same artwork revision.
+subprocess.run([sys.executable, str(root / "scripts/prepare-emoji-font.py")], check=True)

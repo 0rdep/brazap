@@ -13,11 +13,6 @@ const EXPAND: Icon = Icon {
     view: 24.0,
     body: r#"<rect x="3" y="4" width="18" height="16" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M9 4v16m4-12 4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.6"/>"#,
 };
-const PHONE: Icon = Icon {
-    name: "calls",
-    view: 24.0,
-    body: r#"<path d="m7 3 3 5-3 3c1.5 3 3 4.5 6 6l3-3 5 3c-1 4-3 5-6 3C9 18 6 15 3 9 1 6 3 4 7 3Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>"#,
-};
 pub(super) fn layout(s: &State, _cx: &mut Cx<State>, layer: &mut Vec<El>) -> El {
     let sidebar = if s.sidebar.is_open() {
         expanded(s)
@@ -334,17 +329,29 @@ fn chat_row(s: &State, chat: &Chat) -> El {
     let selected = s.selected.as_deref() == Some(&chat.jid);
     let jid = chat.jid.clone();
     let mut preview = row().grow(1.0).min_w(0.0).gap(4.0).center_y();
-    if chat.preview_from_me {
+    let is_call = matches!(
+        chat.preview_kind.as_str(),
+        "call" | "voice_call" | "video_call"
+    );
+    if chat.preview_from_me && !is_call {
         preview = preview.child(status_icon(&chat.preview_status, 12.0));
     }
     if let Some(glyph) = kind_icon(&chat.preview_kind) {
         preview = preview.child(icon(glyph, 13.0).color(MUTED));
     }
     preview = preview.child(
-        label(&chat.preview, 11.0, MUTED)
-            .grow(1.0)
-            .min_w(0.0)
-            .truncate(),
+        label(
+            if is_call {
+                super::locale::tr(&chat.preview)
+            } else {
+                chat.preview.clone()
+            },
+            11.0,
+            MUTED,
+        )
+        .grow(1.0)
+        .min_w(0.0)
+        .truncate(),
     );
     if chat.unread > 0 {
         preview = preview.child(

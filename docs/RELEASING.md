@@ -7,8 +7,9 @@ Release binaries and update metadata live in the public
 
 1. Update `[package].version` in `Cargo.toml` and refresh `Cargo.lock` with
    `./scripts/cargo check`, then verify the locked build.
-2. Complete formatting, compilation and manual checks. Commit and push to `main`.
-3. Tag that commit with the exact package version:
+2. Write user-facing release notes in `docs/releases/v<version>.md`.
+3. Complete formatting, compilation and manual checks. Commit and push to `main`.
+4. Tag that commit with the exact package version:
 
    ```sh
    git tag -a v0.1.0 -m "Brazap v0.1.0"

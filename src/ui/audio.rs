@@ -2,12 +2,12 @@ use super::{Command, State, view::*};
 use crate::{model::Message, playback};
 use rune::{Color, El, Icon, col, el, icon, row};
 
-const PLAY: Icon = Icon {
+pub(super) const PLAY: Icon = Icon {
     name: "play-voice",
     view: 24.0,
     body: r#"<path d="m9 5 11 7-11 7Z" fill="currentColor"/>"#,
 };
-const PAUSE: Icon = Icon {
+pub(super) const PAUSE: Icon = Icon {
     name: "pause-voice",
     view: 24.0,
     body: r#"<path d="M7 5h4v14H7zm7 0h4v14h-4z" fill="currentColor"/>"#,

@@ -1,8 +1,6 @@
 use rune::tok::motion;
-use rune::{
-    Color, Cx, El, FileDialogOptions, Icon, ScrollSpec, TextStyle, Tx, col, el, icon, row, text,
-};
-use rune_kit::{Kit, TextInput, glyphs};
+use rune::{Color, Cx, El, FileDialogOptions, Icon, ScrollSpec, Tx, col, el, icon, row, text};
+use rune_kit::{Kit, glyphs};
 use serde_json::json;
 
 use super::{State, actions, details, media, sidebar};
@@ -74,6 +72,11 @@ const VIDEO: Icon = Icon {
     view: 24.0,
     body: r#"<rect x="3" y="5" width="12" height="14" rx="3" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="m15 10 6-4v12l-6-4" fill="none" stroke="currentColor" stroke-width="1.7"/>"#,
 };
+pub(super) const PHONE: Icon = Icon {
+    name: "calls",
+    view: 24.0,
+    body: r#"<path d="m7 3 3 5-3 3c1.5 3 3 4.5 6 6l3-3 5 3c-1 4-3 5-6 3C9 18 6 15 3 9 1 6 3 4 7 3Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>"#,
+};
 const AUDIO: Icon = Icon {
     name: "audio",
     view: 24.0,
@@ -102,6 +105,8 @@ pub(super) fn kind_icon(kind: &str) -> Option<&'static Icon> {
         "video" => Some(&VIDEO),
         "sticker" => Some(&STICKER),
         "audio" => Some(&AUDIO),
+        "call" | "voice_call" => Some(&PHONE),
+        "video_call" => Some(&VIDEO),
         "template" | "contact" => Some(&CHAT),
         _ => None,
     }
@@ -254,7 +259,7 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
     let content = if connected {
         sidebar::layout(s, cx, &mut layer)
     } else {
-        pairing(s)
+        pairing(s, &mut layer)
     };
     let mut root = el()
         .key("brazap-window")
@@ -279,14 +284,16 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
                 b: 0.0065,
                 a: 1.0,
             },
-        )
-        .child(
+        );
+    if connected {
+        root = root.child(
             el().size(450.0, 450.0)
                 .absolute(-150.0, -180.0)
                 .radius(225.0)
                 .fill(MINT.alpha(0.035)),
-        )
-        .child(content);
+        );
+    }
+    root = root.child(content);
     if let Some(error) = &s.error {
         root = root.child(
             row()
@@ -329,60 +336,21 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
     if let Some(confirm) = super::preferences::confirmation(s) {
         layer.push(confirm);
     }
-    rune_kit::root(root, layer)
+    if let Some((modal, above)) = super::attachments::modal(s) {
+        layer.push(modal);
+        layer.extend(above);
+    }
+    rune_kit::root(root, layer).on_paste_content(|s: &mut State, content, _| s.paste_chat(content))
 }
 
-fn pairing(s: &State) -> El {
+fn pairing(s: &State, layer: &mut Vec<El>) -> El {
     let connection = &s.snapshot.connection;
-    let mut intro=col().w(365.0).gap(20.0)
-        .child(label(super::locale::tr("YOUR SPACE TO CONNECT"),11.0,MINT).font(TextStyle::new(11.0,650.0)))
-        .child(title(super::locale::tr("Your chats.\nYour own space."),40.0))
-        .child(label(super::locale::tr("Your WhatsApp conversations, in a calm desktop home. Connect your phone to get started."),15.0,MUTED).wrap())
-        .child(row().mt(16.0).gap(9.0).center_y().child(icon(&glyphs::LOCK,16.0).color(MINT)).child(label(super::locale::tr("Stored locally. End-to-end encrypted in transit."),11.0,MUTED)));
-    intro = intro.child(
-        label(
-            super::locale::tr(
-                "Your session stays on this device, so you only\nneed to link it once.",
-            ),
-            12.0,
-            MUTED,
-        )
-        .mt(10.0),
-    );
-    let tabs = row()
-        .w_full()
-        .padding(4.0)
-        .radius(12.0)
-        .fill(Color::BLACK.alpha(0.20))
-        .child(tab("QR code", !s.phone_mode, |s| s.phone_mode = false))
-        .child(tab("Phone number", s.phone_mode, |s| s.phone_mode = true));
-    let mut card = col()
-        .w(370.0)
-        .padding(28.0)
-        .gap(20.0)
-        .child(title(super::locale::tr("Link your WhatsApp"), 22.0))
-        .child(tabs);
+    let mut card = col().w(390.0).padding(28.0).gap(22.0);
     if s.phone_mode {
         card = card
-            .child(
-                label(
-                    super::locale::tr("Enter your number with its country code."),
-                    13.0,
-                    MUTED,
-                )
-                .wrap(),
-            )
-            .child(
-                TextInput::new(&s.phone)
-                    .placeholder("+55 11 99999 9999")
-                    .width(None)
-                    .on_edit(|s: &mut State| &mut s.phone)
-                    .on_submit(|s: &mut State, _| {
-                        s.tool("pair_phone", json!({"phone":s.phone.text}));
-                    })
-                    .build(kit())
-                    .h(44.0),
-            )
+            .child(title(super::locale::tr("Link your WhatsApp"), 22.0))
+            .child(label(super::locale::tr("Enter your phone number."), 13.0, MUTED).wrap())
+            .child(super::phone::input(s, layer))
             .child(button(
                 if s.busy {
                     "Requesting…"
@@ -392,14 +360,7 @@ fn pairing(s: &State) -> El {
                     "Get pairing code"
                 },
                 |s, _| {
-                    if !s.busy
-                        && s.snapshot
-                            .connection
-                            .pair_retry_at
-                            .is_none_or(|at| at <= s.second)
-                    {
-                        s.tool("pair_phone", json!({"phone":s.phone.text}));
-                    }
+                    s.request_phone_pairing();
                 },
             ));
         if let Some(code) = &connection.pairing_code {
@@ -423,55 +384,56 @@ fn pairing(s: &State) -> El {
             }
         }
     } else {
-        let qr = if let Some(image) = s.qr.as_ref().filter(|_| {
-            connection
-                .qr_expires_at
-                .is_none_or(|expires| expires > s.second)
-        }) {
+        let qr = if let Some(image) = &s.qr {
             let [width, height] = image.size().unwrap_or([248, 248]);
             el().size(width as f32, height as f32)
                 .pixels(image.pixels())
         } else {
             el().size(248.0, 248.0).center().child(
-                label(
-                    super::locale::tr(
-                        &(if connection.qr.is_some() {
-                            "QR code expired. Refresh to continue."
-                        } else {
-                            "Preparing QR code…"
-                        }),
-                    ),
-                    13.0,
-                    Color::BLACK,
-                )
-                .w(190.0)
-                .wrap(),
+                label(super::locale::tr("Preparing QR code…"), 13.0, Color::BLACK)
+                    .w(190.0)
+                    .wrap(),
             )
         };
         card = card
             .child(
-                el().w_full()
-                    .center()
-                    .child(el().padding(6.0).fill(Color::WHITE).radius(16.0).child(qr)),
+                el().w_full().center().child(
+                    el().key("pairing-qr")
+                        .padding(6.0)
+                        .fill(Color::WHITE)
+                        .radius(16.0)
+                        .role("img")
+                        .label(super::locale::tr("QR code"))
+                        .child(qr),
+                ),
             )
             .child(
                 col()
                     .gap(8.0)
-                    .child(label(
-                        super::locale::tr("1  Open WhatsApp on your phone"),
-                        12.0,
-                        MUTED,
-                    ))
-                    .child(label(
-                        super::locale::tr("2  Go to Settings → Linked Devices"),
-                        12.0,
-                        MUTED,
-                    ))
-                    .child(label(
-                        super::locale::tr("3  Tap Link a device and scan this code"),
-                        12.0,
-                        MUTED,
-                    )),
+                    .child(
+                        label(
+                            super::locale::tr("1  Open WhatsApp on your phone"),
+                            13.0,
+                            MUTED,
+                        )
+                        .wrap(),
+                    )
+                    .child(
+                        label(
+                            super::locale::tr("2  Go to Settings → Linked Devices"),
+                            13.0,
+                            MUTED,
+                        )
+                        .wrap(),
+                    )
+                    .child(
+                        label(
+                            super::locale::tr("3  Tap Link a device and scan this code"),
+                            13.0,
+                            MUTED,
+                        )
+                        .wrap(),
+                    ),
             );
     }
     if connection.notice.is_some() {
@@ -480,48 +442,31 @@ fn pairing(s: &State) -> El {
         }
         card = card.child(button("Try again", |s, _| s.tool("reconnect", json!({}))));
     }
-    col()
-        .w_full()
+    let alternative = if s.phone_mode {
+        "Use QR code"
+    } else {
+        "Link with phone number"
+    };
+    card = card.child(
+        row()
+            .w_full()
+            .h(36.0)
+            .center()
+            .radius(10.0)
+            .role("button")
+            .label(super::locale::tr(alternative))
+            .hover(MINT.alpha(0.06))
+            .on_press(|s: &mut State| {
+                s.phone_mode = !s.phone_mode;
+                s.phone_country.close();
+            })
+            .child(label(super::locale::tr(alternative), 13.0, MINT)),
+    );
+    el().w_full()
         .h_full()
         .padding(32.0)
-        .child(brand(s))
-        .child(
-            row()
-                .grow(1.0)
-                .w_full()
-                .gap(64.0)
-                .center()
-                .child(intro)
-                .child(panel(card)),
-        )
-        .child(
-            label(
-                super::locale::tr("BRAZAP  /  A native home for your conversations"),
-                10.0,
-                MUTED.alpha(0.65),
-            )
-            .center(),
-        )
-}
-
-pub(super) fn tab(name: &str, active: bool, action: fn(&mut State)) -> El {
-    el().grow(1.0)
-        .h(34.0)
         .center()
-        .radius(9.0)
-        .fill(if active {
-            Color::WHITE.alpha(0.07)
-        } else {
-            Color::TRANSPARENT
-        })
-        .role("tab")
-        .label(super::locale::tr(name))
-        .on_press(action)
-        .child(label(
-            super::locale::tr(name),
-            12.0,
-            if active { INK } else { MUTED },
-        ))
+        .child(panel(card))
 }
 
 pub(super) fn conversation(s: &State, jid: &str, layer: &mut Vec<El>) -> El {
@@ -879,7 +824,56 @@ fn message_bubble(s: &State, message: &Message) -> El {
     if !message.title.is_empty() {
         bubble = bubble.child(title(&message.title, 14.0).wrap());
     }
-    if !message.text.is_empty() {
+    if message.is_call() {
+        let mut detail = row().gap(6.0).center_y().child(label(
+            super::locale::tr(if mine { "Outgoing" } else { "Incoming" }),
+            11.0,
+            MUTED,
+        ));
+        if !message.footer.is_empty() {
+            detail = detail.child(label("·", 11.0, MUTED)).child(label(
+                super::locale::tr(&message.footer),
+                11.0,
+                MUTED,
+            ));
+        }
+        if let Some(seconds) = message.duration_seconds.filter(|s| *s > 0) {
+            detail = detail.child(label("·", 11.0, MUTED)).child(label(
+                format!("{}:{:02}", seconds / 60, seconds % 60),
+                11.0,
+                MUTED,
+            ));
+        }
+        bubble = bubble.child(
+            row()
+                .gap(12.0)
+                .center_y()
+                .min_w(210.0)
+                .child(
+                    el().size(42.0, 42.0)
+                        .radius(21.0)
+                        .fill(MINT.alpha(0.12))
+                        .center()
+                        .child(
+                            icon(
+                                if message.kind == "video_call" {
+                                    &VIDEO
+                                } else {
+                                    &PHONE
+                                },
+                                22.0,
+                            )
+                            .color(MINT),
+                        ),
+                )
+                .child(
+                    col()
+                        .gap(7.0)
+                        .child(title(super::locale::tr(&message.text), 14.0))
+                        .child(detail),
+                ),
+        );
+    } else if !message.text.is_empty() {
         bubble = bubble.child(label(&message.text, 14.0, INK).wrap().selectable(true));
     }
     if matches!(message.kind.as_str(), "image" | "video" | "sticker") {
@@ -927,7 +921,7 @@ fn message_bubble(s: &State, message: &Message) -> El {
                 ),
         );
     }
-    if !message.footer.is_empty() {
+    if !message.footer.is_empty() && !message.is_call() {
         bubble = bubble.child(label(&message.footer, 11.0, MUTED).wrap());
     }
     for action in &message.actions {
@@ -959,7 +953,7 @@ fn message_bubble(s: &State, message: &Message) -> El {
         label(clock(message.timestamp), 9.0, MUTED)
             .help(super::times::day_label(message.timestamp)),
     );
-    if mine {
+    if mine && !message.is_call() {
         metadata = metadata.child(status_icon(&message.status, 14.0));
     }
     bubble = bubble.child(metadata);
@@ -994,7 +988,8 @@ fn composer(s: &State, layer: &mut Vec<El>) -> El {
     if let Some(selection) = actions::selection_bar(s) {
         return selection;
     }
-    let enabled = s.snapshot.connection.phase == Phase::Connected && !s.busy;
+    let recording = s.recording.is_some();
+    let enabled = s.snapshot.connection.phase == Phase::Connected && !s.busy && !recording;
     let edit = rune::text_input(&s.draft, super::locale::style(13.0, 450.0))
         .key("composer-edit")
         .w_full()
@@ -1003,6 +998,7 @@ fn composer(s: &State, layer: &mut Vec<El>) -> El {
         .caret(INK, kit().selection());
     let edit = if enabled {
         edit.on_edit(|s: &mut State| &mut s.draft)
+            .on_input_paste(|s: &mut State, content, _| s.paste_attachments(content))
             .on_submit(|s: &mut State, _| s.send())
     } else {
         edit
@@ -1023,7 +1019,9 @@ fn composer(s: &State, layer: &mut Vec<El>) -> El {
         .on_press(|s: &mut State| s.send())
         .child(icon(&SEND, 21.0).color(Color::BLACK));
     let trigger = icon_button(&PLUS, "Add an attachment", |s, _| {
-        s.attachments_open = !s.attachments_open
+        if s.recording.is_none() {
+            s.attachments_open = !s.attachments_open;
+        }
     });
     let mut menu = col().w(250.0).gap(4.0);
     for (glyph, name, description, kind) in [
@@ -1034,6 +1032,7 @@ fn composer(s: &State, layer: &mut Vec<El>) -> El {
             "sticker",
         ),
         (&MEDIA, "Photos & videos", "Share images or videos", "media"),
+        (&AUDIO, "Audio", "Share an audio file", "audio"),
         (&FILE, "File", "Send a document or any file", "file"),
     ] {
         menu = menu.child(
@@ -1080,15 +1079,17 @@ fn composer(s: &State, layer: &mut Vec<El>) -> El {
     if let Some(reply) = actions::reply_banner(s) {
         content = content.child(reply);
     }
+    let controls = row()
+        .key("composer-controls")
+        .gap(10.0)
+        .center_y()
+        .child(super::picker::trigger(s, layer))
+        .child(attach);
     content.child(
-        row()
-            .key("composer-controls")
-            .gap(10.0)
-            .center_y()
-            .child(super::picker::trigger(s, layer))
-            .child(attach)
+        controls
             .child(field)
-            .child(send),
+            .child(send)
+            .child(super::recording::button(s, layer)),
     )
 }
 
@@ -1096,11 +1097,14 @@ pub(super) fn pick_file(s: &mut State, tx: &mut Tx, kind: &'static str) {
     if s.busy || s.snapshot.connection.phase != Phase::Connected {
         return;
     }
+    if s.recording.is_some() {
+        return;
+    }
     let Some(chat) = s.selected.clone() else {
         return;
     };
     let mut options = FileDialogOptions {
-        title: "Choose an attachment".into(),
+        title: super::locale::tr("Choose an attachment").into(),
         ..Default::default()
     };
     if kind == "sticker" {
@@ -1112,24 +1116,17 @@ pub(super) fn pick_file(s: &mut State, tx: &mut Tx, kind: &'static str) {
             &["png", "jpg", "jpeg", "webp", "mp4", "mov"],
         );
     }
+    if kind == "audio" {
+        options = options.filter(
+            super::locale::tr("Audio"),
+            &["mp3", "m4a", "ogg", "wav", "aac", "flac", "opus"],
+        );
+    }
     tx.open_file(options, move |s: &mut State, result, _| match result {
-        Ok(Some(path)) => {
-            let mime = mime_guess::from_path(&path).first_or_octet_stream();
-            let send_kind = if kind == "media" {
-                if mime.type_() == mime_guess::mime::VIDEO {
-                    "video"
-                } else {
-                    "image"
-                }
-            } else {
-                kind
-            };
-            s.tool(
-                "send_attachment",
-                json!({"chat":chat,"path":path,"kind":send_kind,"caption":""}),
-            );
+        Ok(Some(path)) if s.selected.as_ref() == Some(&chat) => {
+            s.queue_attachments(vec![super::attachments::Source::File(path, kind == "file")]);
         }
-        Ok(None) => {}
+        Ok(_) => {}
         Err(error) => s.error = Some(error.to_string()),
     });
 }

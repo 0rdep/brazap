@@ -87,3 +87,39 @@ index 1dc89b9..4237772 100644
              trace: Default::default(),
          }))
          .map_err(|error| format!("no GPU device: {error}"))
+
+diff --git a/crates/rune/src/text.rs b/crates/rune/src/text.rs
+--- a/crates/rune/src/text.rs
++++ b/crates/rune/src/text.rs
+@@ -148,7 +148,7 @@
+     pub mono: String,
+     symbol_families: Vec<&'static str>,
+     /// The colour emoji family among `symbol_families`.
+-    emoji: Option<&'static str>,
++    emoji: Option<String>,
+     /// The installed math families, once a text has needed them.
+     math: Option<Vec<&'static str>>,
+     /// The installed `Family::SystemMono` families, once a text has needed them.
+@@ -262,7 +262,11 @@
+         let mut font_files = LoadedFiles::new();
+         register_cjk_fallbacks(&mut collection, &mut font_files, &registered, families);
+         let symbol_families = load_families(&mut collection, SYMBOL_FONT_FILES, SYMBOL_FAMILIES);
+-        let emoji = symbol_families.iter().copied().find(|f| f.contains("Emoji"));
++        // Prefer an explicitly bundled emoji family over the platform fallback.
++        let emoji = registered.iter()
++            .filter_map(|id| collection.family_name(*id).map(str::to_owned))
++            .find(|name| name.contains("Emoji"))
++            .or_else(|| symbol_families.iter().find(|name| name.contains("Emoji")).map(|name| (*name).to_owned()));
+         #[cfg(target_arch = "wasm32")]
+         let families = if fonts.is_empty() { ("Inter", "IBM Plex Mono") } else { families };
+         let (sans, mono) = families::slots(families.0, families.1);
+@@ -575,7 +579,8 @@
+             self.system_mono();
+         }
+         let math = self.math.as_deref().unwrap_or(&[]);
+-        let emoji = self.emoji.as_slice();
++        let emoji_family = self.emoji.as_deref();
++        let emoji = emoji_family.as_slice();
+         let system = self.system_mono.as_deref().unwrap_or_default();
+         let with_symbols = |primary| {
+             family_list(primary, system, self.sans.as_str())

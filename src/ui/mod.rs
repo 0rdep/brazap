@@ -1,13 +1,16 @@
 mod actions;
 mod animation;
+mod attachments;
 mod audio;
 mod details;
 mod diagnostics;
 mod locale;
 mod mcp;
 mod media;
+mod phone;
 mod picker;
 mod preferences;
+mod recording;
 mod render;
 mod sidebar;
 mod times;
@@ -56,6 +59,9 @@ enum Command {
     Asset(String, AssetRequest),
     Video(u64, Message),
     Audio(u64, Message),
+    SendVoice(u64, crate::model::VoiceUpload),
+    PrepareAttachment(u64, u64, attachments::Source),
+    SendAttachments(u64, String, Vec<attachments::Upload>),
     Preferences(&'static str, Value),
     Diagnostics,
     Select(String),
@@ -76,6 +82,10 @@ enum Event {
     Asset(String, Result<Option<Vec<u8>>, String>),
     Video(u64, Result<tempfile::TempPath, String>),
     Audio(u64, Result<tempfile::TempPath, String>),
+    VoiceSent(u64, Result<Message, String>),
+    AttachmentPrepared(u64, u64, Result<attachments::Prepared, String>),
+    AttachmentSent(u64, u64, Result<Message, String>),
+    AttachmentsFinished(u64),
     Preferences(&'static str, Result<Value, String>),
     Diagnostics(Result<Value, String>),
     Done(Result<Value, String>),
@@ -108,6 +118,11 @@ pub(super) struct State {
     voice_generation: u64,
     voice_next_tick: Option<f64>,
     voice_rate: f64,
+    recording: Option<recording::Panel>,
+    recording_generation: u64,
+    attachments: Option<attachments::Panel>,
+    attachment_generation: u64,
+    attachment_sequence: u64,
     diagnostics: diagnostics::Panel,
     section: Section,
     sidebar: rune_kit::shell::PaneState,
@@ -140,6 +155,7 @@ pub(super) struct State {
     search: TextEdit,
     draft: TextEdit,
     phone: TextEdit,
+    phone_country: phone::Picker,
     address: TextEdit,
     drafts: HashMap<String, String>,
     phone_mode: bool,
@@ -227,6 +243,11 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         voice_generation: 0,
         voice_next_tick: None,
         voice_rate: 1.0,
+        recording: None,
+        recording_generation: 0,
+        attachments: None,
+        attachment_generation: 0,
+        attachment_sequence: 0,
         diagnostics: diagnostics::Panel::default(),
         section: Section::Messages,
         sidebar: rune_kit::shell::PaneState::new(305.0).range(260.0, 440.0),
@@ -259,6 +280,7 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         search: TextEdit::new(""),
         draft: TextEdit::new(""),
         phone: TextEdit::new(""),
+        phone_country: phone::Picker::default(),
         address: TextEdit::new(""),
         drafts: HashMap::new(),
         phone_mode: false,
@@ -295,6 +317,13 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         wake,
     };
     let spec = AppSpec {
+        fonts: &[
+            include_bytes!("../../assets/fonts/Inter-Regular.ttf"),
+            include_bytes!("../../assets/fonts/Inter-Medium.ttf"),
+            include_bytes!("../../assets/fonts/Inter-SemiBold.ttf"),
+            include_bytes!("../../assets/emoji/BrazapEmoji.ttf"),
+        ],
+        families: ("Inter, 'Brazap Emoji'", "Inter, 'Brazap Emoji'"),
         min_size: Some((860.0, 620.0)),
         setup: Some(setup),
         poll: Some(poll),
@@ -335,6 +364,7 @@ fn setup(state: &mut State, wake: Waker) {
             cache.rgba(pixels.width(), pixels.height(), pixels.into_raw())
         });
     state.image_cache = Some(cache);
+    state.load_phone_flags(false);
     if let Ok(mut slot) = state.wake.lock() {
         *slot = Some(wake);
     }
@@ -371,6 +401,7 @@ async fn worker(
         emit(&events, &wake, Event::Activate(Some(chat)));
     }
     let mut selected = None;
+    let attachment_slots = Arc::new(tokio::sync::Semaphore::new(1));
     let avatar_slots = Arc::new(tokio::sync::Semaphore::new(2));
     let media_slots = Arc::new(tokio::sync::Semaphore::new(4));
     let mut assets = tokio::task::JoinSet::new();
@@ -446,6 +477,37 @@ async fn worker(
                                 tokio::task::spawn_blocking(move||crate::playback::prepare_audio(file)).await?
                             }.await.map_err(|e|format!("{e:#}"));
                             emit(&events,&wake,Event::Audio(generation,result));
+                        });continue;
+                    }
+                    Some(Command::PrepareAttachment(generation,id,source))=>{
+                        let events=events.clone();let wake=wake.clone();let slots=attachment_slots.clone();
+                        assets.spawn(async move {
+                            let _permit=slots.acquire_owned().await;
+                            let result=attachments::prepare(source).await.map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::AttachmentPrepared(generation,id,result));
+                        });continue;
+                    }
+                    Some(Command::SendAttachments(generation,chat,uploads))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            for upload in uploads {
+                                let result=remote.call("send_attachment",json!({"chat":chat,"path":upload.path,"kind":upload.kind,"caption":upload.caption})).await
+                                    .and_then(|value|Ok(serde_json::from_value(value["message"].clone())?))
+                                    .map_err(|e|format!("{e:#}"));
+                                let failed=result.is_err();
+                                emit(&events,&wake,Event::AttachmentSent(generation,upload.id,result));
+                                if failed { break; }
+                            }
+                            emit(&events,&wake,Event::AttachmentsFinished(generation));
+                        });continue;
+                    }
+                    Some(Command::SendVoice(generation,upload))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=remote.call("send_voice",json!(upload)).await
+                                .and_then(|v|Ok(serde_json::from_value(v["message"].clone())?))
+                                .map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::VoiceSent(generation,result));
                         });continue;
                     }
                     Some(Command::Preferences(action,args))=>{
@@ -534,6 +596,13 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
             .chain(state.avatars.values())
             .chain(state.logo.iter())
             .chain(state.picker.images.values())
+            .chain(
+                state
+                    .attachments
+                    .iter()
+                    .flat_map(|p| p.items.iter())
+                    .filter_map(|i| i.image.as_ref()),
+            )
             .filter_map(|image| image.size())
             .map(|[w, h]| u64::from(w) * u64::from(h) * 16 / 3)
             .sum::<u64>()
@@ -541,7 +610,15 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
         Relaxed,
     );
     IMAGE_COUNT.store(
-        state.images.len() + state.avatars.len() + state.picker.images.len(),
+        state.images.len()
+            + state.avatars.len()
+            + state.picker.images.len()
+            + state
+                .attachments
+                .iter()
+                .flat_map(|p| p.items.iter())
+                .filter(|i| i.image.is_some())
+                .count(),
         Relaxed,
     );
     MESSAGE_COUNT.store(state.timeline.len(), Relaxed);
@@ -549,6 +626,22 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
     while let Ok(event) = state.rx.try_recv() {
         match event {
+            Event::AttachmentPrepared(generation, id, result) => {
+                state.receive_attachment(generation, id, result);
+                changed = true;
+            }
+            Event::AttachmentSent(generation, id, result) => {
+                state.receive_attachment_sent(generation, id, result, tx);
+                changed = true;
+            }
+            Event::AttachmentsFinished(generation) => {
+                state.finish_attachments(generation);
+                changed = true;
+            }
+            Event::VoiceSent(generation, result) => {
+                state.receive_recording(generation, result, tx);
+                changed = true;
+            }
             Event::Activate(chat) => {
                 if let Some(chat) = chat {
                     state.select(chat);
@@ -616,12 +709,20 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
                         }
                         _ => {}
                     }
-                    if state.qr_payload != snapshot.connection.qr {
-                        state.qr_payload = snapshot.connection.qr.clone();
-                        state.qr = state
-                            .qr_payload
-                            .as_deref()
-                            .and_then(|payload| make_qr(payload, state.image_cache.as_ref()?));
+                    if state.authenticated {
+                        state.qr_payload = None;
+                        state.qr = None;
+                    } else if let Some(payload) = &snapshot.connection.qr
+                        && state.qr_payload.as_ref() != Some(payload)
+                        && let Some(image) = state
+                            .image_cache
+                            .as_ref()
+                            .and_then(|cache| make_qr(payload, cache))
+                    {
+                        // Replace atomically once the next code can be drawn.
+                        // Reconnecting snapshots must not blank the previous QR.
+                        state.qr_payload = Some(payload.clone());
+                        state.qr = Some(image);
                     }
                     if !state.preferences.saving {
                         state.preferences.value = snapshot.settings.clone();
@@ -1002,16 +1103,27 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
     if times::day(second) != times::day(state.second) {
         changed = true;
     }
+    if state.attachments.as_ref().is_some_and(|p| {
+        !p.sending
+            && (!state.authenticated
+                || (state.selected.as_ref() != Some(&p.chat)
+                    && !state
+                        .snapshot
+                        .current_chat
+                        .as_ref()
+                        .is_some_and(|c| c.matches_jid(&p.chat))))
+    }) {
+        state.cancel_attachments();
+        changed = true;
+    }
+    changed |= state.poll_recording(elapsed, tx);
     let connection = &state.snapshot.connection;
     let ticking = !state.authenticated
-        && [
-            connection.qr_expires_at,
-            connection.code_expires_at,
-            connection.pair_retry_at,
-        ]
-        .into_iter()
-        .flatten()
-        .any(|expires| expires > second);
+        && state.phone_mode
+        && [connection.code_expires_at, connection.pair_retry_at]
+            .into_iter()
+            .flatten()
+            .any(|expires| expires > second);
     if ticking {
         // Keep one countdown wake pending. Scheduling on every animation frame
         // would turn those wakes into a permanent stream of redraws.
@@ -1082,6 +1194,19 @@ impl State {
             .find(|c| c.matches_jid(&chat))
             .map(|c| c.jid.clone())
             .unwrap_or(chat);
+        if self.attachments.as_ref().is_some_and(|p| p.chat != chat) {
+            self.error = Some("Finish or discard the attachments before switching chats.".into());
+            return;
+        }
+        if self
+            .recording
+            .as_ref()
+            .is_some_and(|recording| recording.chat != chat)
+        {
+            self.error =
+                Some("Finish or discard the voice recording before switching chats.".into());
+            return;
+        }
         if self.forwarding.as_ref().is_some_and(|f| f.sending) {
             return;
         }
@@ -1133,7 +1258,11 @@ impl State {
         }
     }
     fn send(&mut self) {
-        if self.busy || self.draft.text.trim().is_empty() {
+        if self.busy
+            || self.recording.is_some()
+            || self.attachments.is_some()
+            || self.draft.text.trim().is_empty()
+        {
             return;
         }
         if let Some(chat) = &self.selected {
@@ -1155,9 +1284,17 @@ fn on_key(s: &mut State, event: &rune::KeyEvent, _: &mut Tx) -> bool {
         return true;
     }
     if event.key == rune::Key::Escape {
+        if s.recording.is_some() {
+            s.cancel_recording();
+            return true;
+        }
         if s.picker.open {
             s.picker.open = false;
             s.picker.images.clear();
+            return true;
+        }
+        if s.attachments.is_some() {
+            s.cancel_attachments();
             return true;
         }
         if s.preferences.logout || s.preferences.confirm_cache {

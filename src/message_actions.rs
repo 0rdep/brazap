@@ -31,7 +31,7 @@ pub(crate) fn store_reaction(
 }
 
 impl Service {
-    async fn author(&self, sender: &str) -> Result<whatsapp_rust::Jid> {
+    pub(crate) async fn author(&self, sender: &str) -> Result<whatsapp_rust::Jid> {
         if sender == "self" {
             if self.config.demo {
                 return Ok(crate::demo::OWN.parse()?);

@@ -77,9 +77,13 @@ can interact with WhatsApp, including reading and sending messages.
 - Phone-number linking accepts a number with country code, requests a pairing
   code, and shows instructions to enter that code in WhatsApp's Linked Devices
   flow on the phone. A phone number alone does not authenticate the client.
-- Show QR/code loading, expiry, and actionable retry/error states. Do not show
-  routine connection labels or green status dots on the pairing screen or sidebar.
-  Respect pairing cooldowns and keep QR rotation separate from phone code refreshes.
+- Keep the initial pairing screen minimal: a centered QR code, linking
+  instructions, and a discreet alternative for phone-number linking. Do not
+  add promotional copy, routine connection labels, or green status dots.
+- Show initial QR loading and actionable errors. Keep the last QR visible
+  through expiry and reconnection until its replacement is ready; do not show
+  QR-expired messages. Respect phone-code expiry and pairing cooldowns, and
+  keep QR rotation separate from phone code refreshes.
 - Enter the chat layout after the library confirms authentication. Restore the
   saved session on subsequent launches without requiring another pairing.
 - Distinguish temporary disconnections from logout or an invalid session. Retry

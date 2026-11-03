@@ -6,6 +6,11 @@ The default performance policy reserves large blocks even for a mostly idle
 chat window. Small blocks reduce unused reservation; buffers and textures can
 still grow with the content they actually need.
 
+The same tracked patch lets an emoji font explicitly registered by the app take
+priority over system emoji fonts. Brazap uses this to render its bundled Twemoji
+artwork inside normal text, including names, previews, messages and menus.
+This preserves Rune's shaping, wrapping, selection and truncation behavior.
+
 The patch also adapts the Windows adapter-selection part of
 [zAcherttp's Rune PR #46](https://github.com/anomalyco/rune/pull/46), reviewed at
 `2f6ab83ecdadd5819cf638496fb5a0f9529540ca`. After explicit `WGPU_ADAPTER_NAME` and

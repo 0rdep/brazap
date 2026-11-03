@@ -50,6 +50,11 @@ fn emojis() -> &'static [Emoji] {
     })
 }
 
+pub(super) fn emoji_artwork(value: &str) -> Option<&'static [u8]> {
+    let emoji = emojis().iter().find(|emoji| emoji.text == value)?;
+    ART.get(emoji.offset..emoji.offset + emoji.length)
+}
+
 #[derive(Clone, Copy, Default, PartialEq)]
 pub(super) enum Tab {
     #[default]
@@ -59,6 +64,7 @@ pub(super) enum Tab {
 #[derive(Default)]
 pub(super) struct Panel {
     pub open: bool,
+    pub for_attachment: bool,
     tab: Tab,
     query: TextEdit,
     rendered_query: String,
@@ -116,6 +122,7 @@ impl Panel {
 impl State {
     pub(super) fn open_picker(&mut self, tab: Tab, target: Option<Message>) {
         self.picker.open = true;
+        self.picker.for_attachment = false;
         self.picker.tab = tab;
         self.picker.target = target;
         self.picker.query.clear();
@@ -211,6 +218,13 @@ impl State {
         if let Some(target) = self.picker.target.take() {
             self.picker.open = false;
             self.send_reaction(target, text);
+        } else if self.picker.for_attachment {
+            if let Some(panel) = &mut self.attachments
+                && !panel.sending
+                && let Some(item) = panel.items.get_mut(panel.selected)
+            {
+                item.caption.insert(&text);
+            }
         } else {
             self.draft.insert(&text);
         }
@@ -218,16 +232,46 @@ impl State {
 }
 
 pub(super) fn trigger(s: &State, layer: &mut Vec<El>) -> El {
-    let button = icon_button(&SMILE, "Emojis and stickers", |s, _| {
-        if s.picker.open {
+    trigger_for(s, layer, false)
+}
+
+pub(super) fn attachment_trigger(s: &State, layer: &mut Vec<El>) -> El {
+    trigger_for(s, layer, true)
+}
+
+fn trigger_for(s: &State, layer: &mut Vec<El>, attachment: bool) -> El {
+    let key = if attachment {
+        "attachment-emoji-trigger"
+    } else {
+        "expression-picker-trigger"
+    };
+    let label_ = if attachment {
+        "Emoji"
+    } else {
+        "Emojis and stickers"
+    };
+    let button = icon_button(&SMILE, label_, move |s, _| {
+        if s.recording.is_some()
+            || (attachment
+                && !s
+                    .attachments
+                    .as_ref()
+                    .is_some_and(|p| p.caption_available()))
+            || (s.attachments.is_some() && !attachment)
+            || s.attachments.as_ref().is_some_and(|p| p.sending)
+        {
+            return;
+        }
+        if s.picker.open && s.picker.for_attachment == attachment {
             s.picker.open = false;
             s.picker.images.clear();
         } else {
             s.open_picker(Tab::Emoji, None);
+            s.picker.for_attachment = attachment;
         }
-    });
-    let button = button.key("expression-picker-trigger");
-    if s.picker.open {
+    })
+    .key(key);
+    if s.picker.open && s.picker.for_attachment == attachment {
         layer.push(
             el().key("expression-picker-scrim")
                 .absolute(0.0, 0.0)
@@ -241,8 +285,8 @@ pub(super) fn trigger(s: &State, layer: &mut Vec<El>) -> El {
         let content = panel(view(s))
             .radius(16.0)
             .role("dialog")
-            .label(super::locale::tr("Emojis and stickers"))
-            .focus_return("expression-picker-trigger")
+            .label(super::locale::tr(label_))
+            .focus_return(key)
             .on_press(|_: &mut State| {})
             .on_key(|s: &mut State, event, _| {
                 if event.key == rune::Key::Escape {
@@ -256,13 +300,14 @@ pub(super) fn trigger(s: &State, layer: &mut Vec<El>) -> El {
         layer.push(rune_kit::popover::anchored(
             kit(),
             content,
-            "expression-picker-trigger",
+            key,
             Placement::TopStart,
             8.0,
         ));
     }
     button
 }
+
 fn view(s: &State) -> El {
     let mut search = TextInput::new(&s.picker.query)
         .leading_icon(&glyphs::SEARCH)
@@ -486,7 +531,10 @@ fn view(s: &State) -> El {
         }
     }
     let mut tabs = row().w_full().center().gap(12.0);
-    for (tab, name) in [(Tab::Emoji, "Emoji"), (Tab::Stickers, "Stickers")] {
+    for (tab, name) in [(Tab::Emoji, "Emoji"), (Tab::Stickers, "Stickers")]
+        .into_iter()
+        .filter(|(tab, _)| !s.picker.for_attachment || *tab == Tab::Emoji)
+    {
         tabs = tabs.child(
             label(
                 super::locale::tr(name),

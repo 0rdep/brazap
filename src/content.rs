@@ -2,6 +2,83 @@ use crate::model::{Message, MessageAction};
 use std::borrow::Cow;
 use whatsapp_rust::prelude::{MessageExt, wa};
 
+fn call(view: &mut Message, video: Option<bool>, outcome: Option<&str>, duration: Option<u32>) {
+    let (kind, label) = match video {
+        Some(true) => ("video_call", "Video call"),
+        Some(false) => ("voice_call", "Voice call"),
+        None => ("call", "Call"),
+    };
+    view.kind = kind.into();
+    view.text = label.into();
+    view.duration_seconds = duration;
+    view.footer = outcome.unwrap_or_default().into();
+}
+
+pub(crate) fn project_call(view: &mut Message, message: &wa::Message) -> bool {
+    use wa::message::{b_call_message::MediaType, call_log_message::CallOutcome};
+    let base = message.get_base_message();
+    // The extra 's' is the field spelling in WhatsApp's protobuf schema.
+    if let Some(record) = base.call_log_messsage.as_option() {
+        let outcome = match record.call_outcome {
+            Some(CallOutcome::MISSED) if view.from_me => Some("Unanswered"),
+            Some(CallOutcome::MISSED) => Some("Missed"),
+            Some(CallOutcome::FAILED) => Some("Failed"),
+            Some(CallOutcome::REJECTED) => Some("Declined"),
+            Some(CallOutcome::ACCEPTED_ELSEWHERE) => Some("Answered on another device"),
+            Some(CallOutcome::ONGOING) => Some("Ongoing"),
+            Some(CallOutcome::SILENCED_BY_DND | CallOutcome::SILENCED_UNKNOWN_CALLER) => {
+                Some("Silenced")
+            }
+            _ => None,
+        };
+        call(
+            view,
+            record.is_video,
+            outcome,
+            record.duration_secs.and_then(|n| u32::try_from(n).ok()),
+        );
+    } else if let Some(record) = base.bcall_message.as_option() {
+        let video = match record.media_type {
+            Some(MediaType::VIDEO) => Some(true),
+            Some(MediaType::AUDIO) => Some(false),
+            _ => None,
+        };
+        call(view, video, None, None);
+    } else if base.call.is_set() {
+        call(view, None, None, None);
+    } else {
+        return false;
+    }
+    true
+}
+
+pub(crate) fn project_call_stub(view: &mut Message, metadata: &str) -> bool {
+    if !metadata.contains("messageStubType") && !metadata.contains("message_stub_type") {
+        return false;
+    }
+    let Ok(info) = serde_json::from_str::<serde_json::Value>(metadata) else {
+        return false;
+    };
+    let Some(stub) = info
+        .get("messageStubType")
+        .or_else(|| info.get("message_stub_type"))
+    else {
+        return false;
+    };
+    let video = match (stub.as_str(), stub.as_i64()) {
+        (Some("CALL_MISSED_VOICE" | "CALL_MISSED_GROUP_VOICE"), _) | (_, Some(40 | 45)) => false,
+        (Some("CALL_MISSED_VIDEO" | "CALL_MISSED_GROUP_VIDEO"), _) | (_, Some(41 | 46)) => true,
+        _ => return false,
+    };
+    call(
+        view,
+        Some(video),
+        Some(if view.from_me { "Unanswered" } else { "Missed" }),
+        None,
+    );
+    true
+}
+
 fn action(view: &mut Message, label: Option<&str>, target: Option<&str>) {
     if let Some(label) = label.filter(|s| !s.trim().is_empty()) {
         view.actions.push(MessageAction {
@@ -105,6 +182,9 @@ fn template(view: &mut Message, t: &wa::message::TemplateMessage) {
 /// The archive keeps the original protobuf. This is only its user-visible projection.
 pub fn project(view: &mut Message, message: &wa::Message) {
     let base = message.get_base_message();
+    if project_call(view, message) {
+        return;
+    }
     if let Some(context) = base.context_info() {
         view.forwarded = context.is_forwarded.unwrap_or(false);
         if let (Some(id), Some(quoted)) = (&context.stanza_id, context.quoted_message.as_option()) {

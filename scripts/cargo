@@ -10,6 +10,11 @@ cd "$project_root"
 
 # Use the optional, ignored development toolchain on minimal Linux hosts.
 # Ordinary developer machines use their installed compiler and pkg-config.
+for build_tools in "$project_root/.build-deps/tools/cmake/cmake/data/bin" "$project_root/.build-deps/tools/bin"; do
+    if [[ -d "$build_tools" ]]; then
+        export PATH="$build_tools:$PATH"
+    fi
+done
 if [[ -x .build-deps/cc && -x .build-deps/root/usr/bin/pkgconf ]]; then
     export CC="$project_root/.build-deps/cc"
     export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$CC"

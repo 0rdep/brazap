@@ -9,8 +9,14 @@ stdio MCP adapter share one service and one SQLite archive.
 - Windows: Visual Studio C++ build tools and Windows SDK, including `rc.exe`.
   Run the build from Git Bash with the developer environment loaded.
 - Linux: a C compiler, `pkg-config`, Wayland, xkbcommon and fontconfig headers.
-  On Ubuntu: `sudo apt install build-essential pkg-config libwayland-dev libxkbcommon-dev libfontconfig1-dev`.
+  On Ubuntu: `sudo apt install build-essential cmake pkg-config libasound2-dev libwayland-dev libxkbcommon-dev libfontconfig1-dev`.
 - macOS: Xcode Command Line Tools.
+
+CMake is required for the bundled Opus voice encoder on every platform. Microphone
+capture uses the system's default input device; recordings are encoded while
+capturing, and the original Ogg Opus bytes are retained in SQLite after sending.
+Demo mode substitutes a synthetic microphone signal and sends only to its local
+demo archive.
 
 A desktop session and a working GPU driver are needed to run the UI. Linux uses
 Vulkan and desktop portals for native file dialogs.
@@ -95,3 +101,30 @@ GPU reservation, actual allocation and process working set are different metrics
 The README captures the actual Windows UI using fictional fixture conversations
 and the offline `--demo` SQLite profile. Screenshots do not contain a real WhatsApp
 session, personal messages, contact photos or a usable pairing QR code.
+
+## Voice recording
+
+The composer microphone opens a vertical recorder above its button. Pause stops
+microphone capture, Play previews the local recording, and Resume appends audio
+without the paused interval. Sending is an explicit action in the recorder.
+
+Audio is encoded to Ogg Opus incrementally. A bounded temporary PCM file supports
+lossless previews without keeping the entire recording in memory; both it and
+preview files are removed when the recording is sent, discarded, or closed.
+Demo mode uses a synthetic signal, including pause and preview, without opening
+the microphone or connecting to WhatsApp.
+
+## Clipboard attachments
+
+Paste a copied image, screenshot, or Explorer/Finder file selection into the chat
+composer with Ctrl+V / Cmd+V. Pasting opens a local draft; sending is explicit.
+The same preview handles files chosen through the attachment menu. Review up to
+20 files, remove unwanted items, and add a separate caption to each photo, video,
+or document. The caption field supports Unicode and the bundled emoji picker.
+WhatsApp audio messages have no caption field, so audio-file previews say so.
+
+Image preparation runs outside the UI thread with bounded decode memory and
+small thumbnails. Pasted image bytes use temporary files, removed when the draft
+is discarded or sent. Confirmed messages and original bytes are archived through
+the shared service in SQLite. Batch sends stop on failure and retain only unsent
+items for review; successful items are removed from the draft.

@@ -168,6 +168,9 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
                 )
                 .await?,
         )?),
+        "send_voice" => {
+            Ok(json!({"message":service.send_voice(serde_json::from_value(args)?).await?}))
+        }
         "send_attachment" => Ok(
             json!({"message":service.send_attachment(text_arg(&args,"chat")?.into(),text_arg(&args,"path")?.into(),text_arg(&args,"kind")?.into(),args.get("caption").and_then(Value::as_str).unwrap_or("").into()).await?}),
         ),
@@ -281,9 +284,16 @@ pub(crate) fn tools() -> Value {
             false,
         ),
         (
+            "send_voice",
+            "Send a local Ogg Opus recording as a WhatsApp voice message.",
+            json!({"chat":{"type":"string"},"path":{"type":"string"},"duration_seconds":{"type":"integer","minimum":1,"maximum":600},"waveform":{"type":"array","maxItems":64,"items":{"type":"integer","minimum":0,"maximum":255}},"reply_to":{"type":"object","properties":{"timestamp":{"type":"integer"},"id":{"type":"string"},"sender":{"type":"string"}},"required":["timestamp","id","sender"]}}),
+            vec!["chat", "path", "duration_seconds"],
+            false,
+        ),
+        (
             "send_attachment",
-            "Upload and send a local file as an image, video, WebP sticker, or document.",
-            json!({"chat":{"type":"string"},"path":{"type":"string"},"kind":{"type":"string","enum":["image","video","sticker","file"]},"caption":{"type":"string"}}),
+            "Upload and send a local file as an image, video, audio file, WebP sticker, or document. Captions are supported for images, videos, and documents.",
+            json!({"chat":{"type":"string"},"path":{"type":"string"},"kind":{"type":"string","enum":["image","video","audio","sticker","file"]},"caption":{"type":"string"}}),
             vec!["chat", "path", "kind"],
             false,
         ),

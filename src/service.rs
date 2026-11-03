@@ -130,6 +130,9 @@ impl Service {
         if let Err(error) = self.archive.rebuild_projections().await {
             log::warn!("Message projection upgrade failed: {error}");
         }
+        if let Err(error) = self.archive.backfill_call_messages().await {
+            log::warn!("Call message projection upgrade failed: {error}");
+        }
         if let Err(error) = self.archive.backfill_deletions().await {
             log::warn!("Could not restore deletion markers: {error}");
         }
@@ -271,7 +274,10 @@ impl Service {
                             ));
                         }
                     } else if !self.stopping.load(Ordering::Relaxed) {
-                        *self.connection.write().await = Connection {
+                        let mut state = self.connection.write().await;
+                        *state = Connection {
+                            qr: state.qr.take(),
+                            qr_expires_at: state.qr_expires_at,
                             notice: logout_result.as_ref().err().cloned(),
                             ..Default::default()
                         };
@@ -541,9 +547,9 @@ impl Service {
                 }
             }
             Event::PairingQrCodesExhausted(_) => {
-                let mut state = self.connection.write().await;
-                state.qr = None;
-                state.notice = Some("QR code expired. Refresh it to get a new code.".into());
+                // The SDK renews QR-only sessions after exhausting its refs.
+                // Keep the last image until the replacement arrives; expiry
+                // metadata remains available to non-UI consumers.
             }
             Event::Messages(batch) => {
                 // Also covers event-only recoveries which bypass the durability hook.
@@ -917,6 +923,81 @@ impl Service {
             .await
     }
 
+    pub async fn send_voice(&self, upload: crate::model::VoiceUpload) -> Result<Message> {
+        self.archive.allow_chat(&upload.chat).await?;
+        ensure!(
+            (1..=600).contains(&upload.duration_seconds),
+            "Voice messages must be between one second and ten minutes"
+        );
+        ensure!(upload.waveform.len() <= 64, "Invalid voice waveform");
+        let metadata = tokio::fs::metadata(&upload.path)
+            .await
+            .context("Cannot open voice recording")?;
+        ensure!(
+            metadata.is_file() && metadata.len() <= 8 * 1024 * 1024,
+            "Voice recording is too large"
+        );
+        let bytes = tokio::fs::read(&upload.path).await?;
+        let header = bytes.get(26).map(|segments| 27 + usize::from(*segments));
+        ensure!(
+            bytes.starts_with(b"OggS")
+                && header.is_some_and(|at| bytes.get(at..at + 8) == Some(b"OpusHead")),
+            "Voice recording must be Ogg Opus audio"
+        );
+        let jid: whatsapp_rust::Jid = upload.chat.parse()?;
+        let context = if let Some(target) = &upload.reply_to {
+            let original = self
+                .archive
+                .raw_message(
+                    upload.chat.clone(),
+                    target.sender.clone(),
+                    target.id.clone(),
+                )
+                .await?;
+            Some(
+                whatsapp_rust::wacore::proto_helpers::build_quote_context_with_info(
+                    target.id.clone(),
+                    &self.author(&target.sender).await?,
+                    &jid,
+                    &jid,
+                    &original,
+                ),
+            )
+        } else {
+            None
+        };
+        if self.config.demo {
+            let mut audio = wa::message::AudioMessage::default();
+            audio.mimetype = Some("audio/ogg; codecs=opus".into());
+            audio.ptt = Some(true);
+            audio.seconds = Some(upload.duration_seconds);
+            audio.waveform = Some(upload.waveform);
+            if let Some(context) = context {
+                audio.context_info = MessageField::some(context);
+            }
+            let mut message = wa::Message::default();
+            message.audio_message = MessageField::some(audio);
+            return self.demo_send(upload.chat, message, Some(bytes)).await;
+        }
+        let client = self.connected().await?;
+        let uploaded = client
+            .upload(
+                bytes.clone(),
+                whatsapp_rust::download::MediaType::Audio,
+                Default::default(),
+            )
+            .await?;
+        let mut options = whatsapp_rust::media::AudioOptions::default()
+            .with_ptt(true)
+            .with_duration_seconds(upload.duration_seconds)
+            .with_waveform(upload.waveform);
+        if let Some(context) = context {
+            options = options.with_context_info(Box::new(context));
+        }
+        let message = whatsapp_rust::media::audio_message(uploaded, options);
+        self.send_prepared(client, jid, message, Some(bytes)).await
+    }
+
     pub async fn send_attachment(
         &self,
         chat: String,
@@ -925,6 +1006,11 @@ impl Service {
         caption: String,
     ) -> Result<Message> {
         self.archive.allow_chat(&chat).await?;
+        ensure!(caption.len() <= 65_536, "Message is too long");
+        ensure!(
+            kind != "audio" || caption.trim().is_empty(),
+            "Audio files do not support captions."
+        );
         if self.config.demo {
             return self.demo_attachment(chat, path, kind, caption).await;
         }
@@ -949,6 +1035,7 @@ impl Service {
         let media_type = match kind.as_str() {
             "image" => whatsapp_rust::download::MediaType::Image,
             "video" => whatsapp_rust::download::MediaType::Video,
+            "audio" => whatsapp_rust::download::MediaType::Audio,
             "sticker" => {
                 ensure!(mime == "image/webp", "Stickers must be WebP files");
                 whatsapp_rust::download::MediaType::Sticker
@@ -972,6 +1059,12 @@ impl Service {
                 media::VideoOptions::default()
                     .with_mimetype(mime)
                     .with_caption(caption),
+            ),
+            "audio" => media::audio_message(
+                uploaded,
+                media::AudioOptions::default()
+                    .with_mimetype(mime)
+                    .with_ptt(false),
             ),
             "sticker" => {
                 let mut sticker = wa::message::StickerMessage::default();
@@ -1293,8 +1386,9 @@ pub(crate) async fn ingest_history(archive: &Archive, history: &wa::HistorySync)
         for item in &conversation.messages {
             if let Some(info) = item.message.as_option()
                 && let Some(key) = info.key.as_option()
-                && let Some(message) = info.message.as_option()
             {
+                let empty = wa::Message::default();
+                let message = info.message.as_option().unwrap_or(&empty);
                 let mut row = project_message(
                     conversation.id.clone(),
                     key.participant
@@ -1307,6 +1401,9 @@ pub(crate) async fn ingest_history(archive: &Archive, history: &wa::HistorySync)
                     String::new(),
                     serde_json::to_string(info)?,
                 );
+                if info.message.is_unset() && !row.view.is_call() {
+                    continue;
+                }
                 if row.view.from_me {
                     use wa::web_message_info::Status;
                     row.view.status = match info.status {

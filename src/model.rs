@@ -180,7 +180,21 @@ pub struct MessageCursor {
     pub sender: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VoiceUpload {
+    pub chat: String,
+    pub path: String,
+    pub duration_seconds: u32,
+    #[serde(default)]
+    pub waveform: Vec<u8>,
+    #[serde(default)]
+    pub reply_to: Option<MessageCursor>,
+}
+
 impl Message {
+    pub fn is_call(&self) -> bool {
+        matches!(self.kind.as_str(), "call" | "voice_call" | "video_call")
+    }
     pub fn cursor(&self) -> MessageCursor {
         MessageCursor {
             timestamp: self.timestamp,
@@ -200,7 +214,7 @@ impl Message {
     pub fn actionable(&self) -> bool {
         !matches!(
             self.kind.as_str(),
-            "protocol" | "placeholder" | "unsupported"
+            "protocol" | "placeholder" | "unsupported" | "call" | "voice_call" | "video_call"
         )
     }
     pub fn preview(&self) -> String {

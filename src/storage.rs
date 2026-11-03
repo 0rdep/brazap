@@ -494,6 +494,9 @@ pub fn project_message(
         ..Default::default()
     };
     crate::content::project(&mut view, message);
+    if !view.is_call() {
+        crate::content::project_call_stub(&mut view, &metadata);
+    }
     StoredMessage {
         view,
         encoded: message.encode_to_vec(),

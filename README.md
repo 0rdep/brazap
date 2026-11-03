@@ -27,7 +27,7 @@
 | --- | --- |
 | **Native desktop** | Dark surfaces, smooth transitions, a resizable sidebar and a compact navigation rail. Built with [Rune](https://github.com/anomalyco/rune). |
 | **Conversations** | Personal and group chats, quoted replies, emoji reactions, multi-message forwarding, delivery/read indicators and day separators. |
-| **Media** | Inline image previews, video playback, voice notes with waveforms and playback speed, files and animated WebP stickers. |
+| **Media** | Inline image previews, video playback, voice recording with pause, resume, local preview, waveform and timer, voice-note playback speed, clipboard image/file pasting with previews and emoji captions, files and animated WebP stickers. |
 | **Find anything** | Search chat names, phone numbers, filenames and message contents. Jump directly to a matching message. |
 | **Make it yours** | Pin, mute and archive chats. Choose fonts, text size and English, Brazilian Portuguese or Spanish. |
 | **Local archive** | SQLite stores session state, messages, contacts and original attachment bytes. Browse saved conversations offline. |
