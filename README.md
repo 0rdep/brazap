@@ -122,7 +122,7 @@ cd brazap
 ./scripts/cargo run
 ```
 
-Requires Rust 1.94+, Git, Bash and the platform dependencies listed in the [development guide](docs/DEVELOPMENT.md). Use `./scripts/cargo` to apply the pinned [Rune memory patch](patches/README.md) reproducibly.
+Requires Rust 1.99.1+, Git, Bash and the platform dependencies listed in the [development guide](docs/DEVELOPMENT.md). Use `./scripts/cargo` to apply the pinned [Rune memory patch](patches/README.md) reproducibly.
 
 See [AGENTS.md](AGENTS.md) for project conventions, [localization](locales/README.md) for translations and the [release guide](docs/RELEASING.md) for publishing. Validation currently uses formatting, compilation and manual checks; do not add automated tests unless explicitly requested.
 

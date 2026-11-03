@@ -5,7 +5,7 @@ stdio MCP adapter share one service and one SQLite archive.
 
 ## Requirements
 
-- Rust 1.94 or newer, Git and Bash.
+- Rust 1.99.1 or newer, Git and Bash.
 - Windows: Visual Studio C++ build tools and Windows SDK, including `rc.exe`.
   Run the build from Git Bash with the developer environment loaded.
 - Linux: a C compiler, `pkg-config`, Wayland, xkbcommon and fontconfig headers.
