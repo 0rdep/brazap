@@ -28,6 +28,7 @@
 | **Native desktop** | Dark surfaces, smooth transitions, a resizable sidebar and a compact navigation rail. Built with [Rune](https://github.com/anomalyco/rune). |
 | **Conversations** | Personal and group chats, quoted replies, emoji reactions, multi-message forwarding, delivery/read indicators and day separators. |
 | **Media** | Inline image previews, video playback, voice recording with pause, resume, local preview, waveform and timer, voice-note playback speed, clipboard image/file pasting with previews and emoji captions, files and animated WebP stickers. |
+| **Calls** | One-to-one voice and video calls, incoming-call controls, microphone mute, camera toggle and a floating call panel. [Calling details](docs/CALLING.md). |
 | **Find anything** | Search chat names, phone numbers, filenames and message contents. Jump directly to a matching message. |
 | **Make it yours** | Pin, mute and archive chats. Choose fonts, text size and English, Brazilian Portuguese or Spanish. |
 | **Local archive** | SQLite stores session state, messages, contacts and original attachment bytes. Browse saved conversations offline. |
@@ -99,6 +100,7 @@ On Linux or macOS, replace `command` with the absolute path to the downloaded ex
 | --- | --- |
 | `get_status`, `list_chats`, `list_calls` | `send_message`, `react_message` |
 | `search`, `read_messages`, `sticker_catalog` | `forward_messages`, `send_attachment` |
+| `get_current_call` | `start_call`, `answer_call`, `end_call`, `mute_call`, `camera_call` |
 | | `send_sticker`, `save_attachment` |
 
 The MCP adapter connects to the existing service over authenticated loopback. It uses the same SQLite archive and WhatsApp session as the UI. Use chat identifiers returned by `list_chats`; sending tools deliver real WhatsApp messages.

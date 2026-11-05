@@ -8,7 +8,7 @@ use diesel::{
     sql_types::{BigInt, Text},
 };
 use whatsapp_rust::{
-    prelude::{MessageBuilderExt, MessageExt, wa},
+    prelude::{MessageExt, wa},
     wacore_binary::JidExt,
 };
 
@@ -52,31 +52,8 @@ impl Service {
         text: String,
         target: MessageCursor,
     ) -> Result<Message> {
-        ensure!(
-            !text.trim().is_empty() && text.len() <= 65_536,
-            "Enter a message up to 65,536 bytes"
-        );
-        let original = self
-            .archive
-            .raw_message(chat.clone(), target.sender.clone(), target.id.clone())
-            .await?;
-        let jid: whatsapp_rust::Jid = chat.parse()?;
-        let author = self.author(&target.sender).await?;
-        let context = whatsapp_rust::wacore::proto_helpers::build_quote_context_with_info(
-            target.id, &author, &jid, &jid, &original,
-        );
-        if self.config.demo {
-            return self
-                .demo_send(chat, wa::Message::text_with_context(text, context), None)
-                .await;
-        }
-        self.send_prepared(
-            self.connected().await?,
-            jid,
-            wa::Message::text_with_context(text, context),
-            None,
-        )
-        .await
+        self.send_text_with_id(chat, text, Some(target), crate::outbox::new_id(), None)
+            .await
     }
 
     pub async fn react(&self, chat: String, target: MessageCursor, emoji: String) -> Result<()> {

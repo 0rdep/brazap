@@ -24,6 +24,26 @@ impl Archive {
         }).await?;
         Ok(())
     }
+    pub(crate) async fn note_history_visibility(&self, jid: String) -> Result<()> {
+        let account = self.account as i64;
+        self.backend.shared().run(move|conn| {
+            diesel::sql_query("INSERT OR IGNORE INTO brazap_chat_locks(account,jid,locked,changed_at) VALUES(?,?,0,0)")
+                .bind::<BigInt,_>(account).bind::<Text,_>(jid).execute(conn).map_err(db_error)?;
+            Ok(())
+        }).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn chat_visibility_known(&self, chat: &str) -> Result<bool> {
+        let account = self.account as i64;
+        let aliases = self.identities().await?.aliases_json(chat);
+        let count:Count=self.backend.shared().read(move|conn| {
+            diesel::sql_query("SELECT COUNT(*) AS value FROM brazap_chat_locks WHERE account=? AND jid IN (SELECT value FROM json_each(?))")
+                .bind::<BigInt,_>(account).bind::<Text,_>(aliases).get_result(conn).map_err(db_error)
+        }).await?;
+        Ok(count.value > 0)
+    }
+
     pub(crate) async fn allow_chat(&self, chat: &str) -> Result<()> {
         ensure!(
             !self.identities().await?.is_locked(chat),

@@ -22,6 +22,9 @@ if [[ -x .build-deps/cc && -x .build-deps/root/usr/bin/pkgconf ]]; then
     export PKG_CONFIG="$project_root/.build-deps/root/usr/bin/pkgconf"
     export PKG_CONFIG_SYSROOT_DIR="$project_root/.build-deps/root"
     export PKG_CONFIG_LIBDIR="$project_root/.build-deps/root/usr/lib/x86_64-linux-gnu/pkgconfig"
+    if [[ -x .build-deps/cxx ]]; then
+        export CXX="$project_root/.build-deps/cxx"
+    fi
 fi
 
 exec cargo "$@"

@@ -8,8 +8,8 @@ stdio MCP adapter share one service and one SQLite archive.
 - Rust 1.99.1 or newer, Git and Bash.
 - Windows: Visual Studio C++ build tools and Windows SDK, including `rc.exe`.
   Run the build from Git Bash with the developer environment loaded.
-- Linux: a C compiler, `pkg-config`, Wayland, xkbcommon and fontconfig headers.
-  On Ubuntu: `sudo apt install build-essential cmake pkg-config libasound2-dev libwayland-dev libxkbcommon-dev libfontconfig1-dev`.
+- Linux: C and C++ compilers, libclang, `pkg-config`, ALSA, Wayland, xkbcommon and fontconfig headers.
+  On Ubuntu: `sudo apt install build-essential cmake libclang-dev pkg-config libasound2-dev libwayland-dev libxkbcommon-dev libfontconfig1-dev`.
 - macOS: Xcode Command Line Tools.
 
 CMake is required for the bundled Opus voice encoder on every platform. Microphone
@@ -30,9 +30,15 @@ The wrapper prepares `.build-deps/rune`, applying the tracked GPU-memory patch t
 the exact upstream revision in `patches/rune.rev`. Do not edit this generated
 checkout or use `.references` as build dependencies. See [the patch guide](../patches/README.md).
 
+Appearance changes apply without restarting. Rune receives the bundled Inter and
+emoji fonts plus the installed faces offered in Settings; system fonts are read
+locally and are not redistributed. Unavailable optional families are hidden.
+Settings edits update the UI immediately and save in order through the shared
+service, with a revision guard against stale background snapshots.
+
 ## Windows builds from WSL
 
-Install the MinGW-w64 C toolchain and binutils, including `windres` and `dlltool`:
+Install the MinGW-w64 C/C++ toolchain and binutils, including `windres` and `dlltool`:
 
 ```sh
 rustup target add x86_64-pc-windows-gnu
@@ -40,7 +46,7 @@ rustup target add x86_64-pc-windows-gnu
 ```
 
 Output: `target/x86_64-pc-windows-gnu/release/brazap.exe`. Set
-`BRAZAP_WINDOWS_CC` when the cross compiler is outside `PATH`.
+`BRAZAP_WINDOWS_CC` and `BRAZAP_WINDOWS_CXX` when the cross compilers are outside `PATH`.
 
 ## Local profiles and commands
 

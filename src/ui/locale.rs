@@ -1,5 +1,5 @@
 use crate::settings::AppearanceSettings;
-use rune::{Family, TextStyle};
+use rune::TextStyle;
 thread_local! {static APPEARANCE:std::cell::RefCell<AppearanceSettings>=std::cell::RefCell::new(AppearanceSettings::default());}
 pub(super) fn configure(value: &AppearanceSettings) {
     APPEARANCE.with(|s| *s.borrow_mut() = value.clone());
@@ -7,13 +7,7 @@ pub(super) fn configure(value: &AppearanceSettings) {
 pub(super) fn style(size: f32, weight: f32) -> TextStyle {
     APPEARANCE.with(|s| {
         let a = s.borrow();
-        let family = match a.font.as_str() {
-            "Inter" => Family::Named("Inter"),
-            "Segoe UI" => Family::Named("Segoe UI"),
-            "Arial" => Family::Named("Arial"),
-            "monospace" => Family::Mono,
-            _ => Family::Sans,
-        };
+        let family = super::fonts::family(&a.font);
         TextStyle::new(size * a.font_size as f32 / 13.0, weight).family(family)
     })
 }
@@ -28,6 +22,19 @@ fn catalog(language: &str) -> &'static std::collections::HashMap<String, String>
         _ => (&EN, include_str!("../../locales/en.json")),
     };
     slot.get_or_init(|| serde_json::from_str(source).expect("Bundled locale catalog"))
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn in_language(value: &str, language: &str) -> String {
+    catalog(language)
+        .get(value)
+        .or_else(|| catalog("en").get(value))
+        .cloned()
+        .unwrap_or_else(|| value.into())
+}
+
+pub(super) fn has_key(key: &str) -> bool {
+    catalog("en").contains_key(key)
 }
 
 pub(super) fn tr(value: &str) -> String {

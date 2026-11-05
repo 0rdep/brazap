@@ -51,6 +51,10 @@ impl State {
             self.pause_resume_recording();
             return;
         }
+        if self.snapshot.live_call.as_ref().is_some_and(|c| !c.ended()) {
+            self.error = Some("End the call before recording a voice message.".into());
+            return;
+        }
         if self.busy
             || self.attachments.is_some()
             || self.snapshot.connection.phase != Phase::Connected
@@ -135,7 +139,7 @@ impl State {
         }
         if let Some(player) = &recording.player {
             player.toggle();
-        } else if let Some(wake) = self.wake.lock().ok().and_then(|w| w.clone())
+        } else if let Some(wake) = self.wake.lock().ok().and_then(|w| w.waker.clone())
             && let Some(file) = recording.preview.take()
         {
             recording.player = Some(playback::Player::new_audio(file, wake));

@@ -144,6 +144,117 @@ impl Archive {
             .collect())
     }
 
+    pub(crate) async fn journal_live_call(&self, call: &crate::calling::LiveCall) -> Result<()> {
+        let account = self.account as i64;
+        let id = call.id.clone();
+        let ended = i64::from(call.ended());
+        let payload = serde_json::to_string(call)?;
+        self.backend.shared().run(move |conn| {
+            diesel::sql_query("INSERT INTO brazap_call_sessions(account,id,ended,payload) VALUES(?,?,?,?) ON CONFLICT(account,id) DO UPDATE SET ended=excluded.ended,payload=excluded.payload")
+                .bind::<BigInt,_>(account).bind::<Text,_>(id).bind::<BigInt,_>(ended).bind::<Text,_>(payload).execute(conn).map_err(db_error)?;
+            Ok(())
+        }).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn recover_live_calls(&self) -> Result<()> {
+        #[derive(QueryableByName)]
+        struct Row {
+            #[diesel(sql_type=Text)]
+            payload: String,
+        }
+        let account = self.account as i64;
+        let rows: Vec<Row> = self
+            .backend
+            .shared()
+            .read(move |conn| {
+                diesel::sql_query(
+                    "SELECT payload FROM brazap_call_sessions WHERE account=? AND ended=0",
+                )
+                .bind::<BigInt, _>(account)
+                .load(conn)
+                .map_err(db_error)
+            })
+            .await?;
+        for row in rows {
+            let mut call: crate::calling::LiveCall = serde_json::from_str(&row.payload)?;
+            call.ended_at = Some(crate::model::now());
+            call.phase = "ended".into();
+            call.camera = false;
+            call.peer_camera = false;
+            call.error = Some("The call was interrupted when Brazap closed.".into());
+            self.store_live_call(
+                &call,
+                call.call_id.clone().unwrap_or_else(|| call.id.clone()),
+                call.creator.clone(),
+            )
+            .await?;
+            self.journal_live_call(&call).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn store_live_call(
+        &self,
+        live: &crate::calling::LiveCall,
+        id: String,
+        creator: Option<String>,
+    ) -> Result<()> {
+        let creator = creator.unwrap_or(if live.incoming {
+            live.chat.clone()
+        } else {
+            self.own_jids()
+                .await?
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "local".into())
+        });
+        let creator = canonical(&creator);
+        let duration = live.connected_at.map(|at| {
+            live.ended_at
+                .unwrap_or_else(crate::model::now)
+                .saturating_sub(at)
+        });
+        let outcome = if let Some(outcome) = live.outcome.as_deref() {
+            outcome
+        } else if live.error.is_some() {
+            "failed"
+        } else if duration.is_some() {
+            "completed"
+        } else if live.incoming {
+            "missed"
+        } else {
+            "cancelled"
+        };
+        let value = Call {
+            id: id.clone(),
+            peer: live.chat.clone(),
+            name: live.name.clone(),
+            timestamp: Some(live.created_at),
+            from_me: Some(!live.incoming),
+            video: live.video,
+            duration,
+            outcome: outcome.into(),
+            photo_version: live.photo_version,
+        };
+        let mut record = wa::CallLogRecord::default();
+        record.call_id = Some(id.clone());
+        record.call_creator_jid = Some(creator.clone());
+        record.start_time = Some(live.created_at);
+        record.duration = duration;
+        record.is_video = Some(live.video);
+        let record = record.encode_to_vec();
+        let payload = serde_json::to_string(&value)?;
+        let account = self.account as i64;
+        self.backend.shared().run(move |conn| {
+            diesel::sql_query("INSERT INTO brazap_calls(account,creator,id,peer,timestamp,payload,record) VALUES(?,?,?,?,?,?,?) ON CONFLICT(account,creator,id) DO UPDATE SET peer=excluded.peer,timestamp=excluded.timestamp,payload=excluded.payload,record=excluded.record")
+                .bind::<BigInt,_>(account).bind::<Text,_>(creator).bind::<Text,_>(id).bind::<Text,_>(value.peer)
+                .bind::<Nullable<BigInt>,_>(value.timestamp).bind::<Text,_>(payload).bind::<Binary,_>(record).execute(conn).map_err(db_error)?;
+            Ok(())
+        }).await?;
+        Ok(())
+    }
+
     pub async fn store_call(
         &self,
         record: &wa::CallLogRecord,

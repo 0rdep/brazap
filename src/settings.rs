@@ -116,10 +116,10 @@ impl Archive {
 impl Service {
     pub async fn settings_view(&self) -> Result<Value> {
         Ok(
-            json!({"settings": self.settings.read().await.clone(), "storage": self.archive.storage_usage(&self.config).await?, "updates": self.updates.read().await.clone()}),
+            json!({"settings": self.settings.read().await.clone(), "revision": self.revision(), "storage": self.archive.storage_usage(&self.config).await?, "updates": self.updates.read().await.clone()}),
         )
     }
-    pub async fn save_settings(&self, value: Settings) -> Result<()> {
+    pub async fn save_settings(&self, value: Settings) -> Result<u64> {
         value.validate()?;
         let previous = self.settings.read().await.clone();
         self.archive
@@ -147,7 +147,7 @@ impl Service {
             }
         }
         self.changed();
-        Ok(())
+        Ok(self.revision())
     }
     pub async fn whatsapp_privacy(&self) -> Result<BTreeMap<String, String>> {
         if self.config.demo {
@@ -224,6 +224,7 @@ impl Service {
     }
     pub async fn request_logout(&self) -> Result<()> {
         let _ = self.connected().await?;
+        self.stop_calls().await;
         let (send, receive) = tokio::sync::oneshot::channel();
         {
             let mut pending = self.logout_request.lock().await;
@@ -240,46 +241,5 @@ impl Service {
             .await
             .context("The connection stopped during logout")?
             .map_err(anyhow::Error::msg)
-    }
-}
-
-impl Service {
-    pub async fn mark_chat_read(&self, chat: String) -> Result<()> {
-        let chat = self.archive.canonical_chat(&chat).await?;
-        let unread = self
-            .archive
-            .chats()
-            .await?
-            .into_iter()
-            .find(|c| c.jid == chat)
-            .map_or(0, |c| c.unread);
-        if unread > 0 && self.settings.read().await.privacy.send_read_receipts {
-            if let Ok(client) = self.connected().await {
-                let messages = self
-                    .archive
-                    .messages(chat.clone(), unread.min(500) as usize, None)
-                    .await?;
-                let jid: whatsapp_rust::Jid = chat.parse()?;
-                let mut groups = BTreeMap::<String, Vec<String>>::new();
-                for message in messages.into_iter().filter(|m| !m.from_me && m.visible()) {
-                    groups.entry(message.sender).or_default().push(message.id);
-                }
-                for (sender, ids) in groups {
-                    let participant = if chat.ends_with("@g.us") {
-                        Some(sender.parse::<whatsapp_rust::Jid>()?)
-                    } else {
-                        None
-                    };
-                    client
-                        .mark_as_read(
-                            &jid,
-                            participant.as_ref(),
-                            &ids.iter().map(String::as_str).collect::<Vec<_>>(),
-                        )
-                        .await?;
-                }
-            }
-        }
-        self.archive.mark_read(chat).await
     }
 }

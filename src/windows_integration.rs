@@ -34,7 +34,16 @@ use windows::{
     core::{GUID, HSTRING, Interface, PCWSTR},
 };
 
-const APP_ID: &str = "Brazap.Desktop";
+fn app_id(config: &crate::config::Config) -> &'static str {
+    if config.demo {
+        "Brazap.Demo"
+    } else {
+        "Brazap.Desktop"
+    }
+}
+fn protocol(config: &crate::config::Config) -> &'static str {
+    if config.demo { "brazap-demo" } else { "brazap" }
+}
 const APP_ID_KEY: PROPERTYKEY = PROPERTYKEY {
     fmtid: GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3),
     pid: 5,
@@ -54,7 +63,8 @@ fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
 
 pub fn initialize(config: &crate::config::Config) {
     unsafe {
-        if let Err(error) = SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(APP_ID)) {
+        if let Err(error) = SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(app_id(config)))
+        {
             log::warn!("Could not set Windows application identity: {error}");
         }
     }
@@ -104,6 +114,8 @@ pub fn notify(title: String, preview: String, chat: String, sound: bool) {
         if let Err(error) = sender.try_send((title, preview, chat, sound)) {
             log::warn!("Windows notification queue unavailable: {error}");
         }
+    } else {
+        log::warn!("Windows notification delivery is not initialized");
     }
 }
 
@@ -132,6 +144,38 @@ pub fn set_window_icon(window: &rune::WindowHandle) {
                         );
                     }
                 }
+            }
+        }
+    });
+}
+
+/// Opaque dark call windows use native rounded corners, without the Windows
+/// accent border. The opaque surface also works on GPUs without alpha support.
+pub fn configure_floating_window(window: &rune::WindowHandle) {
+    use windows::Win32::Graphics::Dwm::{
+        DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+        DwmSetWindowAttribute,
+    };
+    set_window_icon(window);
+    let _ = window.with_raw_handle(|handle| {
+        if let rune::raw_window_handle::RawWindowHandle::Win32(handle) = handle.as_raw() {
+            let hwnd = HWND(handle.hwnd.get() as *mut _);
+            let corners = DWMWCP_ROUND;
+            let border = DWMWA_COLOR_NONE;
+            // Windows versions without these preferences keep the dark fallback.
+            unsafe {
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_WINDOW_CORNER_PREFERENCE,
+                    std::ptr::from_ref(&corners).cast(),
+                    std::mem::size_of_val(&corners) as u32,
+                );
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_BORDER_COLOR,
+                    (&border as *const u32).cast(),
+                    std::mem::size_of_val(&border) as u32,
+                );
             }
         }
     });
@@ -174,18 +218,19 @@ fn register(config: &crate::config::Config) -> Result<()> {
     if std::fs::read(&icon).ok().as_deref() != Some(bytes) {
         std::fs::write(&icon, bytes)?;
     }
-    let app_key = format!("Software\\Classes\\AppUserModelId\\{APP_ID}");
+    let app_key = format!("Software\\Classes\\AppUserModelId\\{}", app_id(config));
+    let scheme = format!("Software\\Classes\\{}", protocol(config));
     registry_value(&app_key, "DisplayName", "Brazap")?;
     registry_value(&app_key, "IconUri", &icon.to_string_lossy())?;
-    registry_value("Software\\Classes\\brazap", "", "URL:Brazap")?;
-    registry_value("Software\\Classes\\brazap", "URL Protocol", "")?;
+    registry_value(&scheme, "", "URL:Brazap")?;
+    registry_value(&scheme, "URL Protocol", "")?;
     registry_value(
-        "Software\\Classes\\brazap\\DefaultIcon",
+        &format!("{scheme}\\DefaultIcon"),
         "",
         &format!("\"{}\",0", exe.display()),
     )?;
     registry_value(
-        "Software\\Classes\\brazap\\shell\\open\\command",
+        &format!("{scheme}\\shell\\open\\command"),
         "",
         &format!(
             "\"{}\" --open-chat \"%1\" --data-dir \"{}\"",
@@ -194,7 +239,11 @@ fn register(config: &crate::config::Config) -> Result<()> {
         ),
     )?;
     let programs = std::env::var_os("APPDATA").context("Missing Windows APPDATA directory")?;
-    let shortcut = Path::new(&programs).join("Microsoft/Windows/Start Menu/Programs/Brazap.lnk");
+    let shortcut = Path::new(&programs).join(if config.demo {
+        "Microsoft/Windows/Start Menu/Programs/Brazap Demo.lnk"
+    } else {
+        "Microsoft/Windows/Start Menu/Programs/Brazap.lnk"
+    });
     std::fs::create_dir_all(shortcut.parent().unwrap())?;
     // A dedicated thread owns this STA and all its shell interfaces.
     unsafe {
@@ -209,7 +258,7 @@ fn register(config: &crate::config::Config) -> Result<()> {
                 config.data_dir.display()
             )))?;
             let properties: IPropertyStore = link.cast()?;
-            properties.SetValue(&APP_ID_KEY, &PROPVARIANT::from(APP_ID))?;
+            properties.SetValue(&APP_ID_KEY, &PROPVARIANT::from(app_id(config)))?;
             properties.SetValue(&ACTIVATOR_KEY, &InitPropVariantFromCLSID(&ACTIVATOR)?)?;
             properties.Commit()?;
             let file: IPersistFile = link.cast()?;
@@ -244,8 +293,8 @@ fn show(
     let image = config.data_dir.join("notification-logo.png");
     let document = XmlDocument::new()?;
     document.LoadXml(&HSTRING::from(format!(
-        "<toast activationType=\"protocol\" launch=\"brazap://chat/{}\"><visual><binding template=\"ToastGeneric\"><image placement=\"appLogoOverride\" hint-crop=\"circle\" src=\"{}\"/><text>{}</text><text>{}</text></binding></visual>{}</toast>",
-        xml(chat), xml(&image.to_string_lossy()), xml(title), xml(preview), if sound { "<audio src=\"ms-winsoundevent:Notification.IM\"/>" } else { "<audio silent=\"true\"/>" }
+        "<toast activationType=\"protocol\" launch=\"{}://chat/{}\"><visual><binding template=\"ToastGeneric\"><image placement=\"appLogoOverride\" hint-crop=\"circle\" src=\"{}\"/><text>{}</text><text>{}</text></binding></visual>{}</toast>",
+        protocol(config), xml(chat), xml(&image.to_string_lossy()), xml(title), xml(preview), if sound { "<audio src=\"ms-winsoundevent:Notification.IM\"/>" } else { "<audio silent=\"true\"/>" }
     )))?;
     let notification = ToastNotification::CreateToastNotification(&document)?;
     notification.SetTag(&HSTRING::from(
@@ -256,7 +305,7 @@ fn show(
         notification.SetTag(&HSTRING::from("local-preview"))?;
     }
     // Keep one current notification per conversation instead of stacking a burst.
-    ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID))?
+    ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(app_id(config)))?
         .Show(&notification)?;
     Ok(())
 }
@@ -278,10 +327,10 @@ pub fn preview(config: &crate::config::Config, chat: &str) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(500));
         println!(
             "Notification setting: {:?}; retained notifications: {}",
-            ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID))?
+            ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(app_id(config)))?
                 .Setting()?,
             ToastNotificationManager::History()?
-                .GetHistoryWithId(&HSTRING::from(APP_ID))?
+                .GetHistoryWithId(&HSTRING::from(app_id(config)))?
                 .Size()?
         );
     }

@@ -25,7 +25,10 @@ pub(crate) struct Desktop {
 }
 
 pub fn chat_from_link(link: &str) -> Result<String> {
-    let chat = link.strip_prefix("brazap://chat/").unwrap_or(link);
+    let chat = link
+        .strip_prefix("brazap://chat/")
+        .or_else(|| link.strip_prefix("brazap-demo://chat/"))
+        .unwrap_or(link);
     ensure!(
         chat.len() <= 160
             && chat
@@ -54,28 +57,69 @@ impl Service {
         Ok(json!({"accepted": available, "pid": desktop.pid}))
     }
 
-    pub async fn poll_desktop(&self, pid: u32, chat: Option<String>) -> Value {
+    pub async fn poll_desktop(
+        self: &std::sync::Arc<Self>,
+        pid: u32,
+        chat: Option<String>,
+    ) -> Value {
         let mut desktop = self.desktop.lock().await;
         desktop.seen = Some(Instant::now());
         desktop.pid = pid;
-        desktop.chat = chat;
-        match desktop.activation.take() {
-            Some(chat) => json!({"activate": true, "chat": chat}),
-            None => json!({"activate": false}),
+        desktop.chat = chat.clone();
+        let activation = desktop.activation.take();
+        drop(desktop);
+        if let Some(chat) = chat {
+            if self.desktop_viewing(&chat).await
+                && self
+                    .archive
+                    .chats()
+                    .await
+                    .is_ok_and(|chats| chats.iter().any(|c| c.matches_jid(&chat) && c.unread > 0))
+            {
+                if let Err(error) = self.mark_chat_read(chat).await {
+                    log::warn!("Could not persist the visible chat read: {error}");
+                }
+            }
+        }
+        match activation {
+            Some(chat) => json!({"activate":true,"chat":chat}),
+            None => json!({"activate":false}),
+        }
+    }
+
+    pub(crate) async fn desktop_viewing(&self, chat: &str) -> bool {
+        let (active, pid) = {
+            let desktop = self.desktop.lock().await;
+            if desktop
+                .seen
+                .is_none_or(|seen| seen.elapsed() >= Duration::from_secs(5))
+            {
+                return false;
+            }
+            (desktop.chat.clone(), desktop.pid)
+        };
+        let Some(active) = active else {
+            return false;
+        };
+        let Ok(identities) = self.archive.identities().await else {
+            return false;
+        };
+        if identities.canonical(&active) != identities.canonical(chat) {
+            return false;
+        }
+        #[cfg(all(target_os = "windows", feature = "desktop"))]
+        return crate::windows_integration::is_foreground(pid);
+        #[cfg(not(all(target_os = "windows", feature = "desktop")))]
+        {
+            let _ = pid;
+            true
         }
     }
 
     #[cfg(all(target_os = "windows", feature = "desktop"))]
     pub(crate) async fn notify_incoming(&self, message: &Message) -> Result<()> {
         // Only fresh, visible inbound messages. Offline history and protocol updates stay silent.
-        if !self
-            .chat_locks_ready
-            .load(std::sync::atomic::Ordering::Acquire)
-            || !self
-                .notifications_ready
-                .load(std::sync::atomic::Ordering::Acquire)
-            || message.timestamp
-                < self.connected_at.load(std::sync::atomic::Ordering::Acquire) as i64
+        if message.timestamp < self.connected_at.load(std::sync::atomic::Ordering::Acquire) as i64
             || message.timestamp > crate::model::now() + 30
             || message.from_me
             || !message.visible()
@@ -88,15 +132,18 @@ impl Service {
         if identities.is_locked(&message.chat) {
             return Ok(());
         }
+        if !self
+            .chat_locks_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+            && !self.archive.chat_visibility_known(&message.chat).await?
+        {
+            return Ok(());
+        }
+        if self.archive.incoming_is_read(message).await? {
+            return Ok(());
+        }
         let canonical = identities.canonical(&message.chat);
-        let (pid, active_chat) = {
-            let desktop = self.desktop.lock().await;
-            (desktop.pid, desktop.chat.clone())
-        };
-        let viewing = active_chat
-            .as_ref()
-            .is_some_and(|chat| identities.canonical(chat) == canonical)
-            && crate::windows_integration::is_foreground(pid);
+        let viewing = self.desktop_viewing(&message.chat).await;
         let aliases = identities.aliases_json(&message.chat);
         let delivery_sender = if message.chat.ends_with("@g.us") {
             identities.canonical(&message.sender)

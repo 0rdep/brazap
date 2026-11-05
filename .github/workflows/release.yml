@@ -58,7 +58,7 @@ jobs:
           "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" >> $env:GITHUB_ENV
       - name: Install Linux libraries
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake libasound2-dev libxkbcommon-dev libwayland-dev libfontconfig1-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libclang-dev libasound2-dev libxkbcommon-dev libwayland-dev libfontconfig1-dev
       - name: Install Rust toolchain
         shell: bash
         run: |

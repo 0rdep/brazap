@@ -49,6 +49,50 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
             Ok(json!({"phase":snapshot.connection.phase,"notice":snapshot.connection.notice}))
         }
         "list_chats" => Ok(json!({"chats":service.archive.chats().await?})),
+        "get_current_call" => Ok(json!({"call": service.live_call().await})),
+        "start_call" => service
+            .start_call(
+                text_arg(&args, "chat")?.into(),
+                args["video"].as_bool().unwrap_or(false),
+            )
+            .await
+            .map(|call| json!({"call":call})),
+        "answer_call" => service
+            .answer_call(
+                text_arg(&args, "id")?.into(),
+                args["video"].as_bool().unwrap_or(false),
+            )
+            .await
+            .map(|_| json!({"ok":true})),
+        "end_call" => service
+            .end_call(&text_arg(&args, "id")?)
+            .await
+            .map(|_| json!({"ok":true})),
+        "dismiss_call" => service
+            .dismiss_call(&text_arg(&args, "id")?)
+            .await
+            .map(|_| json!({"ok":true})),
+        "mute_call" => service
+            .mute_call(
+                &text_arg(&args, "id")?,
+                args["muted"].as_bool().unwrap_or(true),
+            )
+            .await
+            .map(|_| json!({"ok":true})),
+        "camera_call" => service
+            .camera_call(
+                &text_arg(&args, "id")?,
+                args["enabled"].as_bool().unwrap_or(false),
+            )
+            .await
+            .map(|_| json!({"ok":true})),
+        "simulate_incoming_call" => service
+            .demo_incoming_call(
+                text_arg(&args, "chat")?.into(),
+                args["video"].as_bool().unwrap_or(false),
+            )
+            .await
+            .map(|call| json!({"call":call})),
         "list_calls" => Ok(json!({"calls":service.archive.calls().await?})),
         "read_messages" => {
             let chat = text_arg(&args, "chat")?.to_owned();
@@ -144,11 +188,12 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
                 )
                 .await?,
         )?),
-        "send_message" => Ok(
-            json!({"message":if let Some(target)=args.get("reply_to").filter(|v|!v.is_null()) {
-                service.reply_text(text_arg(&args,"chat")?.into(),text_arg(&args,"text")?.into(),serde_json::from_value(target.clone())?).await?
-            } else {service.send_text(text_arg(&args,"chat")?.into(),text_arg(&args,"text")?.into()).await?}}),
-        ),
+        "send_message" => Ok(json!({"message":service.send_text_with_id(
+            text_arg(&args,"chat")?.into(), text_arg(&args,"text")?.into(),
+            args.get("reply_to").filter(|v|!v.is_null()).map(|v|serde_json::from_value(v.clone())).transpose()?,
+            args.get("message_id").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(crate::outbox::new_id),
+            args.get("timestamp").and_then(Value::as_i64),
+        ).await?})),
         "react_message" => {
             service
                 .react(
@@ -242,6 +287,48 @@ pub(crate) fn tools() -> Value {
             true,
         ),
         (
+            "get_current_call",
+            "Read the active voice or video call.",
+            json!({}),
+            vec![],
+            true,
+        ),
+        (
+            "start_call",
+            "Start a real one-to-one WhatsApp call using this computer's microphone and optional camera.",
+            json!({"chat":{"type":"string"},"video":{"type":"boolean"}}),
+            vec!["chat"],
+            false,
+        ),
+        (
+            "answer_call",
+            "Answer the currently ringing call. Video enables this computer's camera.",
+            json!({"id":{"type":"string"},"video":{"type":"boolean"}}),
+            vec!["id"],
+            false,
+        ),
+        (
+            "end_call",
+            "Decline or hang up a WhatsApp call.",
+            json!({"id":{"type":"string"}}),
+            vec!["id"],
+            false,
+        ),
+        (
+            "mute_call",
+            "Mute or unmute the call microphone.",
+            json!({"id":{"type":"string"},"muted":{"type":"boolean"}}),
+            vec!["id", "muted"],
+            false,
+        ),
+        (
+            "camera_call",
+            "Enable or disable the camera during a connected call.",
+            json!({"id":{"type":"string"},"enabled":{"type":"boolean"}}),
+            vec!["id", "enabled"],
+            false,
+        ),
+        (
             "list_calls",
             "List locally stored WhatsApp call history, most recent first.",
             json!({}),
@@ -264,8 +351,8 @@ pub(crate) fn tools() -> Value {
         ),
         (
             "send_message",
-            "Send a WhatsApp text message to the exact chat JID.",
-            json!({"chat":{"type":"string"},"text":{"type":"string","minLength":1},"reply_to":{"type":"object","properties":{"timestamp":{"type":"integer"},"id":{"type":"string"},"sender":{"type":"string"}},"required":["timestamp","id","sender"]}}),
+            "Send a WhatsApp text message to the exact chat JID. Reuse message_id to retry a failed send without changing its identity.",
+            json!({"chat":{"type":"string"},"text":{"type":"string","minLength":1},"message_id":{"type":"string","maxLength":80},"reply_to":{"type":"object","properties":{"timestamp":{"type":"integer"},"id":{"type":"string"},"sender":{"type":"string"}},"required":["timestamp","id","sender"]}}),
             vec!["chat", "text"],
             false,
         ),
@@ -374,7 +461,7 @@ pub async fn handle(
             Ok(settings) => service
                 .save_settings(settings)
                 .await
-                .map(|_| json!({"saved":true})),
+                .map(|revision| json!({"saved":true,"revision":revision})),
             Err(e) => Err(e.into()),
         },
         "brazap/privacy" => service.whatsapp_privacy().await.map(|v| json!(v)),
@@ -403,6 +490,12 @@ pub async fn handle(
                 .typing(chat, params["active"].as_bool().unwrap_or(false))
                 .await
                 .map(|_| json!({})),
+            Err(e) => Err(e),
+        },
+        "brazap/call/frame" => match text_arg(&params, "id") {
+            Ok(id) => Ok(
+                json!({"frame":service.call_preview(&id, params["local"].as_bool().unwrap_or(false), params["after"].as_u64().unwrap_or(0)).await}),
+            ),
             Err(e) => Err(e),
         },
         "brazap/diagnostics" => service.diagnostics().await,

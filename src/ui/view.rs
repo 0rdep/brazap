@@ -162,13 +162,9 @@ pub(super) fn kit() -> &'static Kit {
     static KITS: std::sync::OnceLock<Vec<Kit>> = std::sync::OnceLock::new();
     &KITS.get_or_init(|| {
         let mut kits = Vec::new();
-        for family in [
-            rune::Family::Sans,
-            rune::Family::Named("Inter"),
-            rune::Family::Named("Segoe UI"),
-            rune::Family::Named("Arial"),
-            rune::Family::Mono,
-        ] {
+        for family in
+            ["system", "Inter", "Segoe UI", "Arial", "monospace"].map(super::fonts::family)
+        {
             for size in 11..=19 {
                 let mut k = Kit::neutral(true);
                 k.c.text_accent = MINT;
@@ -340,6 +336,9 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
         layer.push(modal);
         layer.extend(above);
     }
+    if let Some(call) = super::calling::overlay(s) {
+        layer.push(call);
+    }
     rune_kit::root(root, layer).on_paste_content(|s: &mut State, content, _| s.paste_chat(content))
 }
 
@@ -508,6 +507,17 @@ pub(super) fn conversation(s: &State, jid: &str, layer: &mut Vec<El>) -> El {
                     MUTED,
                 )),
         );
+    let header = if jid.ends_with("@g.us") {
+        header
+    } else {
+        header
+            .child(icon_button(&PHONE, "Voice call", |s, _| {
+                s.start_call(false)
+            }))
+            .child(icon_button(&super::calling::VIDEO, "Video call", |s, _| {
+                s.start_call(true)
+            }))
+    };
     let thumb = s.scroll_thumb.clone();
     let height = s.scroll_height.clone();
     let metrics = s.scroll_metrics.clone();
@@ -955,6 +965,12 @@ fn message_bubble(s: &State, message: &Message) -> El {
     );
     if mine && !message.is_call() {
         metadata = metadata.child(status_icon(&message.status, 14.0));
+    }
+    if mine && message.status == "failed" && message.kind == "text" {
+        let retry = message.clone();
+        metadata = metadata.child(icon_button(&SEND, "Retry send", move |s, _| {
+            s.retry_text(retry.clone())
+        }));
     }
     bubble = bubble.child(metadata);
     if let Some(reactions) = actions::reactions(message) {

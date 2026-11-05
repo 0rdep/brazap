@@ -291,6 +291,8 @@ pub struct Snapshot {
     #[serde(default)]
     pub calls: Vec<Call>,
     #[serde(default)]
+    pub live_call: Option<crate::calling::LiveCall>,
+    #[serde(default)]
     pub current_chat: Option<Chat>,
 }
 

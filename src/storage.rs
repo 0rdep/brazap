@@ -122,6 +122,10 @@ impl Archive {
                 conn.batch_execute(include_str!("../migrations/013_chat_sync_policy.sql"))
                     .map_err(db_error)?;
                 conn.batch_execute(include_str!("../migrations/014_history_boundaries.sql"))
+                    .map_err(db_error)?;
+                conn.batch_execute(include_str!("../migrations/015_live_calls.sql"))
+                    .map_err(db_error)?;
+                conn.batch_execute(include_str!("../migrations/016_read_state.sql"))
                     .map_err(db_error)
             })
             .await?;
@@ -138,16 +142,21 @@ impl Archive {
         let rows: Vec<_> = rows
             .into_iter()
             .filter(|row| !identities.is_locked(&row.view.chat))
+            .map(|row| {
+                let aliases = identities.aliases_json(&row.view.chat);
+                let senders = identities.aliases_json(&row.view.sender);
+                (row, aliases, senders)
+            })
             .collect();
         self.backend.shared().run(move |conn| {
             conn.transaction::<_, diesel::result::Error, _>(|conn| {
-                for row in rows {
+                for (row,aliases,senders) in rows {
                     let m = row.view;
                     crate::stickers::index(conn, account as i64, &m, &row.encoded)?;
                     store_deletion(conn, account as i64, &m.chat, m.timestamp, &row.encoded)?;
                     let payload = message_payload(&m).map_err(|error| diesel::result::Error::SerializationError(Box::new(error)))?;
-                    let existed:CountRow=diesel::sql_query("SELECT COUNT(*) AS count FROM brazap_messages WHERE account=? AND chat=? AND sender=? AND id=?")
-                        .bind::<BigInt,_>(account as i64).bind::<Text,_>(&m.chat).bind::<Text,_>(&m.sender).bind::<Text,_>(&m.id).get_result(conn)?;
+                    let existed:CountRow=diesel::sql_query("SELECT COUNT(*) AS count FROM brazap_messages WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND (? NOT LIKE '%@g.us' OR sender IN (SELECT value FROM json_each(?))) AND id=? AND json_extract(payload,'$.from_me')=?")
+                        .bind::<BigInt,_>(account as i64).bind::<Text,_>(&aliases).bind::<Text,_>(&m.chat).bind::<Text,_>(&senders).bind::<Text,_>(&m.id).bind::<BigInt,_>(i64::from(m.from_me)).get_result(conn)?;
                     diesel::sql_query(
                         "INSERT INTO brazap_messages(account, chat, sender, id, timestamp, status, payload, encoded, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(account,chat,sender,id) DO UPDATE SET status=CASE WHEN (CASE excluded.status WHEN 'read' THEN 4 WHEN 'delivered' THEN 3 WHEN 'sent' THEN 2 ELSE 0 END)>(CASE brazap_messages.status WHEN 'read' THEN 4 WHEN 'delivered' THEN 3 WHEN 'sent' THEN 2 ELSE 0 END) THEN excluded.status ELSE brazap_messages.status END"
                     ).bind::<BigInt,_>(account as i64).bind::<Text,_>(&m.chat)
@@ -158,7 +167,9 @@ impl Archive {
                     if !m.visible() {continue;}
                     diesel::sql_query("INSERT INTO brazap_message_search(account,chat,sender,id,text) VALUES(?,?,?,?,?) ON CONFLICT(account,chat,sender,id) DO UPDATE SET text=excluded.text")
                         .bind::<BigInt,_>(account as i64).bind::<Text,_>(&m.chat).bind::<Text,_>(&m.sender).bind::<Text,_>(&m.id).bind::<Text,_>(searchable(&m)).execute(conn)?;
-                    let unread = i64::from(existed.count == 0 && live && !m.from_me);
+                    let read:CountRow=diesel::sql_query("SELECT (EXISTS(SELECT 1 FROM brazap_chat_reads WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND through_timestamp>?) OR EXISTS(SELECT 1 FROM brazap_read_messages WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND id=? AND (sender='' OR sender IN (SELECT value FROM json_each(?))))) AS count")
+                        .bind::<BigInt,_>(account as i64).bind::<Text,_>(&aliases).bind::<BigInt,_>(m.timestamp).bind::<BigInt,_>(account as i64).bind::<Text,_>(&aliases).bind::<Text,_>(&m.id).bind::<Text,_>(&senders).get_result(conn)?;
+                    let unread = i64::from(existed.count == 0 && live && !m.from_me && read.count==0);
                     let preview = m.preview();
                     diesel::sql_query(
                         "INSERT INTO brazap_chats(account,jid,name,preview,updated_at,unread) VALUES(?,?,?,?,?,?) ON CONFLICT(account,jid) DO UPDATE SET name=CASE WHEN excluded.name!='' THEN excluded.name ELSE brazap_chats.name END, preview=CASE WHEN excluded.updated_at>=brazap_chats.updated_at THEN excluded.preview ELSE brazap_chats.preview END, updated_at=MAX(brazap_chats.updated_at,excluded.updated_at), unread=brazap_chats.unread+excluded.unread"
@@ -263,20 +274,15 @@ impl Archive {
     }
 
     pub async fn mark_read(&self, chat: String) -> Result<()> {
-        let account = self.account as i64;
-        let chat = self.identities().await?.aliases_json(&chat);
-        self.backend
-            .shared()
-            .run(move |conn| {
-                diesel::sql_query("UPDATE brazap_chats SET unread=0 WHERE account=? AND jid IN (SELECT value FROM json_each(?))")
-                    .bind::<BigInt, _>(account)
-                    .bind::<Text, _>(chat)
-                    .execute(conn)
-                    .map_err(db_error)?;
-                Ok(())
-            })
-            .await?;
-        Ok(())
+        self.apply_chat_read(
+            &chat,
+            None,
+            Vec::new(),
+            chrono::Utc::now().timestamp_millis(),
+            false,
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn receipt(&self, chat: String, ids: Vec<String>, status: String) -> Result<()> {
@@ -285,7 +291,7 @@ impl Archive {
         self.backend.shared().run(move |conn| {
             conn.transaction::<_,diesel::result::Error,_>(|conn| {
                 for id in ids {
-                    diesel::sql_query("INSERT INTO brazap_receipts(account,chat,id,status) VALUES(?,?,?,?) ON CONFLICT(account,chat,id) DO UPDATE SET status=CASE WHEN (CASE excluded.status WHEN 'read' THEN 4 WHEN 'delivered' THEN 3 WHEN 'sent' THEN 2 WHEN 'failed' THEN 2 ELSE 1 END) >= (CASE brazap_receipts.status WHEN 'read' THEN 4 WHEN 'delivered' THEN 3 WHEN 'sent' THEN 2 ELSE 1 END) THEN excluded.status ELSE brazap_receipts.status END")
+                    diesel::sql_query("INSERT INTO brazap_receipts(account,chat,id,status) VALUES(?,?,?,?) ON CONFLICT(account,chat,id) DO UPDATE SET status=CASE WHEN (CASE excluded.status WHEN 'read' THEN 4 WHEN 'delivered' THEN 3 WHEN 'sent' THEN 2 WHEN 'failed' THEN 1 ELSE 0 END) >= (CASE brazap_receipts.status WHEN 'read' THEN 4 WHEN 'delivered' THEN 3 WHEN 'sent' THEN 2 WHEN 'failed' THEN 1 ELSE 0 END) THEN excluded.status ELSE brazap_receipts.status END")
                         .bind::<BigInt,_>(account).bind::<Text,_>(&chat).bind::<Text,_>(&id).bind::<Text,_>(&status).execute(conn)?;
                     diesel::sql_query("UPDATE brazap_messages SET status=? WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND id=? AND json_extract(payload,'$.from_me')=1 AND (CASE status WHEN 'read' THEN 4 WHEN 'delivered' THEN 3 WHEN 'sent' THEN 2 ELSE 0 END) <= ?")
                         .bind::<Text,_>(&status).bind::<BigInt,_>(account).bind::<Text,_>(&aliases).bind::<Text,_>(&id).bind::<BigInt,_>(status_rank(&status)).execute(conn)?;
@@ -543,7 +549,8 @@ pub(crate) fn status_rank(status: &str) -> i64 {
     match status {
         "read" => 4,
         "delivered" => 3,
-        "sent" | "failed" => 2,
+        "sent" => 2,
+        "failed" => 1,
         _ => 0,
     }
 }

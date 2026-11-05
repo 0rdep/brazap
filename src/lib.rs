@@ -1,4 +1,5 @@
 pub mod assets;
+pub mod calling;
 pub mod calls;
 pub mod chat;
 pub(crate) mod chat_sync_policy;
@@ -16,8 +17,10 @@ pub(crate) mod media_recovery;
 pub mod message_actions;
 pub mod model;
 pub mod notifications;
+pub(crate) mod outbox;
 #[cfg(feature = "desktop")]
 pub(crate) mod playback;
+pub(crate) mod read_state;
 #[cfg(feature = "desktop")]
 pub(crate) mod recording;
 pub mod search;

@@ -52,6 +52,8 @@ pub(super) struct Panel {
     pub value: Settings,
     pub loading: bool,
     pub saving: bool,
+    save_value: Option<Settings>,
+    pub settings_revision: u64,
     pub report: Value,
     pub privacy: BTreeMap<String, String>,
     pub privacy_pending: bool,
@@ -65,7 +67,9 @@ pub(super) struct Panel {
 impl State {
     pub(super) fn open_preferences(&mut self) {
         self.preferences.open = true;
-        self.preferences.value = self.snapshot.settings.clone();
+        if !self.preferences.saving {
+            self.preferences.value = self.snapshot.settings.clone();
+        }
         self.preferences.loading = true;
         self.preferences.error = None;
         self.close_viewer();
@@ -78,13 +82,21 @@ impl State {
         let _ = self.tx.send(Command::Preferences(action, args));
     }
     pub(super) fn edit_preferences(&mut self, change: impl FnOnce(&mut Settings)) {
-        if self.preferences.saving || self.preferences.loading {
+        let previous = self.preferences.value.clone();
+        change(&mut self.preferences.value);
+        if previous == self.preferences.value {
             return;
         }
-        change(&mut self.preferences.value);
-        self.preferences.saving = true;
         self.preferences.error = None;
         self.preferences.notice = None;
+        self.sync_floating();
+        if !self.preferences.saving {
+            self.save_preferences();
+        }
+    }
+    fn save_preferences(&mut self) {
+        self.preferences.saving = true;
+        self.preferences.save_value = Some(self.preferences.value.clone());
         self.request_preference("save", json!(self.preferences.value));
     }
     fn preferences_page(&mut self, page: Page) {
@@ -100,9 +112,38 @@ impl State {
         }
     }
     pub(super) fn receive_preferences(&mut self, action: &str, result: Result<Value, String>) {
+        if action == "save" {
+            self.preferences.saving = false;
+            let Some(saved) = self.preferences.save_value.take() else {
+                return;
+            };
+            let newer = self.preferences.value != saved;
+            match result {
+                Ok(value) => {
+                    self.preferences.settings_revision = self
+                        .preferences
+                        .settings_revision
+                        .max(value["revision"].as_u64().unwrap_or(0));
+                    self.snapshot.settings = saved;
+                    if !newer {
+                        self.preferences.notice = Some("Saved".into());
+                    }
+                }
+                Err(error) => {
+                    self.preferences.error = Some(error);
+                    if !newer {
+                        self.preferences.value = self.snapshot.settings.clone();
+                    }
+                }
+            }
+            if newer {
+                self.save_preferences();
+            }
+            self.sync_floating();
+            return;
+        }
         match action {
             "get" => self.preferences.loading = false,
-            "save" => self.preferences.saving = false,
             "logout" => self.preferences.logging_out = false,
             "privacy" | "privacy_set" => self.preferences.privacy_pending = false,
             _ => {}
@@ -110,23 +151,19 @@ impl State {
         match result {
             Err(e) => {
                 self.preferences.error = Some(e);
-                if action == "save" {
-                    self.preferences.value = self.snapshot.settings.clone();
-                }
             }
             Ok(value) => match action {
                 "get" => {
                     self.preferences.report = value["storage"].clone();
                     self.preferences.update = value["updates"].clone();
-                    if !self.preferences.saving {
+                    if !self.preferences.saving
+                        && value["revision"].as_u64().unwrap_or(0)
+                            >= self.preferences.settings_revision
+                    {
                         if let Ok(settings) = serde_json::from_value(value["settings"].clone()) {
                             self.preferences.value = settings;
                         }
                     }
-                }
-                "save" => {
-                    self.snapshot.settings = self.preferences.value.clone();
-                    self.preferences.notice = Some("Saved".into());
                 }
                 "privacy" | "privacy_set" => {
                     if let Ok(p) = serde_json::from_value(value) {
@@ -213,7 +250,7 @@ fn card(body: El) -> El {
         .border(1.0, BORDER)
 }
 fn toggle(
-    s: &State,
+    _s: &State,
     name: &str,
     description: &str,
     on: bool,
@@ -235,7 +272,6 @@ fn toggle(
                 Switch::new(on)
                     .label(super::locale::tr(name))
                     .hide_label()
-                    .disabled(s.preferences.saving || s.preferences.loading)
                     .on_toggle(move |s: &mut State| s.edit_preferences(&change))
                     .build(kit()),
             ),
@@ -310,6 +346,9 @@ pub(super) fn view(s: &State) -> El {
                 ("Arial", "Arial"),
                 ("monospace", "Monospace"),
             ] {
+                if !super::fonts::available(id) {
+                    continue;
+                }
                 fonts = fonts.child(choice(name, p.appearance.font == id, move |s| {
                     s.edit_preferences(|p| p.appearance.font = id.into())
                 }));

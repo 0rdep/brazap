@@ -18,6 +18,24 @@ if [[ ! -x "$windows_cc" ]]; then
 fi
 
 export CC_x86_64_pc_windows_gnu="$windows_cc"
+windows_cxx="${BRAZAP_WINDOWS_CXX:-$(command -v x86_64-w64-mingw32-g++ || true)}"
+if [[ -z "$windows_cxx" && -x .build-deps/windows-cxx ]]; then
+    windows_cxx="$project_root/.build-deps/windows-cxx"
+fi
+if [[ ! -x "$windows_cxx" ]]; then
+    echo 'Install the MinGW-w64 C++ toolchain or set BRAZAP_WINDOWS_CXX to its compiler.' >&2
+    exit 1
+fi
+export CXX_x86_64_pc_windows_gnu="$windows_cxx"
+# OpenH264 is C++; bundle its runtime instead of requiring libstdc++-6.dll.
+cpp_runtime="$("$windows_cxx" -print-file-name=libstdc++.a)"
+if [[ ! -f "$cpp_runtime" ]]; then
+    echo 'The MinGW-w64 static C++ runtime was not found.' >&2
+    exit 1
+fi
+export CXXSTDLIB_x86_64_pc_windows_gnu=static=stdc++
+export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="${CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS:-} -Lnative=$(dirname -- "$cpp_runtime")"
+
 export AR_x86_64_pc_windows_gnu="${AR_x86_64_pc_windows_gnu:-$(command -v x86_64-w64-mingw32-ar || command -v ar)}"
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="$CC_x86_64_pc_windows_gnu"
 

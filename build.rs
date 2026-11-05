@@ -3,6 +3,21 @@ use std::{env, fs, path::PathBuf, process::Command};
 fn main() {
     println!("cargo:rerun-if-changed=assets/logo.png");
     println!("cargo:rerun-if-env-changed=WINDRES");
+    println!("cargo:rerun-if-changed=assets/macos/Info.plist");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+        let plist = out.join("Info.plist");
+        let source = fs::read_to_string("assets/macos/Info.plist").expect("Read macOS permissions");
+        fs::write(
+            &plist,
+            source.replace("__VERSION__", &env::var("CARGO_PKG_VERSION").unwrap()),
+        )
+        .expect("Write macOS permissions");
+        println!(
+            "cargo:rustc-link-arg-bin=brazap=-Wl,-sectcreate,__TEXT,__info_plist,{}",
+            plist.display()
+        );
+    }
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }

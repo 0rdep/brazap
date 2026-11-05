@@ -21,6 +21,11 @@ use crate::{
 };
 
 pub struct Service {
+    pub(crate) live_calls: crate::calling::Calls,
+    pub(crate) read_slots: Semaphore,
+    pub(crate) read_jobs: std::sync::Mutex<std::collections::HashSet<(String, i64)>>,
+    pub(crate) outbox_locks:
+        Mutex<std::collections::HashMap<(String, String), std::sync::Weak<Mutex<()>>>>,
     pub archive: Archive,
     pub(crate) config: Config,
     pub(crate) settings: RwLock<crate::settings::Settings>,
@@ -66,13 +71,20 @@ impl Service {
             .as_deref()
             == Some("1")
         {
+            archive.clear_read_sync().await?;
             archive.database.reset_device(archive.account).await?;
             archive
                 .set_preference("session_reset_pending".into(), "0".into())
                 .await?;
         }
+        archive.recover_live_calls().await?;
+        archive.recover_pending_sends().await?;
         let settings = archive.app_settings().await?;
         Ok(Arc::new(Self {
+            live_calls: Default::default(),
+            read_slots: Semaphore::new(2),
+            read_jobs: Default::default(),
+            outbox_locks: Mutex::new(Default::default()),
             config: config.clone(),
             settings: RwLock::new(settings),
             updates: RwLock::new(crate::updates::UpdateState::default()),
@@ -109,6 +121,10 @@ impl Service {
 
     pub(crate) fn changed(&self) {
         self.revision.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Relaxed)
     }
 
     pub async fn run(self: Arc<Self>) {
@@ -355,6 +371,7 @@ impl Service {
     }
 
     async fn reset_unlinked_session(&self) -> Result<()> {
+        self.archive.clear_read_sync().await?;
         self.chat_locks_ready.store(false, Ordering::Release);
         // Call only before starting a client, or after its store_release fence.
         self.archive.preserve_identity_links().await?;
@@ -397,13 +414,13 @@ impl Service {
                                     [whatsapp_rust::wacore::appstate::patch_decode::WAPatchName::RegularLow],
                                     whatsapp_rust::AppStateResyncMode::Snapshot,
                                 ).await.is_ok_and(|report|report.all_synced());
-                                if !synced {
+                                if synced {
+                                    service.chat_locks_ready.store(true, Ordering::Release);
+                                } else {
                                     log::warn!(
-                                        "Could not refresh chat privacy state; automatic history remains paused"
+                                        "Could not refresh all chat privacy state; automatic history remains paused. Notifications use archived chat visibility."
                                     );
-                                    return;
                                 }
-                                service.chat_locks_ready.store(true, Ordering::Release);
                             }
                             let current = service.client.read().await;
                             if current
@@ -415,6 +432,7 @@ impl Service {
                                 service.changed();
                             }
                             drop(current);
+                            service.flush_read_sync().await;
                             if let Err(error) = service.refresh_chat_names().await {
                                 log::debug!("Chat names refresh: {error}");
                             }
@@ -459,6 +477,13 @@ impl Service {
                 self.notifications_ready.store(true, Ordering::Release);
             }
             Event::Disconnected(_) => {
+                if let Some(call) = self.live_call().await.filter(|c| !c.ended()) {
+                    self.finish_call(
+                        &call.id,
+                        Some("The call ended because WhatsApp disconnected.".into()),
+                    )
+                    .await;
+                }
                 self.notifications_ready.store(false, Ordering::Release);
                 let mut state = self.connection.write().await;
                 if state.phase != Phase::LoggedOut {
@@ -556,7 +581,17 @@ impl Service {
                 self.archive
                     .store_messages(project_inbound(&batch.messages), true)
                     .await?;
+                let mut viewed = std::collections::HashSet::new();
                 for inbound in batch.messages.iter() {
+                    let chat = inbound.info.source.chat.to_string();
+                    if !inbound.info.source.is_from_me
+                        && viewed.insert(chat.clone())
+                        && self.desktop_viewing(&chat).await
+                    {
+                        if let Err(error) = self.mark_chat_read(chat).await {
+                            log::warn!("Could not mark the visible conversation read: {error}");
+                        }
+                    }
                     let row = project_inbound(std::slice::from_ref(inbound)).remove(0);
                     #[cfg(all(target_os = "windows", feature = "desktop"))]
                     if !inbound.info.is_offline && inbound.info.unavailable_request_id.is_none() {
@@ -569,8 +604,62 @@ impl Service {
                     }
                 }
             }
+            Event::MarkChatAsReadUpdate(update) => {
+                if let Some(read) = update.action.read {
+                    let range = update.action.message_range.as_option();
+                    let through = range
+                        .and_then(|r| r.last_message_timestamp)
+                        .or_else(|| update.action_timestamp.map(|t| t.timestamp()));
+                    if through.is_some() || !update.from_full_sync || !read {
+                        let refs = range
+                            .map(|r| {
+                                r.messages
+                                    .iter()
+                                    .filter_map(|m| {
+                                        let key = m.key.as_option()?;
+                                        Some(crate::read_state::ReadTarget {
+                                            id: key.id.clone()?,
+                                            sender: key.participant.clone().unwrap_or_default(),
+                                            timestamp: m.timestamp.unwrap_or(0),
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        self.archive
+                            .apply_chat_read(
+                                &update.jid.to_string(),
+                                through,
+                                refs,
+                                update
+                                    .action_timestamp
+                                    .unwrap_or(update.timestamp)
+                                    .timestamp_millis(),
+                                !read,
+                            )
+                            .await?;
+                    }
+                }
+            }
             Event::Receipt(receipt) => {
                 use whatsapp_rust::wacore::types::presence::ReceiptType;
+                if matches!(
+                    receipt.r#type,
+                    ReceiptType::ReadSelf | ReceiptType::PlayedSelf
+                ) && receipt.source.is_from_me
+                {
+                    self.archive
+                        .read_self(
+                            &receipt.source.chat.to_string(),
+                            &receipt
+                                .message_ids
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>(),
+                            receipt.timestamp.timestamp_millis(),
+                        )
+                        .await?;
+                }
                 let status = match receipt.r#type {
                     ReceiptType::Read | ReceiptType::Played => Some("read"),
                     ReceiptType::Delivered => Some("delivered"),
@@ -741,12 +830,30 @@ impl Service {
                                 .timestamp_millis(),
                         )
                         .await?;
+                    if locked {
+                        if let Some(call) = self.live_call().await.filter(|call| !call.ended()) {
+                            if self.archive.identities().await?.is_locked(&call.chat) {
+                                let _ = self.end_call(&call.id).await;
+                                let _ = self.dismiss_call(&call.id).await;
+                            }
+                        }
+                    }
                 }
             }
             Event::PictureUpdate(picture) => {
                 self.archive
                     .invalidate_avatar(picture.jid.to_string())
                     .await?;
+            }
+            Event::IncomingCall(call) => {
+                self.incoming_call(call).await?;
+            }
+            Event::CallEndedElsewhere(call) => {
+                if let Some(current) = self.live_call().await.filter(|c| {
+                    c.call_id.as_deref().unwrap_or(&c.id) == call.call_id.as_str() && !c.ended()
+                }) {
+                    self.finish_call(&current.id, None).await;
+                }
             }
             Event::CallLogSync(call) => {
                 let device = client.persistence_manager().get_device_snapshot();
@@ -844,6 +951,7 @@ impl Service {
             selected_chat,
             revision: self.revision.load(Ordering::Relaxed),
             calls: self.archive.calls().await?,
+            live_call: self.live_call().await,
             current_chat,
             settings: self.settings.read().await.clone(),
         })
@@ -911,15 +1019,7 @@ impl Service {
     }
 
     pub async fn send_text(&self, chat: String, text: String) -> Result<Message> {
-        ensure!(!text.trim().is_empty(), "Message cannot be empty");
-        ensure!(text.len() <= 65_536, "Message is too long");
-        self.archive.allow_chat(&chat).await?;
-        if self.config.demo {
-            return self.demo_send(chat, wa::Message::text(text), None).await;
-        }
-        let client = self.connected().await?;
-        let jid: whatsapp_rust::Jid = chat.parse().context("Invalid chat address")?;
-        self.send_prepared(client, jid, wa::Message::text(text), None)
+        self.send_text_with_id(chat, text, None, crate::outbox::new_id(), None)
             .await
     }
 
@@ -1246,6 +1346,7 @@ impl Service {
     }
 
     pub async fn shutdown(&self) {
+        self.stop_calls().await;
         self.stopping.store(true, Ordering::Relaxed);
         self.history_prefetch.wake();
         if let Some(client) = self.client.read().await.clone() {
@@ -1353,6 +1454,10 @@ pub(crate) async fn ingest_history(archive: &Archive, history: &wa::HistorySync)
         if let Some(locked) = conversation.locked {
             archive
                 .set_chat_locked(conversation.id.clone(), locked, 0)
+                .await?;
+        } else {
+            archive
+                .note_history_visibility(conversation.id.clone())
                 .await?;
         }
         if archive.identities().await?.is_locked(&conversation.id) {

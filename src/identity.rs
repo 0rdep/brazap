@@ -113,6 +113,22 @@ impl Identities {
     pub(crate) fn aliases_json(&self, jid: &str) -> String {
         serde_json::to_string(&self.aliases(jid)).expect("String aliases serialize")
     }
+    pub(crate) fn person(&self, jid: &str, fallback: &str) -> (String, String) {
+        let jid = self.canonical(jid);
+        let name = self
+            .saved_names
+            .get(&jid)
+            .or_else(|| self.known_names.get(&jid))
+            .map(String::as_str)
+            .unwrap_or(fallback);
+        let phone = self
+            .aliases(&jid)
+            .into_iter()
+            .find(|value| value.ends_with("@s.whatsapp.net"))
+            .unwrap_or_default();
+        display_identity(&jid, name, &phone)
+    }
+
     pub(crate) fn message(&self, mut message: Message) -> Message {
         message.chat = self.canonical(&message.chat);
         if !message.from_me {

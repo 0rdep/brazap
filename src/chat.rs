@@ -121,7 +121,7 @@ impl Archive {
     }
 
     pub async fn restore_chat_settings(&self) -> Result<()> {
-        if self.preference("chat_settings_v3".into()).await?.is_some() {
+        if self.preference("chat_settings_v4".into()).await?.is_some() {
             return Ok(());
         }
         let mut cursor = 0;
@@ -200,6 +200,8 @@ impl Archive {
             for chat in history.conversations {
                 if let Some(locked) = chat.locked {
                     self.set_chat_locked(chat.id.clone(), locked, 0).await?;
+                } else {
+                    self.note_history_visibility(chat.id.clone()).await?;
                 }
                 if chat.end_of_history_transfer_type == Some(whatsapp_rust::prelude::wa::conversation::EndOfHistoryTransferType::COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY) {
                     self.complete_history(chat.id.clone(), "server_complete")
@@ -233,7 +235,7 @@ impl Archive {
                 }
             }
         }
-        self.set_preference("chat_settings_v3".into(), "1".into())
+        self.set_preference("chat_settings_v4".into(), "1".into())
             .await
     }
 }
