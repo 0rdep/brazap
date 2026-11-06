@@ -556,7 +556,14 @@ pub(super) fn button(s: &State, layer: &mut Vec<El>) -> El {
         } else {
             INK.alpha(0.04)
         })
-        .border(1.0, MINT.alpha(if active.is_some() { 0.25 } else { 0.0 }))
+        .border(
+            1.0,
+            if active.is_some() {
+                MINT.alpha(0.35)
+            } else {
+                CONTROL_BORDER
+            },
+        )
         .hover(MINT.alpha(0.15))
         .opacity(if enabled { 1.0 } else { 0.4 })
         .role("button")

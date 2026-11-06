@@ -653,7 +653,14 @@ pub(super) fn modal(s: &State) -> Option<(El, Vec<El>)> {
                     .padding(8.0)
                     .radius(14.0)
                     .fill(Color::BLACK.alpha(0.18))
-                    .border(1.0, BORDER)
+                    .border(
+                        1.0,
+                        if item.caption.focused {
+                            MINT.alpha(0.55)
+                        } else {
+                            CONTROL_BORDER
+                        },
+                    )
                     .child(
                         rune::auto_grow(edit, 1, 3)
                             .key(format!("caption-scroll-{id}"))

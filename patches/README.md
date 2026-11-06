@@ -11,6 +11,20 @@ priority over system emoji fonts. Brazap uses this to render its bundled Twemoji
 artwork inside normal text, including names, previews, messages and menus.
 This preserves Rune's shaping, wrapping, selection and truncation behavior.
 
+The tracked patch also carries desktop text-input fixes against the same pin:
+
+- On Windows, use the keyboard layout's committed text for printable keypresses.
+  US International dead-key + Space produces a literal accent even though the
+  logical key is Space; invalid combinations can produce two characters. Keep
+  shortcut keys separate, including Ctrl+C/V, and allow AltGr text.
+- Distinguish macOS Command navigation from Windows/Linux Ctrl navigation. Ctrl
+  moves/selects/deletes by word, Ctrl+Up/Down moves by paragraph, and Ctrl+Home/End
+  moves to document boundaries. Plain Home/End follows the current visual line
+  on Windows/Linux. macOS Command/Option behavior is preserved.
+
+These fixes are applied to normal windows and native overlays. No reference
+checkout or unrecorded build-source edits are used.
+
 The patch also adapts the Windows adapter-selection part of
 [zAcherttp's Rune PR #46](https://github.com/anomalyco/rune/pull/46), reviewed at
 `2f6ab83ecdadd5819cf638496fb5a0f9529540ca`. After explicit `WGPU_ADAPTER_NAME` and

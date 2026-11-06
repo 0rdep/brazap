@@ -1486,6 +1486,7 @@ impl State {
             self.drafts.insert(old.clone(), self.draft.text.clone());
         }
         self.draft = TextEdit::new(self.drafts.get(&chat).cloned().unwrap_or_default());
+        self.focus_composer();
         self.typing_text = self.draft.text.clone();
         self.typing_sent_at = 0;
         self.selected = Some(chat.clone());
@@ -1519,6 +1520,10 @@ impl State {
         self.section = Section::Messages;
         let _ = self.tx.send(Command::Select(chat));
         self.update_viewing();
+    }
+    fn focus_composer(&mut self) {
+        self.search.focused = false;
+        self.draft.focused = true;
     }
     fn tool(&mut self, name: &'static str, args: Value) {
         self.busy = true;
@@ -1559,6 +1564,7 @@ impl State {
                 .insert(message.id.clone(), (message.clone(), target.clone()));
             self.merge_messages(vec![message.clone()]);
             self.draft.clear();
+            self.focus_composer();
             self.drafts.remove(&chat);
             self.detached = false;
             self.error = None;

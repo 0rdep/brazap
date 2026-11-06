@@ -36,6 +36,12 @@ pub(super) const BORDER: Color = Color {
     b: 1.0,
     a: 0.065,
 };
+pub(super) const CONTROL_BORDER: Color = Color {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 0.13,
+};
 pub(super) const CHAT: Icon = Icon {
     name: "brazap-chat",
     view: 24.0,
@@ -221,6 +227,8 @@ pub(super) fn icon_button(
     el().size(36.0, 36.0)
         .center()
         .radius(11.0)
+        .fill(Color::WHITE.alpha(0.035))
+        .border(1.0, CONTROL_BORDER)
         .role("button")
         .label(super::locale::tr(name))
         .help(super::locale::tr(name))
@@ -1021,7 +1029,18 @@ fn composer(s: &State, layer: &mut Vec<El>) -> El {
     };
     let field = rune::auto_grow(edit, 1, 5)
         .key("composer-input")
-        .padding(8.0)
+        .px(13.0)
+        .py(11.0)
+        .radius(13.0)
+        .fill(Color::WHITE.alpha(0.035))
+        .border(
+            1.0,
+            if s.draft.focused && enabled {
+                MINT.alpha(0.55)
+            } else {
+                CONTROL_BORDER
+            },
+        )
         .grow(1.0)
         .min_w(0.0);
     let send = el()
@@ -1029,6 +1048,7 @@ fn composer(s: &State, layer: &mut Vec<El>) -> El {
         .radius(13.0)
         .center()
         .fill(if enabled { MINT } else { MINT.alpha(0.3) })
+        .border(1.0, MINT.alpha(if enabled { 0.7 } else { 0.2 }))
         .role("button")
         .label(super::locale::tr("Send message"))
         .help(super::locale::tr("Send message"))
@@ -1089,8 +1109,11 @@ fn composer(s: &State, layer: &mut Vec<El>) -> El {
     let mut content = col()
         .key("composer")
         .w_full()
-        .padding(18.0)
+        .padding(12.0)
         .gap(9.0)
+        .radius(18.0)
+        .fill(Color::WHITE.alpha(0.018))
+        .border(1.0, CONTROL_BORDER)
         .instant_changes();
     if let Some(reply) = actions::reply_banner(s) {
         content = content.child(reply);
@@ -1101,12 +1124,20 @@ fn composer(s: &State, layer: &mut Vec<El>) -> El {
         .center_y()
         .child(super::picker::trigger(s, layer))
         .child(attach);
-    content.child(
-        controls
-            .child(field)
-            .child(send)
-            .child(super::recording::button(s, layer)),
-    )
+    col()
+        .key("composer-dock")
+        .w_full()
+        .px(14.0)
+        .pt(8.0)
+        .pb(14.0)
+        .child(
+            content.child(
+                controls
+                    .child(field)
+                    .child(send)
+                    .child(super::recording::button(s, layer)),
+            ),
+        )
 }
 
 pub(super) fn pick_file(s: &mut State, tx: &mut Tx, kind: &'static str) {

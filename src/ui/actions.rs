@@ -135,6 +135,7 @@ pub(super) fn toolbar(message: &Message) -> El {
         }))
         .child(action(&REPLY, "Reply to message", move |s| {
             s.reply = Some(reply.clone());
+            s.focus_composer();
             s.reaction_menu = None;
             s.attachments_open = false;
         }))
