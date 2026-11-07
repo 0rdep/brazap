@@ -21,6 +21,9 @@ The tracked patch also carries desktop text-input fixes against the same pin:
   moves/selects/deletes by word, Ctrl+Up/Down moves by paragraph, and Ctrl+Home/End
   moves to document boundaries. Plain Home/End follows the current visual line
   on Windows/Linux. macOS Command/Option behavior is preserved.
+- Word boundaries also handle Unicode whitespace (including pasted non-breaking
+  spaces), punctuation and emoji. Navigation and deletion preserve atomic pills
+  and hidden secure fields instead of treating an entire pasted phrase as a word.
 
 These fixes are applied to normal windows and native overlays. No reference
 checkout or unrecorded build-source edits are used.

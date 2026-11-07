@@ -2,6 +2,7 @@ mod actions;
 mod animation;
 mod attachments;
 mod audio;
+mod background;
 mod calling;
 mod details;
 mod diagnostics;
@@ -14,6 +15,7 @@ mod picker;
 mod preferences;
 mod recording;
 mod render;
+mod search;
 mod sidebar;
 mod times;
 mod view;
@@ -59,7 +61,7 @@ struct UiWake {
 enum Command {
     Start,
     Call(&'static str, Value),
-    Search(String),
+    Search(search::Request),
     Stickers(bool),
     RememberEmoji(String),
     Jump(Message, u64),
@@ -94,7 +96,7 @@ enum Event {
         Arc<std::sync::atomic::AtomicBool>,
     ),
     Snapshot(Snapshot),
-    Search(String, Result<SearchResults, String>),
+    Search(search::Request, Result<SearchResults, String>),
     Stickers(bool, Result<Value, String>),
     Jump(Message, u64, Result<MessagePage, String>),
     Gallery(String, String, Result<MediaPage, String>),
@@ -122,6 +124,7 @@ enum Section {
 }
 
 pub(super) struct State {
+    background: background::Background,
     config: Config,
     preferences: preferences::Panel,
     picker: picker::Panel,
@@ -147,10 +150,10 @@ pub(super) struct State {
     diagnostics: diagnostics::Panel,
     section: Section,
     sidebar: rune_kit::shell::PaneState,
-    search_results: SearchResults,
-    search_requested: String,
-    search_at: Option<f64>,
-    searching: bool,
+    search: search::Panel,
+    chat_search: search::Panel,
+    composer_focus_at: Option<std::time::Instant>,
+    search_focus_at: Option<std::time::Instant>,
     history_focus: bool,
     highlighted: Option<String>,
     history_notice: Option<String>,
@@ -173,7 +176,6 @@ pub(super) struct State {
     logo: Option<Image>,
     snapshot: Snapshot,
     selected: Option<String>,
-    search: TextEdit,
     draft: TextEdit,
     phone: TextEdit,
     phone_country: phone::Picker,
@@ -252,6 +254,7 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
     let window = Arc::new(std::sync::Mutex::new(None));
     let window_created = window.clone();
     let mut state = State {
+        background: Default::default(),
         config: ui_config,
         preferences: Default::default(),
         picker: Default::default(),
@@ -277,10 +280,10 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         diagnostics: diagnostics::Panel::default(),
         section: Section::Messages,
         sidebar: rune_kit::shell::PaneState::new(305.0).range(260.0, 440.0),
-        search_results: SearchResults::default(),
-        search_requested: String::new(),
-        search_at: None,
-        searching: false,
+        search: search::Panel::default(),
+        chat_search: search::Panel::default(),
+        composer_focus_at: None,
+        search_focus_at: None,
         history_focus: false,
         highlighted: None,
         history_notice: None,
@@ -303,7 +306,6 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         logo: None,
         snapshot: Snapshot::default(),
         selected: None,
-        search: TextEdit::new(""),
         draft: TextEdit::new(""),
         phone: TextEdit::new(""),
         phone_country: phone::Picker::default(),
@@ -373,6 +375,13 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         .on_ready(move |_| {
             let _ = start.send(Command::Start);
         });
+    state.background.attach(app.handle(), state.config.demo);
+    if state.background.tray.is_some() {
+        app = app
+            .keep_running()
+            .release_gpu_when_closed()
+            .on_close(background::close);
+    }
     if let Ok(mut wake) = state.wake.lock() {
         wake.app = Some(app.handle());
     }
@@ -380,7 +389,8 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
     app.init(move || state)
         .try_run()
         .map_err(|error| anyhow::anyhow!("Could not open the desktop window: {error}"))?;
-    // The window owns the last command sender; closing it asks the worker to flush its session.
+    // Quit drops the last command sender and flushes the shared session. A tray
+    // close only hides the window; its state and service stay alive.
     let _ = worker.join();
     Ok(())
 }
@@ -510,11 +520,11 @@ async fn worker(
                         assets.spawn(async move {if let Err(error)=remote.call("prepare_media",json!({"chat":chat,"items":items})).await{log::debug!("Could not prepare media: {error}");}});
                         continue;
                     }
-                    Some(Command::Search(query))=>{
+                    Some(Command::Search(request))=>{
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
                         assets.spawn(async move {
-                            let result=remote.call("search",json!({"query":query})).await.and_then(|v|Ok(serde_json::from_value(v)?)).map_err(|e|format!("{e:#}"));
-                            emit(&events,&wake,Event::Search(query,result));
+                            let result=remote.call("search",json!({"query":request.query,"chat":request.chat,"cursor":request.cursor})).await.and_then(|v|Ok(serde_json::from_value(v)?)).map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Search(request,result));
                         });continue;
                     }
                     Some(Command::Jump(message, generation))=>{
@@ -705,6 +715,10 @@ async fn worker(
 }
 
 fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
+    locale::configure(&state.preferences.value.appearance);
+    state
+        .background
+        .localize(&state.preferences.value.appearance.language);
     use std::sync::atomic::Ordering::Relaxed;
     IMAGE_BYTES.store(
         state
@@ -817,15 +831,30 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
                 state.receive_stickers(sync, result);
                 changed = true;
             }
-            Event::Search(query, result) => {
-                if query == state.search.text.trim() {
-                    state.searching = false;
-                    match result {
-                        Ok(results) => state.search_results = results,
-                        Err(error) => state.error = Some(error),
-                    }
-                    changed = true;
+            Event::Search(request, result) => {
+                let result = result.map(|mut results| {
+                    results.chats.retain(|hit| {
+                        state
+                            .snapshot
+                            .chats
+                            .iter()
+                            .any(|chat| chat.matches_jid(&hit.jid))
+                    });
+                    results.messages.retain(|hit| {
+                        state
+                            .snapshot
+                            .chats
+                            .iter()
+                            .any(|chat| chat.matches_jid(&hit.chat.jid))
+                    });
+                    results
+                });
+                if request.chat.is_none() {
+                    state.search.receive(&request, result);
+                } else {
+                    state.chat_search.receive(&request, result);
                 }
+                changed = true;
             }
             Event::Jump(message, generation, result) => {
                 if state.selected.as_deref() == Some(&message.chat)
@@ -1118,23 +1147,26 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
             changed = true;
         }
     }
-    if state.search_requested != state.search.text.trim() && state.search_at.is_none() {
-        state.search_at = Some(elapsed + 0.2);
-        tx.wake_after(Duration::from_millis(200));
-    }
-    if state.search_at.is_some_and(|at| elapsed >= at) {
-        state.search_at = None;
-        state.search_requested = state.search.text.trim().into();
-        if state.search_requested.is_empty() {
-            state.search_results = SearchResults::default();
-            state.searching = false;
+    changed |= search::poll(state, elapsed, tx);
+    if let Some(at) = state.composer_focus_at {
+        if let Some(delay) = at.checked_duration_since(std::time::Instant::now()) {
+            tx.wake_after(delay);
         } else {
-            state.searching = true;
-            let _ = state
-                .tx
-                .send(Command::Search(state.search_requested.clone()));
+            state.composer_focus_at = None;
+            state.focus_composer();
+            changed = true;
         }
-        changed = true;
+    }
+    if let Some(at) = state.search_focus_at {
+        if let Some(delay) = at.checked_duration_since(std::time::Instant::now()) {
+            tx.wake_after(delay);
+        } else {
+            state.search_focus_at = None;
+            if state.chat_search.open {
+                state.focus_chat_search();
+                changed = true;
+            }
+        }
     }
     let second = crate::model::now();
     if state.typing_text != state.draft.text {
@@ -1246,6 +1278,8 @@ fn receive_snapshot(state: &mut State, mut snapshot: Snapshot, tx: &mut Tx) -> b
                 state.close_viewer();
                 state.details = false;
                 state.picker.open = false;
+                state.chat_search.clear();
+                state.chat_search.open = false;
             } else {
                 return call_changed;
             }
@@ -1293,10 +1327,17 @@ fn receive_snapshot(state: &mut State, mut snapshot: Snapshot, tx: &mut Tx) -> b
             state.preferences.value = snapshot.settings.clone();
         }
         state
-            .search_results
+            .search
+            .results
             .chats
             .retain(|hit| snapshot.chats.iter().any(|chat| chat.matches_jid(&hit.jid)));
-        state.search_results.messages.retain(|hit| {
+        state.search.results.messages.retain(|hit| {
+            snapshot
+                .chats
+                .iter()
+                .any(|chat| chat.matches_jid(&hit.chat.jid))
+        });
+        state.chat_search.results.messages.retain(|hit| {
             snapshot
                 .chats
                 .iter()
@@ -1480,6 +1521,8 @@ impl State {
         self.contact = None;
         self.stop_voice();
         self.reply = None;
+        self.chat_search.clear();
+        self.chat_search.open = false;
         self.reaction_menu = None;
         self.forwarding = None;
         if let Some(old) = &self.selected {
@@ -1522,8 +1565,19 @@ impl State {
         self.update_viewing();
     }
     fn focus_composer(&mut self) {
-        self.search.focused = false;
+        self.search_focus_at = None;
+        self.search.edit.focused = false;
+        self.chat_search.edit.focused = false;
         self.draft.focused = true;
+    }
+    fn defer_composer_focus(&mut self, tx: &mut Tx) {
+        // A pointer press can blur an editor in the same frame. Request focus
+        // after that frame has committed, without replacing the draft/undo state.
+        self.draft.focused = false;
+        self.search.edit.focused = false;
+        self.chat_search.edit.focused = false;
+        self.composer_focus_at = Some(std::time::Instant::now() + Duration::from_millis(16));
+        tx.wake_after(Duration::from_millis(16));
     }
     fn tool(&mut self, name: &'static str, args: Value) {
         self.busy = true;
@@ -1599,7 +1653,50 @@ impl State {
     }
 }
 
-fn on_key(s: &mut State, event: &rune::KeyEvent, _: &mut Tx) -> bool {
+fn message_enter(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
+    if event.key != rune::Key::Enter || event.mods.shift {
+        return false;
+    }
+    // The IME owns Return while committing a composition. Repeat must not send
+    // another message or activate a different control after the first send.
+    if s.draft.preedit.is_some()
+        || s.attachments.as_ref().is_some_and(|panel| {
+            panel
+                .items
+                .iter()
+                .any(|item| item.caption.preedit.is_some())
+        })
+    {
+        return false;
+    }
+    if !tx.key_repeat() {
+        if s.attachments.is_some() {
+            s.send_attachments();
+        } else {
+            s.send();
+        }
+    }
+    true
+}
+
+fn on_key(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
+    if event.is_command('f')
+        && !event.mods.shift
+        && s.authenticated
+        && s.selected.is_some()
+        && s.section == Section::Messages
+        && !s.preferences.open
+        && !s.details
+        && s.viewer.is_none()
+        && s.attachments.is_none()
+        && s.recording.is_none()
+        && s.forwarding.is_none()
+        && s.reaction_menu.is_none()
+        && !state_call_open(s)
+    {
+        s.open_chat_search(tx);
+        return true;
+    }
     if event.is_command('m') && event.mods.shift {
         s.diagnostics.open = !s.diagnostics.open;
         s.diagnostics.next_sample = 0.0;
@@ -1657,6 +1754,10 @@ fn on_key(s: &mut State, event: &rune::KeyEvent, _: &mut Tx) -> bool {
                 }
                 return true;
             }
+        }
+        if s.chat_search.open {
+            s.close_chat_search();
+            return true;
         }
         if s.reply.take().is_some() {
             return true;
@@ -1726,14 +1827,14 @@ impl State {
     }
 
     fn visible_chats(&self) -> Vec<&Chat> {
-        if self.search.text.trim().is_empty() {
+        if self.search.edit.text.trim().is_empty() {
             self.snapshot
                 .chats
                 .iter()
                 .filter(|c| c.archived == self.show_archived)
                 .collect()
         } else {
-            self.search_results.chats.iter().collect()
+            search::matching_chats(self)
         }
     }
 

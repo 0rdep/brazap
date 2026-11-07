@@ -351,7 +351,7 @@ impl State {
         }
     }
 
-    fn send_attachments(&mut self) {
+    pub(super) fn send_attachments(&mut self) {
         let Some(panel) = &mut self.attachments else {
             return;
         };
@@ -635,14 +635,8 @@ pub(super) fn modal(s: &State) -> Option<(El, Vec<El>)> {
                         .unwrap()
                         .caption
                 })
-                .on_submit(move |s: &mut State, _| {
-                    if let Some(panel) = &mut s.attachments
-                        && !panel.sending
-                        && let Some(item) = panel.items.iter_mut().find(|item| item.id == id)
-                    {
-                        item.caption.insert("\n");
-                    }
-                })
+                .on_input_key(super::message_enter)
+                .on_submit(|s: &mut State, _| s.send_attachments())
                 .on_input_paste(|s: &mut State, content, _| s.paste_attachments(content))
             };
             body = body.child(

@@ -526,6 +526,9 @@ pub(super) fn conversation(s: &State, jid: &str, layer: &mut Vec<El>) -> El {
                 s.start_call(true)
             }))
     };
+    let header = header.child(icon_button(&glyphs::SEARCH, "Search this chat", |s, tx| {
+        s.open_chat_search(tx);
+    }));
     let thumb = s.scroll_thumb.clone();
     let height = s.scroll_height.clone();
     let metrics = s.scroll_metrics.clone();
@@ -649,13 +652,20 @@ pub(super) fn conversation(s: &State, jid: &str, layer: &mut Vec<El>) -> El {
                 ),
         );
     }
-    col()
+    let conversation = col()
+        .grow(1.0)
+        .min_w(0.0)
         .w_full()
         .h_full()
         .on_layout(|s: &mut State, bounds| s.chat_bounds = bounds)
         .child(header)
         .child(viewport)
-        .child(composer(s, layer))
+        .child(composer(s, layer));
+    let mut layout = row().w_full().h_full().child(conversation);
+    if s.chat_search.open {
+        layout = layout.child(super::search::panel(s));
+    }
+    layout
 }
 
 fn timeline_row(s: &State, index: usize) -> El {
@@ -766,9 +776,16 @@ fn row_day(timestamp: i64) -> El {
 
 fn message_bubble(s: &State, message: &Message) -> El {
     let mine = message.from_me;
+    let actions = if s.forwarding.is_some() { 37.0 } else { 113.0 };
+    let avatar = if !mine && message.chat.ends_with("@g.us") {
+        39.0
+    } else {
+        0.0
+    };
+    let width = (s.chat_bounds[2] - 48.0 - actions - avatar).clamp(120.0, 480.0);
     let mut bubble = col()
         .key(format!("message-{}-{}", message.sender, message.id))
-        .max_w(480.0)
+        .max_w(width)
         .padding(13.0)
         .gap(8.0)
         .radius(15.0)
@@ -1022,6 +1039,7 @@ fn composer(s: &State, layer: &mut Vec<El>) -> El {
         .caret(INK, kit().selection());
     let edit = if enabled {
         edit.on_edit(|s: &mut State| &mut s.draft)
+            .on_input_key(super::message_enter)
             .on_input_paste(|s: &mut State, content, _| s.paste_attachments(content))
             .on_submit(|s: &mut State, _| s.send())
     } else {

@@ -749,5 +749,17 @@
   "Could not encode the call video.": "Não foi possível codificar o vídeo da chamada.",
   "Return to Brazap": "Voltar para o Brazap",
   "Drag to move the call window": "Arraste para mover a janela da chamada",
-  "{duration} · Black video": "{duration} · Vídeo preto"
+  "{duration} · Black video": "{duration} · Vídeo preto",
+  "Search this chat": "Buscar nesta conversa",
+  "Search messages": "Buscar mensagens",
+  "Search messages in this chat": "Busque mensagens nesta conversa",
+  "No matching messages": "Nenhuma mensagem encontrada",
+  "{current} of {total} matches": "{current} de {total} resultados",
+  "Close search": "Fechar busca",
+  "Newer match": "Resultado mais recente",
+  "Older match": "Resultado mais antigo",
+  "Load older matches": "Carregar resultados mais antigos",
+  "Showing the latest 100 matching messages": "Mostrando as 100 mensagens mais recentes da busca",
+  "Open Brazap": "Abrir Brazap",
+  "Quit Brazap": "Encerrar Brazap"
 }

@@ -277,6 +277,8 @@ pub struct SearchHit {
 pub struct SearchResults {
     pub chats: Vec<Chat>,
     pub messages: Vec<SearchHit>,
+    #[serde(default)]
+    pub next: Option<MessageCursor>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

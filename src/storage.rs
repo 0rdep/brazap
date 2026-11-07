@@ -126,6 +126,8 @@ impl Archive {
                 conn.batch_execute(include_str!("../migrations/015_live_calls.sql"))
                     .map_err(db_error)?;
                 conn.batch_execute(include_str!("../migrations/016_read_state.sql"))
+                    .map_err(db_error)?;
+                conn.batch_execute(include_str!("../migrations/017_search_index.sql"))
                     .map_err(db_error)
             })
             .await?;

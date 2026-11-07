@@ -1,8 +1,7 @@
 diff --git a/crates/rune/Cargo.toml b/crates/rune/Cargo.toml
-index ab76f63..f8e32c7 100644
 --- a/crates/rune/Cargo.toml
 +++ b/crates/rune/Cargo.toml
-@@ -145,6 +145,7 @@ x11rb = { version = "0.13", features = ["shape", "xinput", "randr", "allow-unsaf
+@@ -145,6 +145,7 @@
  xkbcommon = "0.9"
  
  [target.'cfg(target_os = "windows")'.dependencies]
@@ -10,127 +9,112 @@ index ab76f63..f8e32c7 100644
  windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory"] }
  
  [target.'cfg(target_os = "linux")'.dependencies]
-diff --git a/crates/rune/src/gpu/pick.rs b/crates/rune/src/gpu/pick.rs
-index 2b1a824..9a81009 100644
---- a/crates/rune/src/gpu/pick.rs
-+++ b/crates/rune/src/gpu/pick.rs
-@@ -15,6 +15,8 @@ pub(crate) enum Reason {
-     EnvName,
-     EnvPower,
-     Compositor,
-+    #[cfg(target_os = "windows")]
-+    Windows,
-     LowPower,
- }
- 
-@@ -24,6 +26,8 @@ impl Reason {
-             Reason::EnvName => "WGPU_ADAPTER_NAME",
-             Reason::EnvPower => "WGPU_POWER_PREF",
-             Reason::Compositor => "the compositor's GPU",
-+            #[cfg(target_os = "windows")]
-+            Reason::Windows => "Windows' default GPU",
-             Reason::LowPower => "lowest power",
-         }
+diff --git a/crates/rune/src/edit.rs b/crates/rune/src/edit.rs
+--- a/crates/rune/src/edit.rs
++++ b/crates/rune/src/edit.rs
+@@ -589,53 +589,53 @@
      }
-@@ -88,10 +92,39 @@ pub(crate) fn pick(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>
-             return Ok(log(Pick { adapter, reason: Reason::Compositor, compositor }, enumerated));
-         }
-     }
-+    #[cfg(target_os = "windows")]
-+    if let Some(adapter) = windows_default(instance, surface) {
-+        return Ok(log(Pick { adapter, reason: Reason::Windows, compositor }, enumerated));
-+    }
-     let adapter = request(instance, surface, wgpu::PowerPreference::LowPower)?;
-     Ok(log(Pick { adapter, reason: Reason::LowPower, compositor }, enumerated))
- }
  
-+// Adapted from anomalyco/rune#46: DXGI's first hardware adapter follows the
-+// Windows default/primary display instead of forcing the lowest-power GPU.
-+// Explicit WGPU_ADAPTER_NAME and WGPU_POWER_PREF choices above still win.
-+#[cfg(target_os = "windows")]
-+fn windows_default(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>) -> Option<wgpu::Adapter> {
-+    use windows::Win32::Graphics::Dxgi::*;
-+    let factory = unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }.ok()?;
-+    let mut card = None;
-+    for index in 0.. {
-+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else { break };
-+        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else { continue };
-+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
-+            card = Some((desc.VendorId, desc.DeviceId));
-+            break;
+     fn prev_word(&self, i: usize) -> usize {
+-        if self.secure && !self.revealed {
+-            return 0;
+-        }
+-        let s = &self.text;
+-        let b = s.as_bytes();
+-        let mut j = i.min(b.len());
++        use unicode_segmentation::UnicodeSegmentation;
++        if self.secure && !self.revealed { return 0; }
++        let mut j = i.min(self.text.len());
+         loop {
+-            if let Some(start) = self.pill_before(j) {
+-                return start;
+-            }
+-            if j == 0 || !b[j - 1].is_ascii_whitespace() {
+-                break;
+-            }
+-            j -= 1;
+-        }
+-        while j > 0 && !b[j - 1].is_ascii_whitespace() {
+-            if self.marks.iter().any(|m| m.mark.is_pill() && m.end == j) {
+-                break;
+-            }
+-            j = prev_char(s, j);
++            if let Some(start) = self.pill_before(j) { return start; }
++            let Some(c) = self.text[..j].chars().next_back() else { return 0; };
++            if !c.is_whitespace() { break; }
++            j = prev_char(&self.text, j);
 +        }
++        // UAX word boundaries can join narrow NBSP to adjacent letters.
++        // Every Unicode whitespace character must still delimit editor words.
++        let floor = self.text[..j].char_indices().rev().find(|(_, c)| c.is_whitespace())
++            .map_or(0, |(at, c)| at + c.len_utf8());
++        let start = self.text[floor..j].split_word_bound_indices().next_back().map_or(floor, |(at, _)| floor + at);
++        // An adjacent unspaced word must not move through an atomic pill.
++        self.marks.iter().filter(|m| m.mark.is_pill() && m.end <= j)
++            .map(|m| m.end).max().unwrap_or(0).max(start)
 +    }
-+    let card = card?;
-+    pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12))
-+        .into_iter().find(|adapter| {
-+            let info = adapter.get_info();
-+            (info.vendor, info.device) == card
-+                && surface.is_none_or(|surface| adapter.is_surface_supported(surface))
-+        })
-+}
 +
- fn request(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>, power_preference: wgpu::PowerPreference) -> Result<wgpu::Adapter, String> {
-     pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-         power_preference,
-diff --git a/crates/rune/src/render.rs b/crates/rune/src/render.rs
-index 1dc89b9..4237772 100644
---- a/crates/rune/src/render.rs
-+++ b/crates/rune/src/render.rs
-@@ -452,7 +452,9 @@ impl Gpu {
-             required_features,
-             required_limits,
-             experimental_features: Default::default(),
--            memory_hints: wgpu::MemoryHints::Performance,
-+            memory_hints: wgpu::MemoryHints::Manual {
-+                suballocated_device_memory_block_size: 4 * 1024 * 1024..8 * 1024 * 1024,
-+            },
-             trace: Default::default(),
-         }))
-         .map_err(|error| format!("no GPU device: {error}"))
-
-diff --git a/crates/rune/src/text.rs b/crates/rune/src/text.rs
---- a/crates/rune/src/text.rs
-+++ b/crates/rune/src/text.rs
-@@ -148,7 +148,7 @@
-     pub mono: String,
-     symbol_families: Vec<&'static str>,
-     /// The colour emoji family among `symbol_families`.
--    emoji: Option<&'static str>,
-+    emoji: Option<String>,
-     /// The installed math families, once a text has needed them.
-     math: Option<Vec<&'static str>>,
-     /// The installed `Family::SystemMono` families, once a text has needed them.
-@@ -262,7 +262,11 @@
-         let mut font_files = LoadedFiles::new();
-         register_cjk_fallbacks(&mut collection, &mut font_files, &registered, families);
-         let symbol_families = load_families(&mut collection, SYMBOL_FONT_FILES, SYMBOL_FAMILIES);
--        let emoji = symbol_families.iter().copied().find(|f| f.contains("Emoji"));
-+        // Prefer an explicitly bundled emoji family over the platform fallback.
-+        let emoji = registered.iter()
-+            .filter_map(|id| collection.family_name(*id).map(str::to_owned))
-+            .find(|name| name.contains("Emoji"))
-+            .or_else(|| symbol_families.iter().find(|name| name.contains("Emoji")).map(|name| (*name).to_owned()));
-         #[cfg(target_arch = "wasm32")]
-         let families = if fonts.is_empty() { ("Inter", "IBM Plex Mono") } else { families };
-         let (sans, mono) = families::slots(families.0, families.1);
-@@ -575,7 +579,8 @@
-             self.system_mono();
++    // Windows/Linux Ctrl-Right lands at the start of the next word. Whitespace
++    // includes NBSP/narrow NBSP from pasted text, not just ASCII spaces.
++    fn next_word_start(&self, i: usize) -> usize {
++        if self.secure && !self.revealed { return self.text.len(); }
++        let mut j = i.min(self.text.len());
++        if self.text[j..].chars().next().is_some_and(|c| !c.is_whitespace()) {
++            j = self.next_word(j);
++        }
++        while self.text[j..].chars().next().is_some_and(char::is_whitespace) {
++            j = next_char(&self.text, j);
          }
-         let math = self.math.as_deref().unwrap_or(&[]);
--        let emoji = self.emoji.as_slice();
-+        let emoji_family = self.emoji.as_deref();
-+        let emoji = emoji_family.as_slice();
-         let system = self.system_mono.as_deref().unwrap_or_default();
-         let with_symbols = |primary| {
-             family_list(primary, system, self.sans.as_str())
-
+         j
+     }
+ 
+     fn next_word(&self, i: usize) -> usize {
+-        if self.secure && !self.revealed {
+-            return self.text.len();
+-        }
+-        let s = &self.text;
+-        let b = s.as_bytes();
+-        let mut j = i.min(b.len());
++        use unicode_segmentation::UnicodeSegmentation;
++        if self.secure && !self.revealed { return self.text.len(); }
++        let mut j = i.min(self.text.len());
+         loop {
+-            if let Some(end) = self.pill_after(j) {
+-                return end;
+-            }
+-            if j >= b.len() || !b[j].is_ascii_whitespace() {
+-                break;
+-            }
+-            j += 1;
+-        }
+-        while j < b.len() && !b[j].is_ascii_whitespace() {
+-            if self.marks.iter().any(|m| m.mark.is_pill() && m.start == j) {
+-                break;
+-            }
+-            j = next_char(s, j);
+-        }
+-        j
++            if let Some(end) = self.pill_after(j) { return end; }
++            let Some(c) = self.text[j..].chars().next() else { return j; };
++            if !c.is_whitespace() { break; }
++            j = next_char(&self.text, j);
++        }
++        let ceiling = self.text[j..].find(char::is_whitespace).map_or(self.text.len(), |at| j + at);
++        let end = self.text[j..ceiling].split_word_bounds().next().map_or(j, |word| j + word.len());
++        self.marks.iter().filter(|m| m.mark.is_pill() && m.start >= j)
++            .map(|m| m.start).min().unwrap_or(self.text.len()).min(end)
+     }
+ 
+     /// Replace the selection with `label` as one [`Mark::Pill`] carrying `id`, and put the
 diff --git a/crates/rune/src/edit/input.rs b/crates/rune/src/edit/input.rs
 --- a/crates/rune/src/edit/input.rs
 +++ b/crates/rune/src/edit/input.rs
-@@ -85,6 +85,9 @@
+@@ -84,7 +84,10 @@
+         }
          if ev.is_command_chord() { return out; }
          if !matches!(&ev.key, Key::Text(s) if !s.contains(['\r', '\n'])) { self.break_history_group(); }
-         let word = m.alt || (m.ctrl && !cfg!(target_os = "macos"));
+-        let word = m.alt || (m.ctrl && !cfg!(target_os = "macos"));
++        let word = m.alt || ((m.ctrl || m.cmd) && !cfg!(target_os = "macos"));
 +        // `cmd` is also true for Ctrl on Windows/Linux. Only macOS Command
 +        // moves to line/document edges; Ctrl elsewhere moves by word/paragraph.
 +        let line_command = m.cmd && cfg!(target_os = "macos");
@@ -202,32 +186,162 @@ diff --git a/crates/rune/src/edit/input.rs b/crates/rune/src/edit/input.rs
      }
  
      fn line_edge(&self, layout: Option<&Layout<Ink>>, end: bool) -> usize {
-
-diff --git a/crates/rune/src/edit.rs b/crates/rune/src/edit.rs
---- a/crates/rune/src/edit.rs
-+++ b/crates/rune/src/edit.rs
-@@ -613,6 +613,20 @@
-         j
-     }
+diff --git a/crates/rune/src/gpu/pick.rs b/crates/rune/src/gpu/pick.rs
+--- a/crates/rune/src/gpu/pick.rs
++++ b/crates/rune/src/gpu/pick.rs
+@@ -15,6 +15,8 @@
+     EnvName,
+     EnvPower,
+     Compositor,
++    #[cfg(target_os = "windows")]
++    Windows,
+     LowPower,
+ }
  
-+    // Windows/Linux Ctrl-Right lands at the start of the next word. macOS
-+    // Option-Right (and forward word deletion) keep the existing word-end rule.
-+    fn next_word_start(&self, i: usize) -> usize {
-+        if self.secure && !self.revealed { return self.text.len(); }
-+        let mut j = i.min(self.text.len());
-+        if self.text[j..].chars().next().is_some_and(|c| !c.is_whitespace()) {
-+            j = self.next_word(j);
-+        }
-+        while self.text[j..].chars().next().is_some_and(char::is_whitespace) {
-+            j = next_char(&self.text, j);
-+        }
-+        j
+@@ -24,6 +26,8 @@
+             Reason::EnvName => "WGPU_ADAPTER_NAME",
+             Reason::EnvPower => "WGPU_POWER_PREF",
+             Reason::Compositor => "the compositor's GPU",
++            #[cfg(target_os = "windows")]
++            Reason::Windows => "Windows' default GPU",
+             Reason::LowPower => "lowest power",
+         }
+     }
+@@ -88,8 +92,37 @@
+             return Ok(log(Pick { adapter, reason: Reason::Compositor, compositor }, enumerated));
+         }
+     }
++    #[cfg(target_os = "windows")]
++    if let Some(adapter) = windows_default(instance, surface) {
++        return Ok(log(Pick { adapter, reason: Reason::Windows, compositor }, enumerated));
 +    }
+     let adapter = request(instance, surface, wgpu::PowerPreference::LowPower)?;
+     Ok(log(Pick { adapter, reason: Reason::LowPower, compositor }, enumerated))
++}
 +
-     fn next_word(&self, i: usize) -> usize {
-         if self.secure && !self.revealed {
-             return self.text.len();
-
++// Adapted from anomalyco/rune#46: DXGI's first hardware adapter follows the
++// Windows default/primary display instead of forcing the lowest-power GPU.
++// Explicit WGPU_ADAPTER_NAME and WGPU_POWER_PREF choices above still win.
++#[cfg(target_os = "windows")]
++fn windows_default(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>) -> Option<wgpu::Adapter> {
++    use windows::Win32::Graphics::Dxgi::*;
++    let factory = unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }.ok()?;
++    let mut card = None;
++    for index in 0.. {
++        let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else { break };
++        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else { continue };
++        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
++            card = Some((desc.VendorId, desc.DeviceId));
++            break;
++        }
++    }
++    let card = card?;
++    pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12))
++        .into_iter().find(|adapter| {
++            let info = adapter.get_info();
++            (info.vendor, info.device) == card
++                && surface.is_none_or(|surface| adapter.is_surface_supported(surface))
++        })
+ }
+ 
+ fn request(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>, power_preference: wgpu::PowerPreference) -> Result<wgpu::Adapter, String> {
+diff --git a/crates/rune/src/overlay/any_host.rs b/crates/rune/src/overlay/any_host.rs
+--- a/crates/rune/src/overlay/any_host.rs
++++ b/crates/rune/src/overlay/any_host.rs
+@@ -121,7 +121,7 @@
+             }
+             WindowEvent::KeyboardInput { event, .. } if self.options.keys == KeyPolicy::OnDemand => {
+                 let pressed = event.state.is_pressed();
+-                let fallback = (pressed || self.rt.wants_key_up()).then(|| crate::window::map_key(&event.logical_key, self.mods)).flatten();
++                let fallback = (pressed || self.rt.wants_key_up()).then(|| crate::window::map_input(&event, self.mods)).flatten();
+                 if let winit::keyboard::PhysicalKey::Code(key) = event.physical_key {
+                     self.dirty |= self.rt.physical_then(crate::PhysicalInput::Key {
+                         key, mods: crate::window::map_mods(self.mods), pressed, repeat: event.repeat,
+diff --git a/crates/rune/src/platform/web/input.rs b/crates/rune/src/platform/web/input.rs
+--- a/crates/rune/src/platform/web/input.rs
++++ b/crates/rune/src/platform/web/input.rs
+@@ -168,7 +168,7 @@
+             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
+                 immediate = true;
+                 let pressed = event.state == ElementState::Pressed;
+-                let mut logical = (pressed || self.rt.wants_key_up()).then(|| crate::window::map_key(&event.logical_key, self.input.mods)).flatten();
++                let mut logical = (pressed || self.rt.wants_key_up()).then(|| crate::window::map_input(&event, self.input.mods)).flatten();
+                 if let Some(key) = &mut logical {
+                     key.mods = modifiers(self.input.mods);
+                     if key.mods.cmd && let crate::Key::Text(text) = &key.key && text != " " && text.chars().count() == 1 {
+diff --git a/crates/rune/src/render.rs b/crates/rune/src/render.rs
+--- a/crates/rune/src/render.rs
++++ b/crates/rune/src/render.rs
+@@ -452,7 +452,9 @@
+             required_features,
+             required_limits,
+             experimental_features: Default::default(),
+-            memory_hints: wgpu::MemoryHints::Performance,
++            memory_hints: wgpu::MemoryHints::Manual {
++                suballocated_device_memory_block_size: 4 * 1024 * 1024..8 * 1024 * 1024,
++            },
+             trace: Default::default(),
+         }))
+         .map_err(|error| format!("no GPU device: {error}"))
+diff --git a/crates/rune/src/text.rs b/crates/rune/src/text.rs
+--- a/crates/rune/src/text.rs
++++ b/crates/rune/src/text.rs
+@@ -148,7 +148,7 @@
+     pub mono: String,
+     symbol_families: Vec<&'static str>,
+     /// The colour emoji family among `symbol_families`.
+-    emoji: Option<&'static str>,
++    emoji: Option<String>,
+     /// The installed math families, once a text has needed them.
+     math: Option<Vec<&'static str>>,
+     /// The installed `Family::SystemMono` families, once a text has needed them.
+@@ -262,7 +262,11 @@
+         let mut font_files = LoadedFiles::new();
+         register_cjk_fallbacks(&mut collection, &mut font_files, &registered, families);
+         let symbol_families = load_families(&mut collection, SYMBOL_FONT_FILES, SYMBOL_FAMILIES);
+-        let emoji = symbol_families.iter().copied().find(|f| f.contains("Emoji"));
++        // Prefer an explicitly bundled emoji family over the platform fallback.
++        let emoji = registered.iter()
++            .filter_map(|id| collection.family_name(*id).map(str::to_owned))
++            .find(|name| name.contains("Emoji"))
++            .or_else(|| symbol_families.iter().find(|name| name.contains("Emoji")).map(|name| (*name).to_owned()));
+         #[cfg(target_arch = "wasm32")]
+         let families = if fonts.is_empty() { ("Inter", "IBM Plex Mono") } else { families };
+         let (sans, mono) = families::slots(families.0, families.1);
+@@ -575,7 +579,8 @@
+             self.system_mono();
+         }
+         let math = self.math.as_deref().unwrap_or(&[]);
+-        let emoji = self.emoji.as_slice();
++        let emoji_family = self.emoji.as_deref();
++        let emoji = emoji_family.as_slice();
+         let system = self.system_mono.as_deref().unwrap_or_default();
+         let with_symbols = |primary| {
+             family_list(primary, system, self.sans.as_str())
+diff --git a/crates/rune/src/window.rs b/crates/rune/src/window.rs
+--- a/crates/rune/src/window.rs
++++ b/crates/rune/src/window.rs
+@@ -41,7 +41,7 @@
+ use platform_sync::sync_platform;
+ mod shell_requests;
+ mod keys;
+-pub(crate) use keys::{key_base, map_key, map_mods};
++pub(crate) use keys::{key_base, map_input, map_mods};
+ mod any_host;
+ mod event_loop;
+ mod events;
+diff --git a/crates/rune/src/window/events.rs b/crates/rune/src/window/events.rs
+--- a/crates/rune/src/window/events.rs
++++ b/crates/rune/src/window/events.rs
+@@ -341,7 +341,7 @@
+             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
+                 let pressed = event.state == ElementState::Pressed;
+                 // A release's logical key only matters to `on_key_up` handlers.
+-                let logical = (pressed || rt.wants_key_up()).then(|| map_key(&event.logical_key, self.mods)).flatten();
++                let logical = (pressed || rt.wants_key_up()).then(|| map_input(&event, self.mods)).flatten();
+                 let mut redraw = false;
+                 // A menu item handing Rune its key: it acts after, if no handler takes it.
+                 let unhandled = crate::native_menu::take_unhandled(logical.as_ref().filter(|_| pressed));
 diff --git a/crates/rune/src/window/keys.rs b/crates/rune/src/window/keys.rs
 --- a/crates/rune/src/window/keys.rs
 +++ b/crates/rune/src/window/keys.rs
@@ -257,55 +371,3 @@ diff --git a/crates/rune/src/window/keys.rs b/crates/rune/src/window/keys.rs
  /// The character `event`'s key types under the current layout with no modifiers, for
  /// `Tx::key_base`.
  pub(crate) fn key_base(event: &winit::event::KeyEvent) -> Option<char> {
-
-diff --git a/crates/rune/src/window.rs b/crates/rune/src/window.rs
---- a/crates/rune/src/window.rs
-+++ b/crates/rune/src/window.rs
-@@ -41,7 +41,7 @@
- use platform_sync::sync_platform;
- mod shell_requests;
- mod keys;
--pub(crate) use keys::{key_base, map_key, map_mods};
-+pub(crate) use keys::{key_base, map_input, map_mods};
- mod any_host;
- mod event_loop;
- mod events;
-
-diff --git a/crates/rune/src/window/events.rs b/crates/rune/src/window/events.rs
---- a/crates/rune/src/window/events.rs
-+++ b/crates/rune/src/window/events.rs
-@@ -341,7 +341,7 @@
-             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
-                 let pressed = event.state == ElementState::Pressed;
-                 // A release's logical key only matters to `on_key_up` handlers.
--                let logical = (pressed || rt.wants_key_up()).then(|| map_key(&event.logical_key, self.mods)).flatten();
-+                let logical = (pressed || rt.wants_key_up()).then(|| map_input(&event, self.mods)).flatten();
-                 let mut redraw = false;
-                 // A menu item handing Rune its key: it acts after, if no handler takes it.
-                 let unhandled = crate::native_menu::take_unhandled(logical.as_ref().filter(|_| pressed));
-
-diff --git a/crates/rune/src/overlay/any_host.rs b/crates/rune/src/overlay/any_host.rs
---- a/crates/rune/src/overlay/any_host.rs
-+++ b/crates/rune/src/overlay/any_host.rs
-@@ -121,7 +121,7 @@
-             }
-             WindowEvent::KeyboardInput { event, .. } if self.options.keys == KeyPolicy::OnDemand => {
-                 let pressed = event.state.is_pressed();
--                let fallback = (pressed || self.rt.wants_key_up()).then(|| crate::window::map_key(&event.logical_key, self.mods)).flatten();
-+                let fallback = (pressed || self.rt.wants_key_up()).then(|| crate::window::map_input(&event, self.mods)).flatten();
-                 if let winit::keyboard::PhysicalKey::Code(key) = event.physical_key {
-                     self.dirty |= self.rt.physical_then(crate::PhysicalInput::Key {
-                         key, mods: crate::window::map_mods(self.mods), pressed, repeat: event.repeat,
-
-diff --git a/crates/rune/src/platform/web/input.rs b/crates/rune/src/platform/web/input.rs
---- a/crates/rune/src/platform/web/input.rs
-+++ b/crates/rune/src/platform/web/input.rs
-@@ -168,7 +168,7 @@
-             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
-                 immediate = true;
-                 let pressed = event.state == ElementState::Pressed;
--                let mut logical = (pressed || self.rt.wants_key_up()).then(|| crate::window::map_key(&event.logical_key, self.input.mods)).flatten();
-+                let mut logical = (pressed || self.rt.wants_key_up()).then(|| crate::window::map_input(&event, self.input.mods)).flatten();
-                 if let Some(key) = &mut logical {
-                     key.mods = modifiers(self.input.mods);
-                     if key.mods.cmd && let crate::Key::Text(text) = &key.key && text != " " && text.chars().count() == 1 {

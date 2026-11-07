@@ -125,7 +125,7 @@ fn compact(s: &State) -> El {
 }
 
 fn search_input(s: &State) -> El {
-    let mut input = TextInput::new(&s.search)
+    let mut input = TextInput::new(&s.search.edit)
         .leading_icon(&glyphs::SEARCH)
         .placeholder(super::locale::tr(if s.section == Section::Messages {
             "Search chats and messages"
@@ -133,8 +133,8 @@ fn search_input(s: &State) -> El {
             "Search calls"
         }))
         .width(None)
-        .on_edit(|s: &mut State| &mut s.search);
-    if !s.search.text.is_empty() {
+        .on_edit(|s: &mut State| &mut s.search.edit);
+    if !s.search.edit.text.is_empty() {
         input = input.trailing(
             el().key("clear-search")
                 .size(24.0, 24.0)
@@ -220,7 +220,7 @@ fn expanded(s: &State) -> El {
         );
     }
     let count = s.visible_chats().len();
-    if !s.search.text.trim().is_empty() {
+    if !s.search.edit.text.trim().is_empty() {
         return panel.child(search_results(s));
     }
     if count == 0 {
@@ -270,42 +270,61 @@ fn expanded(s: &State) -> El {
     )
 }
 
+#[derive(Clone)]
+enum SearchRow {
+    Heading(&'static str),
+    Chat(Chat),
+    Message(usize),
+}
+
 fn search_results(s: &State) -> El {
-    let mut list = col().w_full().gap(4.0);
-    if s.searching {
-        list = list.child(label(super::locale::tr("Searching…"), 11.0, MUTED).padding(10.0));
+    let chats = super::search::matching_chats(s);
+    let empty = chats.is_empty() && s.search.results.messages.is_empty();
+    let mut rows = Vec::new();
+    if !chats.is_empty() {
+        rows.push(SearchRow::Heading("Chats"));
+        rows.extend(chats.into_iter().cloned().map(SearchRow::Chat));
     }
-    if !s.search_results.chats.is_empty() {
-        list = list.child(label(super::locale::tr("Chats"), 11.0, MINT).padding(10.0));
-        for chat in &s.search_results.chats {
-            list = list.child(chat_row(s, chat));
-        }
+    if !s.search.results.messages.is_empty() {
+        rows.push(SearchRow::Heading("Messages"));
+        rows.extend((0..s.search.results.messages.len()).map(SearchRow::Message));
     }
-    if !s.search_results.messages.is_empty() {
-        list = list.child(label(super::locale::tr("Messages"), 11.0, MINT).padding(10.0));
-        for hit in &s.search_results.messages {
-            let mut chat = hit.chat.clone();
-            chat.preview = hit.excerpt.clone();
-            chat.preview_kind = hit.message.kind.clone();
-            chat.preview_status = hit.message.status.clone();
-            chat.preview_from_me = hit.message.from_me;
-            chat.updated_at = hit.message.timestamp;
-            chat.unread = 0;
-            let hit = hit.clone();
-            list = list.child(
-                chat_row(s, &chat)
-                    .key(format!("search-{}-{}", hit.message.sender, hit.message.id))
-                    .fill(if s.highlighted.as_deref() == Some(&hit.message.id) {
-                        MINT.alpha(0.10)
-                    } else {
-                        Color::TRANSPARENT
-                    })
-                    .on_press(move |s: &mut State| s.jump(hit.clone())),
-            );
-        }
-    }
-    if !s.searching && s.search_results.chats.is_empty() && s.search_results.messages.is_empty() {
-        list = list.child(
+    let rows = std::sync::Arc::new(rows);
+    let keys = rows.clone();
+    let list = col()
+        .w_full()
+        .growth(GrowthSpec::default())
+        .instant_changes()
+        .virtual_rows(
+            rows.len(),
+            78.0,
+            move |s: &State, i| match &keys[i] {
+                SearchRow::Heading(name) => format!("search-heading-{name}").into(),
+                SearchRow::Chat(chat) => format!("search-chat-{}", chat.jid).into(),
+                SearchRow::Message(index) => {
+                    let m = &s.search.results.messages[*index].message;
+                    format!("search-message-{}-{}-{}", m.chat, m.sender, m.id).into()
+                }
+            },
+            move |s: &State, i| match &rows[i] {
+                SearchRow::Heading(name) => {
+                    label(super::locale::tr(name), 11.0, MINT).padding(10.0)
+                }
+                SearchRow::Chat(chat) => chat_row(s, chat),
+                SearchRow::Message(index) => search_message_row(s, *index),
+            },
+        );
+    let mut panel = col().key("search-results").grow(1.0).min_h(0.0).w_full();
+    if s.search.searching() {
+        panel = panel.child(label(super::locale::tr("Searching…"), 11.0, MUTED).padding(10.0));
+    } else if let Some(error) = &s.search.error {
+        panel = panel.child(
+            label(super::locale::tr(error), 12.0, MUTED)
+                .wrap()
+                .padding(10.0),
+        );
+    } else if empty {
+        panel = panel.child(
             label(
                 super::locale::tr("No matching chats or messages"),
                 12.0,
@@ -314,15 +333,47 @@ fn search_results(s: &State) -> El {
             .padding(10.0),
         );
     }
-    col()
-        .key("search-results")
-        .grow(1.0)
-        .min_h(0.0)
-        .w_full()
-        .scroll(ScrollSpec {
-            stick_bottom: false,
+    if s.search.results.next.is_some() {
+        panel = panel.child(
+            label(
+                super::locale::tr("Showing the latest 100 matching messages"),
+                11.0,
+                MUTED,
+            )
+            .wrap()
+            .padding(10.0),
+        );
+    }
+    panel.child(
+        col()
+            .key(format!("search-scroll-{}", s.search.edit.text.trim()))
+            .grow(1.0)
+            .min_h(0.0)
+            .w_full()
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .child(list),
+    )
+}
+
+fn search_message_row(s: &State, index: usize) -> El {
+    let hit = &s.search.results.messages[index];
+    let mut chat = hit.chat.clone();
+    chat.preview = hit.excerpt.clone();
+    chat.preview_kind = hit.message.kind.clone();
+    chat.preview_status = hit.message.status.clone();
+    chat.preview_from_me = hit.message.from_me;
+    chat.updated_at = hit.message.timestamp;
+    chat.unread = 0;
+    let hit = hit.clone();
+    chat_row(s, &chat)
+        .fill(if s.highlighted.as_deref() == Some(&hit.message.id) {
+            MINT.alpha(0.10)
+        } else {
+            Color::TRANSPARENT
         })
-        .child(list)
+        .on_press(move |s: &mut State| s.jump(hit.clone()))
 }
 
 fn chat_row(s: &State, chat: &Chat) -> El {
@@ -428,7 +479,7 @@ fn chat_row(s: &State, chat: &Chat) -> El {
 }
 
 fn calls(s: &State) -> El {
-    let query = s.search.text.to_lowercase();
+    let query = s.search.edit.text.to_lowercase();
     let calls: Vec<_> = s
         .snapshot
         .calls

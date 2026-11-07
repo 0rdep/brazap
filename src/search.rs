@@ -1,5 +1,5 @@
 use crate::{
-    model::{Message, SearchHit, SearchResults},
+    model::{Message, MessageCursor, SearchHit, SearchResults},
     storage::{Archive, MESSAGE_SELECT, MessageRow, db_error, display_identity},
 };
 use anyhow::Result;
@@ -40,18 +40,33 @@ pub(crate) fn decode(row: MessageRow) -> Result<Message> {
 }
 
 impl Archive {
-    pub async fn search(&self, query: String) -> Result<SearchResults> {
+    pub async fn search(
+        &self,
+        query: String,
+        chat: Option<String>,
+        before: Option<MessageCursor>,
+    ) -> Result<SearchResults> {
         let query = query.trim().to_lowercase();
         if query.is_empty() {
             return Ok(SearchResults::default());
         }
-        let all = self.chats().await?;
+        if let Some(chat) = &chat {
+            self.allow_chat(chat).await?;
+        }
+        let mut all = self.chats().await?;
         let identities = self.identities().await?;
+        if let Some(chat) = &chat {
+            all.retain(|c| c.matches_jid(chat));
+        }
         let account = self.account as i64;
-        let names=self.backend.shared().read(move|conn| {
+        let names = if chat.is_none() {
+            self.backend.shared().read(move|conn| {
             diesel::sql_query("SELECT jid,name FROM brazap_chats WHERE account=? UNION ALL SELECT jid,name FROM brazap_contacts WHERE account=? UNION ALL SELECT jid,name FROM brazap_saved_contacts WHERE account=?")
                 .bind::<BigInt,_>(account).bind::<BigInt,_>(account).bind::<BigInt,_>(account).load::<NamedIdentity>(conn).map_err(db_error)
-        }).await?;
+        }).await?
+        } else {
+            Vec::new()
+        };
         let matching_names: std::collections::HashSet<_> = names
             .into_iter()
             .filter(|n| n.name.to_lowercase().contains(&query))
@@ -61,20 +76,50 @@ impl Archive {
         let chats = all
             .iter()
             .filter(|c| {
-                c.name.to_lowercase().contains(&query)
-                    || matching_names.contains(&c.jid)
-                    || (!digits.is_empty() && digits.len() >= 3 && c.phone.contains(&digits))
+                chat.is_none()
+                    && (c.name.to_lowercase().contains(&query)
+                        || matching_names.contains(&c.jid)
+                        || (!digits.is_empty() && digits.len() >= 3 && c.phone.contains(&digits)))
             })
             .cloned()
             .collect();
         let text_query = query.clone();
         let account = self.account as i64;
+        // Filter hidden chats before LIMIT, and resolve expensive names, receipts
+        // and media metadata only for the small set of matching message keys.
+        let allowed = serde_json::to_string(
+            &all.iter()
+                .flat_map(|c| identities.aliases(&c.jid))
+                .collect::<Vec<_>>(),
+        )?;
+        let cursor = before.unwrap_or(MessageCursor {
+            timestamp: i64::MAX,
+            id: String::new(),
+            sender: String::new(),
+        });
+        let indexed = query.chars().count() >= 3 && !query.contains('\0');
+        let phrase = format!("\"{}\"", query.replace('"', "\"\""));
+        let from = if indexed {
+            "brazap_message_fts JOIN brazap_message_search s ON s.rowid=brazap_message_fts.rowid JOIN brazap_messages candidate ON candidate.account=s.account AND candidate.chat=s.chat AND candidate.sender=s.sender AND candidate.id=s.id"
+        } else {
+            // Short queries cannot use trigrams. Walk newest first and stop as
+            // soon as the page is full, instead of hydrating the entire archive.
+            "brazap_messages candidate INDEXED BY brazap_messages_search_order JOIN brazap_message_search s ON candidate.account=s.account AND candidate.chat=s.chat AND candidate.sender=s.sender AND candidate.id=s.id"
+        };
+        let predicate = if indexed {
+            "brazap_message_fts MATCH ?"
+        } else {
+            "? != ''"
+        };
         let rows:Vec<MessageRow>=self.backend.shared().read(move |conn| {
-            diesel::sql_query(format!("{MESSAGE_SELECT} JOIN brazap_message_search s ON m.account=s.account AND m.chat=s.chat AND m.sender=s.sender AND m.id=s.id WHERE s.account=? AND instr(s.text,?)>0 ORDER BY m.timestamp DESC,m.id DESC,m.sender DESC LIMIT 400"))
-                .bind::<BigInt,_>(account).bind::<Text,_>(query).load(conn).map_err(db_error)
+            diesel::sql_query(format!("WITH hits AS MATERIALIZED (SELECT candidate.rowid AS message_rowid FROM {from} WHERE {predicate} AND candidate.account=? AND candidate.chat IN (SELECT value FROM json_each(?)) AND instr(s.text,?)>0 AND (candidate.timestamp,candidate.id,candidate.sender)<(?,?,?) ORDER BY candidate.timestamp DESC,candidate.id DESC,candidate.sender DESC LIMIT 401) {MESSAGE_SELECT} WHERE m.rowid IN (SELECT message_rowid FROM hits) ORDER BY m.timestamp DESC,m.id DESC,m.sender DESC"))
+                .bind::<Text,_>(phrase).bind::<BigInt,_>(account).bind::<Text,_>(allowed).bind::<Text,_>(query)
+                .bind::<BigInt,_>(cursor.timestamp).bind::<Text,_>(cursor.id).bind::<Text,_>(cursor.sender)
+                .load(conn).map_err(db_error)
         }).await?;
         let mut messages = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        let mut next = None;
         for row in rows {
             let message = identities.message(decode(row)?);
             if identities.is_locked(&message.chat) {
@@ -88,6 +133,10 @@ impl Archive {
             if !seen.insert((message.chat.clone(), message.id.clone(), author)) {
                 continue;
             }
+            if messages.len() == 100 {
+                next = messages.last().map(|hit: &SearchHit| hit.message.cursor());
+                break;
+            }
             if let Some(chat) = all.iter().find(|c| c.jid == message.chat) {
                 messages.push(SearchHit {
                     chat: chat.clone(),
@@ -95,11 +144,12 @@ impl Archive {
                     message,
                 });
             }
-            if messages.len() >= 100 {
-                break;
-            }
         }
-        Ok(SearchResults { chats, messages })
+        Ok(SearchResults {
+            chats,
+            messages,
+            next,
+        })
     }
 }
 

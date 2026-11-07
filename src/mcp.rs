@@ -157,7 +157,15 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
         "search" => Ok(serde_json::to_value(
             service
                 .archive
-                .search(text_arg(&args, "query")?.into())
+                .search(
+                    text_arg(&args, "query")?.into(),
+                    args.get("chat").and_then(Value::as_str).map(str::to_owned),
+                    args.get("cursor")
+                        .filter(|v| !v.is_null())
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()?,
+                )
                 .await?,
         )?),
         "message_window" => Ok(serde_json::to_value(
@@ -337,8 +345,8 @@ pub(crate) fn tools() -> Value {
         ),
         (
             "search",
-            "Search locally saved chat names, phone numbers, filenames, and message contents.",
-            json!({"query":{"type":"string","minLength":1}}),
+            "Search locally saved chat names, phone numbers, filenames, and message contents. Pass chat to search one conversation; pass next as cursor to load older matches.",
+            json!({"query":{"type":"string","minLength":1},"chat":{"type":"string"},"cursor":{"type":"object","properties":{"timestamp":{"type":"integer"},"id":{"type":"string"},"sender":{"type":"string"}},"required":["timestamp","id","sender"]}}),
             vec!["query"],
             true,
         ),

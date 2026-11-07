@@ -1,6 +1,6 @@
 use super::{Command, State, media, view::*};
 use crate::model::{Chat, Message};
-use rune::{Color, El, Icon, ScrollSpec, TextEdit, col, el, icon, row};
+use rune::{Color, El, Icon, ScrollSpec, TextEdit, Tx, col, el, icon, row};
 use rune_kit::{TextInput, glyphs};
 use serde_json::json;
 
@@ -107,7 +107,11 @@ impl State {
     }
 }
 
-fn action(glyph: &'static Icon, name: &'static str, f: impl Fn(&mut State) + 'static) -> El {
+fn action(
+    glyph: &'static Icon,
+    name: &'static str,
+    f: impl Fn(&mut State, &mut Tx) + 'static,
+) -> El {
     el().size(29.0, 29.0)
         .center()
         .radius(10.0)
@@ -117,7 +121,8 @@ fn action(glyph: &'static Icon, name: &'static str, f: impl Fn(&mut State) + 'st
         .fill(PANEL)
         .border(1.0, BORDER)
         .hover(MINT.alpha(0.15))
-        .on_press(f)
+        .preserve_focus_on_press(true)
+        .on_press_tx(f)
         .child(icon(glyph, 16.0).color(MUTED))
 }
 
@@ -129,17 +134,17 @@ pub(super) fn toolbar(message: &Message) -> El {
         .key(format!("message-actions-{}-{}", message.sender, message.id))
         .gap(4.0)
         .group_opacity(0.0, 1.0)
-        .child(action(&REACT, "React with an emoji", move |s| {
+        .child(action(&REACT, "React with an emoji", move |s, _| {
             s.reaction_text.clear();
             s.reaction_menu = Some(react.clone());
         }))
-        .child(action(&REPLY, "Reply to message", move |s| {
+        .child(action(&REPLY, "Reply to message", move |s, tx| {
             s.reply = Some(reply.clone());
-            s.focus_composer();
+            s.defer_composer_focus(tx);
             s.reaction_menu = None;
             s.attachments_open = false;
         }))
-        .child(action(&FORWARD, "Forward message", move |s| {
+        .child(action(&FORWARD, "Forward message", move |s, _| {
             s.picker.open = false;
             s.begin_forward(forward.clone())
         }))
@@ -200,12 +205,42 @@ pub(super) fn selection_row(s: &State, message: &Message, content: El) -> El {
 
 pub(super) fn reply_banner(s: &State) -> Option<El> {
     let message = s.reply.as_ref()?;
+    // Keep the preview on one line beside the search panel, leaving enough
+    // room for the composer without reparenting or replacing its text editor.
+    if s.chat_search.open {
+        let author = if message.from_me {
+            super::locale::tr("You")
+        } else {
+            message.sender_name.clone()
+        };
+        return Some(
+            row()
+                .key("reply-preview-compact")
+                .w_full()
+                .gap(8.0)
+                .padding(11.0)
+                .radius(10.0)
+                .fill(MINT.alpha(0.08))
+                .instant_changes()
+                .child(
+                    label(format!("{author}: {}", message.preview()), 12.0, MUTED)
+                        .truncate()
+                        .grow(1.0)
+                        .min_w(0.0),
+                )
+                .child(icon_button(&glyphs::CLOSE, "Cancel reply", |s, _| {
+                    s.reply = None
+                })),
+        );
+    }
     Some(
         row()
+            .key("reply-preview")
             .w_full()
             .gap(12.0)
             .padding(11.0)
             .radius(10.0)
+            .instant_changes()
             .fill(MINT.alpha(0.08))
             .child(icon(&REPLY, 18.0).color(MINT))
             .child(
@@ -213,15 +248,18 @@ pub(super) fn reply_banner(s: &State) -> Option<El> {
                     .grow(1.0)
                     .min_w(0.0)
                     .gap(4.0)
-                    .child(label(
-                        if message.from_me {
-                            "Replying to you"
-                        } else {
-                            &message.sender_name
-                        },
-                        11.0,
-                        MINT,
-                    ))
+                    .child(
+                        label(
+                            if message.from_me {
+                                super::locale::tr("Replying to you")
+                            } else {
+                                message.sender_name.clone()
+                            },
+                            11.0,
+                            MINT,
+                        )
+                        .truncate(),
+                    )
                     .child(label(message.preview(), 12.0, MUTED).truncate()),
             )
             .child(icon_button(&glyphs::CLOSE, "Cancel reply", |s, _| {
