@@ -13,12 +13,14 @@ mod media;
 mod phone;
 mod picker;
 mod preferences;
+mod qr;
 mod recording;
 mod render;
 mod search;
 mod sidebar;
 mod startup;
 mod times;
+mod updates;
 mod view;
 
 use crate::playback as video;
@@ -61,6 +63,8 @@ struct UiWake {
 
 enum Command {
     Start,
+    Refresh,
+    Update,
     Call(&'static str, Value),
     Search(search::Request),
     Stickers(bool),
@@ -76,7 +80,7 @@ enum Command {
     SendAttachments(u64, String, Vec<attachments::Upload>),
     Preferences(&'static str, Value),
     Diagnostics,
-    Select(String),
+    Select(String, u64),
     Viewing(Option<String>),
     Tool(&'static str, Value),
     Send(Message, Option<MessageCursor>),
@@ -97,6 +101,9 @@ enum Event {
         Arc<std::sync::atomic::AtomicBool>,
     ),
     Snapshot(Snapshot),
+    Conversation(String, u64, Result<MessagePage, String>),
+    SnapshotFailed(String),
+    Update(Result<crate::updates::UpdateState, String>),
     Search(search::Request, Result<SearchResults, String>),
     Stickers(bool, Result<Value, String>),
     Jump(Message, u64, Result<MessagePage, String>),
@@ -124,6 +131,12 @@ enum Section {
     Calls,
 }
 
+struct PairingQr {
+    image: Image,
+    size: [u32; 2],
+    logo: Option<qr::Logo>,
+}
+
 pub(super) struct State {
     background: background::Background,
     config: Config,
@@ -146,6 +159,7 @@ pub(super) struct State {
     recording: Option<recording::Panel>,
     recording_generation: u64,
     attachments: Option<attachments::Panel>,
+    attachment_drag_over: bool,
     attachment_generation: u64,
     attachment_sequence: u64,
     diagnostics: diagnostics::Panel,
@@ -176,6 +190,7 @@ pub(super) struct State {
     image_failures: HashMap<String, (i64, Option<String>)>,
     logo: Option<Image>,
     startup_art: Vec<Image>,
+    startup_error: Option<String>,
     snapshot: Snapshot,
     selected: Option<String>,
     draft: TextEdit,
@@ -206,6 +221,7 @@ pub(super) struct State {
     second: i64,
     next_tick: Option<f64>,
     timeline: Vec<crate::model::Message>,
+    loading_chat: bool,
     loading_older: bool,
     has_older: bool,
     has_newer: bool,
@@ -215,7 +231,7 @@ pub(super) struct State {
     tx: tokio::sync::mpsc::UnboundedSender<Command>,
     rx: mpsc::Receiver<Event>,
     image_cache: Option<ImageCache>,
-    qr: Option<Image>,
+    qr: Option<PairingQr>,
     qr_payload: Option<String>,
     wake: Arc<std::sync::Mutex<UiWake>>,
 }
@@ -277,6 +293,7 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         recording: None,
         recording_generation: 0,
         attachments: None,
+        attachment_drag_over: false,
         attachment_generation: 0,
         attachment_sequence: 0,
         diagnostics: diagnostics::Panel::default(),
@@ -307,6 +324,7 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         image_failures: HashMap::new(),
         logo: None,
         startup_art: Vec::new(),
+        startup_error: None,
         snapshot: Snapshot::default(),
         selected: None,
         draft: TextEdit::new(""),
@@ -337,6 +355,7 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         second: crate::model::now(),
         next_tick: None,
         timeline: Vec::new(),
+        loading_chat: false,
         loading_older: false,
         has_older: true,
         has_newer: false,
@@ -363,6 +382,10 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         ..AppSpec::new(window_title, (1180.0, 800.0), unreachable_state, view::view)
     };
     let mut app = App::new(spec)
+        .window_options(rune::WindowOptions {
+            maximized: true,
+            ..Default::default()
+        })
         .on_focus(|s, focused, _| {
             s.focused = focused;
             s.update_viewing();
@@ -477,11 +500,24 @@ async fn worker(
     if !matches!(commands.recv().await, Some(Command::Start)) {
         return;
     }
-    let instance = match ipc::start_or_connect(config).await {
-        Ok(instance) => instance,
-        Err(error) => {
-            emit(&events, &wake, Event::Done(Err(format!("{error:#}"))));
-            return;
+    let instance = loop {
+        match ipc::start_or_connect(config.clone()).await {
+            Ok(instance) => break instance,
+            Err(error) => {
+                log::warn!("Could not start the local service: {error:#}");
+                emit(
+                    &events,
+                    &wake,
+                    Event::SnapshotFailed("Could not start the local service. Try again.".into()),
+                );
+                loop {
+                    match commands.recv().await {
+                        Some(Command::Start | Command::Refresh) => break,
+                        Some(_) => {}
+                        None => return,
+                    }
+                }
+            }
         }
     };
     let remote = instance.remote.clone();
@@ -495,6 +531,11 @@ async fn worker(
     let media_slots = Arc::new(tokio::sync::Semaphore::new(4));
     let mut assets = tokio::task::JoinSet::new();
     let mut interval = tokio::time::interval(Duration::from_millis(700));
+    let mut snapshot_retry_at = None;
+    let (snapshot_done, mut snapshot_results) =
+        tokio::sync::mpsc::unbounded_channel::<(u64, Option<String>, Result<Snapshot, String>)>();
+    let mut snapshot_generation = 0u64;
+    let mut snapshot_pending = false;
     let mut call_tick = tokio::time::interval(Duration::from_millis(100));
     let mut preview_call: Option<crate::calling::LiveCall> = None;
     let mut preview_id = String::new();
@@ -508,6 +549,19 @@ async fn worker(
                 match command {
                     None=>break,
                     Some(Command::Start)=>continue,
+                    Some(Command::Refresh)=>{
+                        snapshot_retry_at=None;
+                        interval.reset_immediately();
+                        continue;
+                    }
+                    Some(Command::Update)=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=remote.request("brazap/updates",json!({"download":true})).await
+                                .and_then(|v|Ok(serde_json::from_value(v)?)).map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Update(result));
+                        });continue;
+                    }
                     Some(Command::Call(name,args))=>{
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
                         assets.spawn(async move {
@@ -614,10 +668,17 @@ async fn worker(
                         });continue;
                     }
                     Some(Command::Preferences(action,args))=>{
+                        if action=="logout" {
+                            snapshot_generation=snapshot_generation.wrapping_add(1);
+                            selected=None;
+                            viewing=None;
+                            preview_call=None;
+                            snapshot_retry_at=None;
+                            interval.reset_immediately();
+                        }
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
                         assets.spawn(async move {
                             let method=match action {"get"=>"brazap/settings","save"=>"brazap/settings/save","privacy"=>"brazap/privacy","privacy_set"=>"brazap/privacy/set","clear"=>"brazap/cache/clear","logout"=>"brazap/logout","typing"=>"brazap/typing",_=>"brazap/updates"};
-                            let args=if action=="update_download"{json!({"download":true})}else{args};
                             let mut result=remote.request(method,args).await.map_err(|e|format!("{e:#}"));
                             if action=="privacy_set" && result.is_ok(){result=remote.request("brazap/privacy",json!({})).await.map_err(|e|format!("{e:#}"));}
                             if action!="typing" {emit(&events,&wake,Event::Preferences(action,result));}
@@ -631,8 +692,15 @@ async fn worker(
                         });continue;
                     }
                     Some(Command::Viewing(chat))=>{viewing=chat;}
-                    Some(Command::Select(chat))=>{
+                    Some(Command::Select(chat,generation))=>{
                         selected=Some(chat.clone());
+                        snapshot_retry_at=None;
+                        let reader=remote.clone();let loaded=events.clone();let ready=wake.clone();let requested=chat.clone();
+                        assets.spawn(async move {
+                            let result=reader.call("read_messages",json!({"chat":requested,"limit":crate::history::CHAT_PAGE_SIZE})).await
+                                .and_then(|v|Ok(serde_json::from_value(v)?)).map_err(|e|format!("{e:#}"));
+                            emit(&loaded,&ready,Event::Conversation(requested,generation,result));
+                        });
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
                         assets.spawn(async move {
                             if let Err(error)=remote.call("mark_read",json!({"chat":chat})).await {
@@ -664,7 +732,7 @@ async fn worker(
                     Some(Command::Newer(chat,cursor,generation))=>{
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
                         assets.spawn(async move {
-                            let result=remote.call("newer_messages",json!({"chat":chat,"cursor":cursor})).await
+                            let result=remote.call("newer_messages",json!({"chat":chat,"cursor":cursor,"limit":crate::history::CHAT_PAGE_SIZE})).await
                                 .and_then(|value|Ok(serde_json::from_value(value)?)).map_err(|e|format!("{e:#}"));
                             emit(&events,&wake,Event::Newer(chat,generation,result));
                         });continue;
@@ -681,6 +749,22 @@ async fn worker(
                 interval.reset_immediately();
             }
             Some(_)=assets.join_next(), if !assets.is_empty()=>{},
+            Some((generation,requested,result))=snapshot_results.recv()=>{
+                snapshot_pending=false;
+                if generation != snapshot_generation || requested != selected { interval.reset_immediately();continue; }
+                match result {
+                    Ok(snapshot)=>{
+                        snapshot_retry_at=None;
+                        preview_call=snapshot.live_call.clone();
+                        emit(&events,&wake,Event::Snapshot(snapshot));
+                    },
+                    Err(error)=>{
+                        log::warn!("Could not load the local snapshot: {error}");
+                        snapshot_retry_at=Some(tokio::time::Instant::now()+Duration::from_secs(10));
+                        emit(&events,&wake,Event::SnapshotFailed("The local service is taking too long to load your conversations. Try again.".into()));
+                    },
+                }
+            },
             _=call_tick.tick(), if preview_call.as_ref().is_some_and(|c| !c.ended() && (c.camera || c.peer_camera))=>{
                 if let Some(call)=&preview_call {
                     if preview_id != call.id { preview_id=call.id.clone();sequences=[0,0]; }
@@ -703,14 +787,23 @@ async fn worker(
                 }
             },
             _=interval.tick()=>{
-                if let Ok(activation) = remote.request("brazap/desktop",json!({"pid":std::process::id(),"chat":viewing})).await
-                    && activation["activate"].as_bool() == Some(true) {
-                    emit(&events,&wake,Event::Activate(activation["chat"].as_str().map(str::to_owned)));
-                }
-                match remote.snapshot(selected.as_deref()).await {
-                    Ok(snapshot)=>{preview_call=snapshot.live_call.clone();emit(&events,&wake,Event::Snapshot(snapshot));},
-                    Err(error)=>emit(&events,&wake,Event::Done(Err(format!("{error:#}")))),
-                }
+                if snapshot_pending || snapshot_retry_at.is_some_and(|at| tokio::time::Instant::now() < at) { continue; }
+                snapshot_pending=true;
+                let generation=snapshot_generation;
+                let remote=remote.clone();let done=snapshot_done.clone();let requested=selected.clone();let viewing=viewing.clone();let events=events.clone();let wake=wake.clone();
+                // Keep the worker available for chat selection and page loads
+                // while the complete sidebar snapshot is being assembled.
+                assets.spawn(async move {
+                    if let Ok(Ok(activation)) = tokio::time::timeout(Duration::from_secs(3), remote.request("brazap/desktop",json!({"pid":std::process::id(),"chat":viewing}))).await
+                        && activation["activate"].as_bool() == Some(true) {
+                        emit(&events,&wake,Event::Activate(activation["chat"].as_str().map(str::to_owned)));
+                    }
+                    let result=match tokio::time::timeout(Duration::from_secs(15),remote.snapshot(requested.as_deref())).await {
+                        Ok(result)=>result.map_err(|error|format!("{error:#}")),
+                        Err(error)=>Err(error.to_string()),
+                    };
+                    let _=done.send((generation,requested,result));
+                });
             }
         }
     }
@@ -810,6 +903,51 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
             }
             Event::Snapshot(snapshot) => {
                 changed |= receive_snapshot(state, snapshot, tx);
+            }
+            Event::Conversation(chat, generation, result) => {
+                if state.selected.as_deref() == Some(&chat)
+                    && state.history_generation == generation
+                    && state.loading_chat
+                    && !state.history_focus
+                {
+                    match result {
+                        Ok(page) => {
+                            state.loading_chat = false;
+                            state.has_older = page.has_older;
+                            state.history_notice = page.notice;
+                            state.merge_messages(page.messages);
+                            state.request_chat_media();
+                            tx.instant();
+                            tx.scroll_to_bottom_instant("messages");
+                        }
+                        Err(error) => {
+                            log::warn!("Could not load conversation: {error}");
+                            state.history_notice =
+                                Some("Could not load this conversation. Retrying…".into());
+                        }
+                    }
+                    changed = true;
+                }
+            }
+            Event::SnapshotFailed(error) => {
+                if state.authenticated || state.qr.is_some() {
+                    state.error = Some(error);
+                } else {
+                    state.startup_error = Some(error);
+                }
+                changed = true;
+            }
+            Event::Update(result) => {
+                match result {
+                    Ok(update) => state.snapshot.updates = update,
+                    Err(error) => {
+                        log::warn!("Could not download update: {error}");
+                        state.snapshot.updates.status = "error".into();
+                        state.error =
+                            Some("Could not download update. It will retry automatically.".into());
+                    }
+                }
+                changed = true;
             }
             Event::Gallery(chat, kind, result) => {
                 if state.details
@@ -1251,6 +1389,15 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
 }
 
 fn receive_snapshot(state: &mut State, mut snapshot: Snapshot, tx: &mut Tx) -> bool {
+    // An in-flight pre-logout snapshot must not reopen cached chats while the
+    // unlink request runs in the background. Fresh pairing snapshots are safe.
+    if state.preferences.logging_out
+        && (snapshot.connection.has_session
+            || snapshot.connection.phase == crate::model::Phase::Connected)
+    {
+        return false;
+    }
+    let recovered = state.startup_error.take().is_some();
     if let Some(viewing) = state.viewing_sent.as_deref() {
         for chat in &mut snapshot.chats {
             if chat.matches_jid(viewing) {
@@ -1291,7 +1438,7 @@ fn receive_snapshot(state: &mut State, mut snapshot: Snapshot, tx: &mut Tx) -> b
                 state.chat_search.clear();
                 state.chat_search.open = false;
             } else {
-                return call_changed;
+                return call_changed || recovered;
             }
         }
         state.selected = snapshot.selected_chat.clone();
@@ -1302,12 +1449,17 @@ fn receive_snapshot(state: &mut State, mut snapshot: Snapshot, tx: &mut Tx) -> b
         }
     }
     if state.snapshot != snapshot {
+        let was_authenticated = state.authenticated;
         let initial_messages = state.timeline.is_empty() && !snapshot.messages.is_empty();
         if state.timeline.is_empty() {
-            state.has_older = snapshot.messages.len() == 100;
+            state.has_older = snapshot.messages.len() == crate::history::CHAT_PAGE_SIZE;
         }
         if !state.history_focus {
             state.merge_messages(snapshot.messages.clone());
+        }
+        if state.loading_chat && snapshot.selected_chat == state.selected {
+            state.loading_chat = false;
+            state.history_notice = None;
         }
         state.authenticated = (snapshot.connection.has_session
             || snapshot.connection.phase == crate::model::Phase::Connected)
@@ -1356,33 +1508,27 @@ fn receive_snapshot(state: &mut State, mut snapshot: Snapshot, tx: &mut Tx) -> b
         }
         state.request_chat_media();
         if initial_messages {
-            tx.instant();
+            // Message rows already lay out instantly. Keep the startup logo's
+            // flight when the first history arrives during authentication.
+            if was_authenticated {
+                tx.instant();
+            }
             tx.scroll_to_bottom_instant("messages");
         }
         return true;
     }
-    call_changed
+    call_changed || recovered
 }
 
-fn make_qr(payload: &str, cache: &ImageCache) -> Option<Image> {
-    let code = qrcode::QrCode::new(payload).ok()?;
-    let side = code.width() + 8;
-    let scale = (280 / side).max(1);
-    let width = side * scale;
-    let mut pixels = vec![255u8; width * width * 4];
-    for y in 0..code.width() {
-        for x in 0..code.width() {
-            if code[(x, y)] == qrcode::Color::Dark {
-                for dy in 0..scale {
-                    for dx in 0..scale {
-                        let index = (((y + 4) * scale + dy) * width + (x + 4) * scale + dx) * 4;
-                        pixels[index..index + 3].fill(0);
-                    }
-                }
-            }
-        }
-    }
-    Some(cache.rgba(width as u32, width as u32, pixels))
+fn make_qr(payload: &str, cache: &ImageCache) -> Option<PairingQr> {
+    let rendered = qr::render(payload)?;
+    let pixels = rendered.pixels;
+    let size = [pixels.width(), pixels.height()];
+    Some(PairingQr {
+        image: cache.rgba(size[0], size[1], pixels.into_raw()),
+        size,
+        logo: rendered.logo,
+    })
 }
 
 impl State {
@@ -1547,6 +1693,7 @@ impl State {
         self.snapshot.current_chat = self.snapshot.chats.iter().find(|c| c.jid == chat).cloned();
         self.snapshot.messages.clear();
         self.timeline.clear();
+        self.loading_chat = true;
         self.merge_messages(Vec::new());
         self.has_older = true;
         self.has_newer = false;
@@ -1567,7 +1714,7 @@ impl State {
         self.attachments_open = false;
         self.close_viewer();
         self.section = Section::Messages;
-        let _ = self.tx.send(Command::Select(chat));
+        let _ = self.tx.send(Command::Select(chat, self.history_generation));
         self.update_viewing();
     }
     fn focus_composer(&mut self) {

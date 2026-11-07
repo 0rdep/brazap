@@ -6,6 +6,8 @@ use serde_json::json;
 use super::{State, actions, details, media, sidebar};
 use crate::model::{Message, Phase};
 
+pub(super) const BRAND_HERO: &str = "brazap-logo";
+
 pub(super) const INK: Color = Color {
     r: 0.815,
     g: 0.88,
@@ -239,12 +241,40 @@ pub(super) fn icon_button(
         .child(icon(glyph, 19.0).color(MUTED))
 }
 
-pub(super) fn brand(s: &State) -> El {
-    row()
-        .gap(8.0)
+pub(super) fn brand(s: &State, show_name: bool) -> El {
+    // Clip only the name as the sidebar collapses. The shared logo must be
+    // free to fly across the window before landing in this header.
+    let mut name = row()
+        .key("brand-name-clip")
+        .grow(1.0)
+        .min_w(0.0)
+        .h_full()
         .center_y()
-        .child(logo(s, 40.0))
-        .child(title(super::locale::tr("brazap"), 21.0).truncate())
+        .clip_soft(0.0);
+    if show_name {
+        name = name.child(
+            title(super::locale::tr("brazap"), 21.0)
+                .key("brand-name")
+                .w_full()
+                .truncate()
+                .transition(rune::Transition::opacity().springs(rune::tok::motion::pair::SNAP)),
+        );
+    }
+    row()
+        .key("brand")
+        .w_full()
+        .h_full()
+        .min_w(0.0)
+        .gap(if show_name { 8.0 } else { 0.0 })
+        .center_y()
+        .child(
+            logo(s, 40.0)
+                .key("brand-logo")
+                .min_w(40.0)
+                .matched(BRAND_HERO)
+                .motion(motion::REFLOW),
+        )
+        .child(name)
 }
 
 pub(super) fn logo(s: &State, size: f32) -> El {
@@ -346,7 +376,16 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
 
 fn pairing(s: &State, layer: &mut Vec<El>) -> El {
     let connection = &s.snapshot.connection;
-    let mut card = col().w(390.0).padding(28.0).gap(22.0);
+    let width = if s.phone_mode {
+        390.0
+    } else {
+        super::locale::scale(480.0)
+    };
+    let mut card = col()
+        .w_full()
+        .max_w(width)
+        .padding(28.0)
+        .gap(if s.phone_mode { 22.0 } else { 18.0 });
     if s.phone_mode {
         card = card
             .child(title(super::locale::tr("Link your WhatsApp"), 22.0))
@@ -385,10 +424,24 @@ fn pairing(s: &State, layer: &mut Vec<El>) -> El {
             }
         }
     } else {
-        let qr = if let Some(image) = &s.qr {
-            let [width, height] = image.size().unwrap_or([248, 248]);
-            el().size(width as f32, height as f32)
-                .pixels(image.pixels())
+        let qr = if let Some(code) = &s.qr {
+            // Rune prepares image pixels asynchronously. Keep the generated QR's
+            // dimensions from the first layout so the hero lands in its badge,
+            // without waiting for image metadata or a later UI update.
+            let [width, height] = code.size;
+            let mut qr = el()
+                .size(width as f32, height as f32)
+                .pixels(code.image.pixels());
+            if let Some(mark) = code.logo {
+                qr = qr.child(
+                    logo(s, mark.side as f32)
+                        .key("qr-logo")
+                        .absolute(mark.left as f32, mark.top as f32)
+                        .matched(BRAND_HERO)
+                        .motion(rune::tok::motion::REFLOW),
+                );
+            }
+            qr
         } else {
             el().size(248.0, 248.0).center().child(
                 label(super::locale::tr("Preparing QR code…"), 13.0, Color::BLACK)
@@ -409,32 +462,39 @@ fn pairing(s: &State, layer: &mut Vec<El>) -> El {
                 ),
             )
             .child(
-                col()
-                    .gap(8.0)
-                    .child(
-                        label(
-                            super::locale::tr("1  Open WhatsApp on your phone"),
-                            13.0,
-                            MUTED,
+                el().w_full().center().child(
+                    col()
+                        .max_w(width - 56.0)
+                        .shrink()
+                        .gap(8.0)
+                        .child(
+                            label(
+                                super::locale::tr("1  Open WhatsApp on your phone"),
+                                13.0,
+                                MUTED,
+                            )
+                            .align(rune::Align::Start)
+                            .wrap(),
                         )
-                        .wrap(),
-                    )
-                    .child(
-                        label(
-                            super::locale::tr("2  Go to Settings → Linked Devices"),
-                            13.0,
-                            MUTED,
+                        .child(
+                            label(
+                                super::locale::tr("2  Go to Settings → Linked Devices"),
+                                13.0,
+                                MUTED,
+                            )
+                            .align(rune::Align::Start)
+                            .wrap(),
                         )
-                        .wrap(),
-                    )
-                    .child(
-                        label(
-                            super::locale::tr("3  Tap Link a device and scan this code"),
-                            13.0,
-                            MUTED,
-                        )
-                        .wrap(),
-                    ),
+                        .child(
+                            label(
+                                super::locale::tr("3  Tap Link a device and scan this code"),
+                                13.0,
+                                MUTED,
+                            )
+                            .align(rune::Align::Start)
+                            .wrap(),
+                        ),
+                ),
             );
     }
     if connection.notice.is_some() {
@@ -443,29 +503,46 @@ fn pairing(s: &State, layer: &mut Vec<El>) -> El {
         }
         card = card.child(button("Try again", |s, _| s.tool("reconnect", json!({}))));
     }
+    if !s.phone_mode {
+        card = card.child(
+            row()
+                .w_full()
+                .gap(12.0)
+                .center_y()
+                .child(el().grow(1.0).h(1.0).fill(CONTROL_BORDER))
+                .child(label(super::locale::tr("or"), 12.0, MUTED))
+                .child(el().grow(1.0).h(1.0).fill(CONTROL_BORDER)),
+        );
+    }
     let alternative = if s.phone_mode {
         "Use QR code"
     } else {
         "Link with phone number"
     };
-    card = card.child(
-        row()
-            .w_full()
-            .h(36.0)
-            .center()
-            .radius(10.0)
-            .role("button")
-            .label(super::locale::tr(alternative))
-            .hover(MINT.alpha(0.06))
-            .on_press(|s: &mut State| {
-                s.phone_mode = !s.phone_mode;
-                s.phone_country.close();
-            })
-            .child(label(super::locale::tr(alternative), 13.0, MINT)),
-    );
-    el().w_full()
+    let mut alternative_button = row()
+        .w_full()
+        .h(super::locale::scale(42.0))
+        .center()
+        .radius(12.0)
+        .role("button")
+        .label(super::locale::tr(alternative))
+        .hover(MINT.alpha(0.06))
+        .press(MINT.alpha(0.1))
+        .on_press(|s: &mut State| {
+            s.phone_mode = !s.phone_mode;
+            s.phone_country.close();
+        })
+        .child(label(super::locale::tr(alternative), 13.0, MINT));
+    if !s.phone_mode {
+        alternative_button = alternative_button
+            .fill(MINT.alpha(0.08))
+            .border(1.0, MINT.alpha(0.3));
+    }
+    card = card.child(alternative_button);
+    el().key("pairing-screen")
+        .w_full()
         .h_full()
-        .padding(32.0)
+        .padding(24.0)
         .center()
         .child(panel(card))
 }
@@ -583,6 +660,16 @@ pub(super) fn conversation(s: &State, jid: &str, layer: &mut Vec<El>) -> El {
                         .map(|m| (m.sender.clone(), m.id.clone()))
                         .collect();
                     s.request_chat_media();
+                    if s.detached
+                        && !s.loading_chat
+                        && !s.loading_older
+                        && s.has_older
+                        && range.start <= 4
+                        && s.history_notice.is_none()
+                    {
+                        s.load_older();
+                        return s.loading_older;
+                    }
                     if range.end >= s.timeline.len().saturating_sub(4) && s.history_notice.is_none()
                     {
                         return s.load_newer();
@@ -659,7 +746,7 @@ pub(super) fn conversation(s: &State, jid: &str, layer: &mut Vec<El>) -> El {
     if s.chat_search.open {
         layout = layout.child(super::search::panel(s));
     }
-    layout
+    super::attachments::drop_zone(s, layout)
 }
 
 fn timeline_row(s: &State, index: usize) -> El {
@@ -703,8 +790,12 @@ fn timeline_row(s: &State, index: usize) -> El {
             row = row.child(
                 label(
                     super::locale::tr(
-                        &(if s.loading_older {
+                        &(if s.loading_chat || s.loading_older {
                             "Loading conversation…"
+                        } else if s.snapshot.connection.syncing
+                            || s.snapshot.connection.initial_sync
+                        {
+                            "Syncing messages…"
                         } else {
                             "No messages yet. Say hello."
                         }),

@@ -35,7 +35,7 @@
 | **Your AI tools** | Let local MCP clients search conversations, read messages, send replies, react, forward and share attachments through the same app session. |
 | **Privacy controls** | Control read receipts, typing indicators, notifications and supported WhatsApp privacy settings. Optionally retain content when a sender deletes a message. |
 | **Windows integration** | Native notifications with message previews and sound. Clicking a notification opens the conversation. |
-| **Updates** | Check GitHub Releases, verify download checksums and install updates when you choose to restart. |
+| **Updates** | Checks GitHub Releases automatically every five minutes, verifies downloads, and shows **Restart and update** above Settings. A pending update also installs on the next full app launch. |
 
 Brazap uses [whatsapp-rust](https://github.com/oxidezap/whatsapp-rust) for the WhatsApp connection. It is an independent project and is not affiliated with WhatsApp or Meta.
 

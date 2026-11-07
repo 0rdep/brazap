@@ -17,7 +17,9 @@ LEFT JOIN brazap_contacts n ON n.account=c.account AND n.jid=c.jid
 LEFT JOIN brazap_contacts p ON p.account=c.account AND p.jid=l.phone_number || '@s.whatsapp.net'
 LEFT JOIN brazap_assets a ON a.account=c.account AND a.key='avatar:' || c.jid
 LEFT JOIN brazap_messages m ON m.rowid=(
-    SELECT latest.rowid FROM brazap_messages latest
+    -- The global search-order index can otherwise win here and scan the whole
+    -- account for every chat. Keep this lookup bounded to one chat's timeline.
+    SELECT latest.rowid FROM brazap_messages latest INDEXED BY brazap_messages_timeline
     WHERE latest.account=c.account AND latest.chat=c.jid
       AND json_extract(latest.payload,'$.kind')!='protocol'
     ORDER BY latest.timestamp DESC,latest.id DESC,latest.sender DESC LIMIT 1

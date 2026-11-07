@@ -12,6 +12,18 @@ use diesel::{
 };
 use whatsapp_rust::{prelude::wa, waproto::buffa::Message as ProtoMessage};
 
+pub(crate) const CHAT_PAGE_SIZE: usize = 30;
+
+fn timeline_select() -> String {
+    // ORDER BY can otherwise tempt SQLite into scanning the account-wide
+    // search index, especially for an alias with few or no stored messages.
+    MESSAGE_SELECT.replacen(
+        "FROM brazap_messages m",
+        "FROM brazap_messages m INDEXED BY brazap_messages_timeline",
+        1,
+    )
+}
+
 #[derive(QueryableByName)]
 struct RawRow {
     #[diesel(sql_type=BigInt)]
@@ -45,6 +57,7 @@ impl Archive {
         let aliases = identities.aliases_json(&chat);
         let sources = identities.aliases(&chat);
         let scope = identities.timeline_scope(&chat);
+        let select = timeline_select();
         let cursor = cursor.unwrap_or(MessageCursor {
             timestamp: i64::MAX,
             id: String::new(),
@@ -53,7 +66,7 @@ impl Archive {
         let rows:Vec<MessageRow>=self.backend.shared().read(move |conn| {
             let mut rows=Vec::new();
             for source in sources {
-            rows.extend(diesel::sql_query(format!("{MESSAGE_SELECT} WHERE m.account=? AND {scope} AND json_extract(m.payload,'$.kind')!='protocol' AND (m.timestamp,m.id,m.sender)<(?,?,?) ORDER BY m.timestamp DESC,m.id DESC,m.sender DESC LIMIT ?"))
+            rows.extend(diesel::sql_query(format!("{select} WHERE m.account=? AND {scope} AND json_extract(m.payload,'$.kind')!='protocol' AND (m.timestamp,m.id,m.sender)<(?,?,?) ORDER BY m.timestamp DESC,m.id DESC,m.sender DESC LIMIT ?"))
                 .bind::<BigInt,_>(account).bind::<Text,_>(source).bind::<Text,_>(&aliases).bind::<BigInt,_>(cursor.timestamp).bind::<Text,_>(&cursor.id).bind::<Text,_>(&cursor.sender).bind::<BigInt,_>((limit+1) as i64).load::<MessageRow>(conn).map_err(db_error)?);
             } Ok(rows)
         }).await?;
@@ -87,10 +100,11 @@ impl Archive {
         let aliases = identities.aliases_json(&chat);
         let sources = identities.aliases(&chat);
         let scope = identities.timeline_scope(&chat);
+        let select = timeline_select();
         let rows: Vec<MessageRow> = self.backend.shared().read(move |conn| {
             let mut rows = Vec::new();
             for source in sources {
-                rows.extend(diesel::sql_query(format!("{MESSAGE_SELECT} WHERE m.account=? AND {scope} AND json_extract(m.payload,'$.kind')!='protocol' AND (m.timestamp,m.id,m.sender)>(?,?,?) ORDER BY m.timestamp,m.id,m.sender LIMIT ?"))
+                rows.extend(diesel::sql_query(format!("{select} WHERE m.account=? AND {scope} AND json_extract(m.payload,'$.kind')!='protocol' AND (m.timestamp,m.id,m.sender)>(?,?,?) ORDER BY m.timestamp,m.id,m.sender LIMIT ?"))
                     .bind::<BigInt,_>(account).bind::<Text,_>(source).bind::<Text,_>(&aliases)
                     .bind::<BigInt,_>(cursor.timestamp).bind::<Text,_>(&cursor.id).bind::<Text,_>(&cursor.sender)
                     .bind::<BigInt,_>((limit+1) as i64).load::<MessageRow>(conn).map_err(db_error)?);
@@ -170,10 +184,11 @@ impl Archive {
             .await?;
         let sources = identities.aliases(&chat);
         let scope = identities.timeline_scope(&chat);
+        let select = timeline_select();
         let rows:Vec<MessageRow>=self.backend.shared().read(move |conn| {
             let mut rows=Vec::new();
             for source in sources {
-                rows.extend(diesel::sql_query(format!("{MESSAGE_SELECT} WHERE m.account=? AND {scope} AND json_extract(m.payload,'$.kind')!='protocol' AND (m.timestamp,m.id,m.sender)>=(?,?,?) ORDER BY m.timestamp,m.id,m.sender LIMIT 52"))
+                rows.extend(diesel::sql_query(format!("{select} WHERE m.account=? AND {scope} AND json_extract(m.payload,'$.kind')!='protocol' AND (m.timestamp,m.id,m.sender)>=(?,?,?) ORDER BY m.timestamp,m.id,m.sender LIMIT 52"))
                     .bind::<BigInt,_>(account).bind::<Text,_>(source).bind::<Text,_>(&aliases).bind::<BigInt,_>(pivot.timestamp).bind::<Text,_>(&pivot.id).bind::<Text,_>(&pivot.sender).load::<MessageRow>(conn).map_err(db_error)?);
             } Ok(rows)
         }).await?;
@@ -297,7 +312,7 @@ impl crate::service::Service {
         let chat = self.archive.canonical_chat(&chat).await?;
         let page = self
             .archive
-            .message_page(chat.clone(), 100, Some(cursor.clone()))
+            .message_page(chat.clone(), CHAT_PAGE_SIZE, Some(cursor.clone()))
             .await?;
         if !page.messages.is_empty() {
             return Ok(page);
@@ -307,7 +322,10 @@ impl crate::service::Service {
         }
         let client = self.connected().await?;
         let result = self.fetch_older_history(&client, &chat, &cursor).await?;
-        let mut page = self.archive.message_page(chat, 100, Some(cursor)).await?;
+        let mut page = self
+            .archive
+            .message_page(chat, CHAT_PAGE_SIZE, Some(cursor))
+            .await?;
         if page.messages.is_empty() {
             page.notice=Some(match result {
                 crate::history_prefetch::Fetched::Empty=>"The phone returned no older messages for this chat.",

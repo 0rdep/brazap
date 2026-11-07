@@ -30,6 +30,25 @@ The tracked patch also carries desktop text-input fixes against the same pin:
 These fixes are applied to normal windows and native overlays. No reference
 checkout or unrecorded build-source edits are used.
 
+`WindowOptions::maximized` passes an initial maximized state to the native
+window manager. Brazap uses it for its main window; call windows retain their
+own size. It does not enter fullscreen.
+
+The Windows first-frame reveal fix is backported from upstream Rune
+`f73f72cdc563534e4f7de9f5a79bed007ac42384` (`platform/win32/cloak.rs` and
+the window host). DWM keeps newly shown windows cloaked until a rendered frame
+has reached the GPU, with a bounded fallback if no frame arrives. This prevents
+the white startup flash and applies when reopening from the tray as well.
+The reveal also waits for DWM to consume the pending present and temporarily
+disables the native show transition, preventing an old redirection frame from
+flashing during startup or tray restore. Normal native transitions are restored
+after the reveal.
+Windows maximization is deferred until that cloak is installed: winit's initial
+maximize call uses `ShowWindow` even when the initial visibility is false, which
+otherwise exposes the unpainted window for a frame on launch and tray recreation.
+The helper is kept in the tracked `platform/win32.rs` file so the reproducible
+build checkout does not gain untracked patch files.
+
 The patch also adapts the Windows adapter-selection part of
 [zAcherttp's Rune PR #46](https://github.com/anomalyco/rune/pull/46), reviewed at
 `2f6ab83ecdadd5819cf638496fb5a0f9529540ca`. After explicit `WGPU_ADAPTER_NAME` and

@@ -72,9 +72,9 @@ impl Service {
             if self.desktop_viewing(&chat).await
                 && self
                     .archive
-                    .chats()
+                    .chat_unread(&chat)
                     .await
-                    .is_ok_and(|chats| chats.iter().any(|c| c.matches_jid(&chat) && c.unread > 0))
+                    .is_ok_and(|unread| unread > 0)
             {
                 if let Err(error) = self.mark_chat_read(chat).await {
                     log::warn!("Could not persist the visible chat read: {error}");

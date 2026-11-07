@@ -269,6 +269,79 @@ diff --git a/crates/rune/src/platform/web/input.rs b/crates/rune/src/platform/we
                  if let Some(key) = &mut logical {
                      key.mods = modifiers(self.input.mods);
                      if key.mods.cmd && let crate::Key::Text(text) = &key.key && text != " " && text.chars().count() == 1 {
+diff --git a/crates/rune/src/platform/win32.rs b/crates/rune/src/platform/win32.rs
+--- a/crates/rune/src/platform/win32.rs
++++ b/crates/rune/src/platform/win32.rs
+@@ -14,6 +14,7 @@
+ };
+ 
+ mod pointer;
++
+ 
+ fn hwnd(window: &winit::window::Window) -> Option<HWND> {
+     let RawWindowHandle::Win32(h) = window.window_handle().ok()?.as_raw() else { return None };
+@@ -245,3 +246,61 @@
+     // SAFETY: GetMonitorInfoW fills `info`, whose cbSize says which struct it is.
+     (unsafe { GetMonitorInfoW(monitor.hmonitor() as _, &mut info) } != 0).then_some((info.rcWork.top, info.rcWork.bottom))
+ }
++
++// First-frame reveal, backported from upstream Rune.
++use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAK, DWMWA_TRANSITIONS_FORCEDISABLED, DwmFlush, DwmSetWindowAttribute};
++
++/// A cloaked window's give-up time: one whose frame never comes still shows by then.
++#[derive(Default)]
++pub(crate) struct Cloak {
++    until: Cell<Option<std::time::Instant>>,
++}
++
++impl Cloak {
++    /// Cloaks the window until `lift`, or `until` at the latest.
++    pub(crate) fn hold(&self, window: &winit::window::Window, until: std::time::Instant) {
++        transitions(window, true);
++        if set(window, true) { self.until.set(Some(until)); }
++        else { transitions(window, false); }
++    }
++
++    pub(crate) fn held(&self) -> bool { self.until.get().is_some() }
++
++    /// Moves a held cloak's deadline, as when making the GPU took part of it.
++    pub(crate) fn extend(&self, until: std::time::Instant) {
++        if self.held() { self.until.set(Some(until)); }
++    }
++
++    /// When the cloak gives up on a frame.
++    pub(crate) fn deadline(&self) -> Option<std::time::Instant> { self.until.get() }
++
++    /// Uncloaks: its frame landed, or `now` is past the deadline.
++    pub(crate) fn lift(&self, window: &winit::window::Window) {
++        if self.until.take().is_some() {
++            // GPU completion alone does not mean DWM has consumed the present.
++            // Keep the native show animation from exposing an old redirection frame.
++            unsafe { let _ = DwmFlush(); }
++            set(window, false);
++            unsafe { let _ = DwmFlush(); }
++            transitions(window, false);
++        }
++    }
++
++    pub(crate) fn lift_if_due(&self, window: &winit::window::Window, now: std::time::Instant) {
++        if self.until.get().is_some_and(|until| until <= now) { self.lift(window); }
++    }
++}
++
++fn set(window: &winit::window::Window, cloaked: bool) -> bool {
++    let Some(hwnd) = hwnd(window) else { return false };
++    let value = i32::from(cloaked);
++    // SAFETY: DWMWA_CLOAK reads one BOOL from `value` for a window this thread owns.
++    unsafe { DwmSetWindowAttribute(hwnd, DWMWA_CLOAK as u32, (&raw const value).cast(), 4) >= 0 }
++}
++
++fn transitions(window: &winit::window::Window, disabled: bool) {
++    let Some(hwnd) = hwnd(window) else { return };
++    let value = i32::from(disabled);
++    // SAFETY: this BOOL configures transitions for the window this thread owns.
++    unsafe { let _ = DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED as u32, (&raw const value).cast(), 4); }
++}
 diff --git a/crates/rune/src/render.rs b/crates/rune/src/render.rs
 --- a/crates/rune/src/render.rs
 +++ b/crates/rune/src/render.rs
@@ -357,6 +430,78 @@ diff --git a/crates/rune/src/window.rs b/crates/rune/src/window.rs
  mod any_host;
  mod event_loop;
  mod events;
+@@ -742,7 +742,20 @@
+             use winit::platform::macos::WindowAttributesExtMacOS;
+             attrs = attrs.with_titlebar_transparent(true).with_title_hidden(true).with_fullsize_content_view(true);
+         }
++        // Present a completed first frame before DWM reveals the window.
++        #[cfg(target_os = "windows")]
++        // winit maximizes with ShowWindow even when visible is false. Defer it
++        // until after the cloak, so creation cannot expose an unpainted window.
++        let attrs = attrs.with_visible(false).with_maximized(false);
+         let window = Arc::new(event_loop.create_window(attrs).map_err(|e| e.to_string())?);
++        #[cfg(target_os = "windows")]
++        let cloak = crate::platform::win32::Cloak::default();
++        #[cfg(target_os = "windows")]
++        if visible {
++            cloak.hold(&window, Instant::now() + win::READY_FALLBACK);
++            if self.options.maximized { window.set_maximized(true); }
++            window.set_visible(true);
++        }
+         #[cfg(target_os = "macos")]
+         crate::native_menu::adopt_standard_view();
+         #[cfg(target_os = "macos")]
+@@ -877,7 +890,14 @@
+             launch_drawables,
+             _spot: crate::platform::macos::traffic_lights::Spot::new(&window),
+         };
+-        #[cfg(not(target_os = "macos"))]
++        #[cfg(target_os = "windows")]
++        cloak.extend(Instant::now() + win::READY_FALLBACK);
++        #[cfg(target_os = "windows")]
++        let native = Native {
++            cloak,
++            maximize_on_show: std::cell::Cell::new(self.options.maximized && !visible),
++        };
++        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+         let native = Native::default();
+         self.win = Some(Win {
+             native,
+diff --git a/crates/rune/src/window/any_host.rs b/crates/rune/src/window/any_host.rs
+--- a/crates/rune/src/window/any_host.rs
++++ b/crates/rune/src/window/any_host.rs
+@@ -66,6 +66,8 @@
+         if let Some(shadow) = self.win.as_ref().and_then(|w| w.native.shadow.as_ref()) { shadow.turn(); }
+         self.meter.turn(matches!(cause, StartCause::ResumeTimeReached { .. } | StartCause::Poll), crate::frame::surface_stats::slept(cause));
+         if matches!(cause, StartCause::ResumeTimeReached { .. }) && let Some(w) = &self.win { w.cursor.reassert(); }
++        #[cfg(target_os = "windows")]
++        if let Some(w) = &self.win { w.native.cloak.lift_if_due(&w.window, Instant::now()); }
+         if let Some(w) = &mut self.win && let Some((retry, until)) = w.first_frame.deadline && retry <= Instant::now() {
+             if until <= Instant::now() {
+                 let notified = w.first_frame.notified;
+@@ -142,6 +144,7 @@
+         runtime.into_iter()
+             .chain(win.and_then(|w| w.first_frame.deadline.map(|(retry, _)| retry)))
+             .chain(win.and_then(|w| w.first_frame.ready_deadline()))
++            .chain(win.and_then(Win::cloak_deadline))
+             .chain(win.and_then(|w| w.retry))
+             .chain(win.filter(|w| !w.visible).and_then(|w| w.hidden_pace.deadline()))
+             .chain(self.files.pointer.as_ref().filter(|_| win.is_some_and(|w| w.visible)).map(|_| Instant::now() + DROP_SAMPLE))
+diff --git a/crates/rune/src/window/draw.rs b/crates/rune/src/window/draw.rs
+--- a/crates/rune/src/window/draw.rs
++++ b/crates/rune/src/window/draw.rs
+@@ -292,6 +292,11 @@
+             && gpu.device.poll(wgpu::PollType::wait_indefinitely()).is_ok() {
+             l.first_frame.ready = true;
+         }
++        #[cfg(target_os = "windows")]
++        if l.native.cloak.held() {
++            let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
++            l.native.cloak.lift(&l.window);
++        }
+         let submitted = Instant::now();
+         self.meter.presented();
+         #[cfg(target_os = "macos")]
 diff --git a/crates/rune/src/window/events.rs b/crates/rune/src/window/events.rs
 --- a/crates/rune/src/window/events.rs
 +++ b/crates/rune/src/window/events.rs
@@ -398,3 +543,93 @@ diff --git a/crates/rune/src/window/keys.rs b/crates/rune/src/window/keys.rs
  /// The character `event`'s key types under the current layout with no modifiers, for
  /// `Tx::key_base`.
  pub(crate) fn key_base(event: &winit::event::KeyEvent) -> Option<char> {
+diff --git a/crates/rune/src/window/native.rs b/crates/rune/src/window/native.rs
+--- a/crates/rune/src/window/native.rs
++++ b/crates/rune/src/window/native.rs
+@@ -32,6 +32,13 @@
+     pub(super) activator: Option<crate::platform::activation::Activator>,
+ }
+ 
+-#[cfg(not(any(target_os = "macos", all(unix, not(target_os = "ios"), not(target_os = "android")))))]
++#[cfg(target_os = "windows")]
++#[derive(Default)]
++pub(super) struct Native {
++    pub(super) cloak: crate::platform::win32::Cloak,
++    pub(super) maximize_on_show: std::cell::Cell<bool>,
++}
++
++#[cfg(not(any(target_os = "macos", target_os = "windows", all(unix, not(target_os = "ios"), not(target_os = "android")))))]
+ #[derive(Default)]
+ pub(super) struct Native;
+diff --git a/crates/rune/src/window/win.rs b/crates/rune/src/window/win.rs
+--- a/crates/rune/src/window/win.rs
++++ b/crates/rune/src/window/win.rs
+@@ -214,8 +214,21 @@
+             }
+             if !focus { crate::platform::macos::show_without_focus(&self.window); return; }
+         }
++        #[cfg(target_os = "windows")]
++        {
++            self.native.cloak.hold(&self.window, Instant::now() + READY_FALLBACK);
++            if self.native.maximize_on_show.replace(false) { self.window.set_maximized(true); }
++            self.window.request_redraw();
++        }
+         self.window.set_visible(true);
+         if focus { self.window.focus_window(); }
++    }
++
++    pub(super) fn cloak_deadline(&self) -> Option<Instant> {
++        #[cfg(target_os = "windows")]
++        return self.native.cloak.deadline();
++        #[cfg(not(target_os = "windows"))]
++        None
+     }
+ 
+     pub(super) fn hide(&self) {
+@@ -226,6 +239,8 @@
+         #[cfg(target_os = "macos")]
+         if let Some(panel) = &self.native.panel { panel.hide(std::time::Duration::ZERO); return; }
+         self.window.set_visible(false);
++        #[cfg(target_os = "windows")]
++        self.native.cloak.lift(&self.window);
+     }
+ 
+     /// Its last frame is on screen and nothing has asked for another since.
+diff --git a/crates/rune/src/windows.rs b/crates/rune/src/windows.rs
+--- a/crates/rune/src/windows.rs
++++ b/crates/rune/src/windows.rs
+@@ -87,6 +87,8 @@
+     pub max_size: Option<(f32, f32)>,
+     /// Whether the user can resize the window. Programmatic sizing is unaffected.
+     pub resizable: bool,
++    /// Ask the platform to maximize the window at creation, without entering fullscreen.
++    pub maximized: bool,
+ }
+ 
+ impl Default for WindowOptions {
+@@ -94,7 +96,7 @@
+         Self {
+             transparent: false, borderless: false, click_through: false,
+             always_on_top: false, visible: true, position: None, physical_size: None,
+-            min_size: None, max_size: None, resizable: true,
++            min_size: None, max_size: None, resizable: true, maximized: false,
+         }
+     }
+ }
+@@ -119,7 +121,7 @@
+         Self {
+             transparent: true, borderless: true, click_through: true, always_on_top: true,
+             visible: true, position: Some(display.position), physical_size: Some(display.size),
+-            min_size: Some((0.0, 0.0)), max_size: None, resizable: true,
++            min_size: Some((0.0, 0.0)), max_size: None, resizable: true, maximized: false,
+         }
+     }
+ 
+@@ -146,6 +148,7 @@
+             .with_inner_size(LogicalSize::new(size.0, size.1))
+             .with_min_inner_size(LogicalSize::new(min.0, min.1))
+             .with_resizable(self.resizable)
++            .with_maximized(self.maximized)
+             .with_transparent(self.transparent)
+             .with_decorations(!self.borderless)
+             .with_visible(visible)

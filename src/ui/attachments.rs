@@ -1,4 +1,4 @@
-//! The local attachment draft. Clipboard reads, preparation and sending are
+//! The local attachment draft. Clipboard reads, file drops, preparation and sending are
 //! separate: nothing reaches WhatsApp until the user confirms this preview.
 use std::{io::Write, path::PathBuf};
 
@@ -9,7 +9,7 @@ use rune::{
 };
 use rune_kit::glyphs;
 
-use super::{Command, State, locale, view::*};
+use super::{Command, Section, State, locale, view::*};
 use crate::model::{Message, Phase};
 
 const MAX_FILES: usize = 20;
@@ -163,6 +163,39 @@ pub(super) async fn prepare(source: Source) -> Result<Prepared> {
 }
 
 impl State {
+    fn chat_content_active(&self) -> bool {
+        self.selected.is_some()
+            && self.section == Section::Messages
+            && !self.preferences.open
+            && !self.details
+            && self.contact.is_none()
+            && self.viewer.is_none()
+            && self.forwarding.is_none()
+            && !self.diagnostics.open
+            && !self.new_chat
+    }
+
+    fn can_drop_attachments(&self) -> bool {
+        self.chat_content_active()
+            && self.authenticated
+            && self.recording.is_none()
+            && !self.busy
+            && !self.attachments.as_ref().is_some_and(|panel| panel.sending)
+    }
+
+    fn drop_chat_files(&mut self, files: &[PathBuf]) {
+        self.attachment_drag_over = false;
+        if self.can_drop_attachments() {
+            self.queue_attachments(
+                files
+                    .iter()
+                    .cloned()
+                    .map(|path| Source::File(path, false))
+                    .collect(),
+            );
+        }
+    }
+
     pub(super) fn paste_attachments(&mut self, content: &ClipboardContent) -> bool {
         let sources = if !content.files().is_empty() {
             content
@@ -181,13 +214,7 @@ impl State {
     }
 
     pub(super) fn paste_chat(&mut self, content: &ClipboardContent) {
-        if self.selected.is_none()
-            || self.preferences.open
-            || self.details
-            || self.contact.is_some()
-            || self.viewer.is_some()
-            || self.forwarding.is_some()
-        {
+        if !self.chat_content_active() {
             return;
         }
         if !self.paste_attachments(content) && !content.text().is_empty() {
@@ -438,6 +465,42 @@ impl State {
             }
         }
     }
+}
+
+/// Native file drops share the clipboard's attachment draft and validation.
+/// Only the conversation and its attachment preview are drop targets.
+pub(super) fn drop_zone(s: &State, body: El) -> El {
+    if !s.can_drop_attachments() {
+        return body;
+    }
+    let body = body
+        .on_drop_files(|s: &mut State, files, _| s.drop_chat_files(files))
+        .on_drop_hover(|s: &mut State, over, _| s.attachment_drag_over = over);
+    if !s.attachment_drag_over {
+        return body;
+    }
+    body.child(
+        el().key("attachment-drop-highlight")
+            .absolute(0.0, 0.0)
+            .w_full()
+            .h_full()
+            .center()
+            .radius(22.0)
+            .fill(MINT.alpha(0.09))
+            .border(2.0, MINT.alpha(0.8))
+            .inert()
+            .child(
+                col()
+                    .padding(24.0)
+                    .gap(12.0)
+                    .center()
+                    .radius(20.0)
+                    .fill(PANEL)
+                    .border(1.0, MINT.alpha(0.4))
+                    .child(icon(&glyphs::FOLDER_OPEN, 32.0).color(MINT))
+                    .child(title(locale::tr("Drop files to attach"), 18.0)),
+            ),
+    )
 }
 
 fn size(bytes: u64) -> String {
@@ -731,5 +794,5 @@ pub(super) fn modal(s: &State) -> Option<(El, Vec<El>)> {
                 .absolute(x + (width - w) / 2.0, y + (height - h) / 2.0)
                 .on_press(|_: &mut State| {}),
         );
-    Some((overlay, picker_layer))
+    Some((drop_zone(s, overlay), picker_layer))
 }

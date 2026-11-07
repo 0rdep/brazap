@@ -292,6 +292,8 @@ pub struct SearchResults {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     #[serde(default)]
+    pub updates: crate::updates::UpdateState,
+    #[serde(default)]
     pub settings: crate::settings::Settings,
     pub connection: Connection,
     pub chats: Vec<Chat>,

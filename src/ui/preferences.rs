@@ -28,7 +28,6 @@ pub(super) enum Page {
     Notifications,
     Privacy,
     Mcp,
-    Updates,
     Debug,
     About,
 }
@@ -39,7 +38,6 @@ impl Page {
             Self::Notifications => "Notifications",
             Self::Privacy => "Privacy",
             Self::Mcp => "MCP",
-            Self::Updates => "Updates",
             Self::Debug => "Debug",
             Self::About => "About",
         }
@@ -57,7 +55,6 @@ pub(super) struct Panel {
     pub report: Value,
     pub privacy: BTreeMap<String, String>,
     pub privacy_pending: bool,
-    pub update: Value,
     pub notice: Option<String>,
     pub error: Option<String>,
     pub logout: bool,
@@ -80,6 +77,51 @@ impl State {
     }
     fn request_preference(&self, action: &'static str, args: Value) {
         let _ = self.tx.send(Command::Preferences(action, args));
+    }
+
+    fn begin_logout(&mut self) {
+        if self.preferences.logging_out {
+            return;
+        }
+        self.cancel_recording();
+        self.cancel_attachments();
+        self.stop_voice();
+        self.close_viewer();
+        self.preferences.logging_out = true;
+        self.preferences.logout = false;
+        self.preferences.open = false;
+        self.preferences.confirm_cache = false;
+        self.preferences.error = None;
+        self.authenticated = false;
+        self.selected = None;
+        self.timeline.clear();
+        self.loading_chat = false;
+        self.history_generation = self.history_generation.wrapping_add(1);
+        self.history_focus = false;
+        self.loading_older = false;
+        self.loading_newer = false;
+        self.reply = None;
+        self.details = false;
+        self.contact = None;
+        self.new_chat = false;
+        self.diagnostics.open = false;
+        self.picker.open = false;
+        self.chat_search.clear();
+        self.chat_search.open = false;
+        self.qr = None;
+        self.qr_payload = None;
+        self.phone_mode = false;
+        self.startup_error = None;
+        self.error = None;
+        self.snapshot = crate::model::Snapshot {
+            settings: self.preferences.value.clone(),
+            ..Default::default()
+        };
+        self.avatars.clear();
+        self.images.clear();
+        self.animations.clear();
+        self.update_viewing();
+        self.request_preference("logout", json!({}));
     }
     pub(super) fn edit_preferences(&mut self, change: impl FnOnce(&mut Settings)) {
         let previous = self.preferences.value.clone();
@@ -107,11 +149,21 @@ impl State {
             self.preferences.privacy_pending = true;
             self.request_preference("privacy", json!({}));
         }
-        if page == Page::Debug || page == Page::Updates {
+        if page == Page::Debug {
             self.request_preference("get", json!({}));
         }
     }
     pub(super) fn receive_preferences(&mut self, action: &str, result: Result<Value, String>) {
+        if action == "logout" {
+            self.preferences.logging_out = false;
+            if let Err(error) = result {
+                self.error = Some(error);
+            }
+            // The background worker has cleared its selected chat as well.
+            // Keep any QR that arrived while logout was finishing.
+            let _ = self.tx.send(Command::Refresh);
+            return;
+        }
         if action == "save" {
             self.preferences.saving = false;
             let Some(saved) = self.preferences.save_value.take() else {
@@ -144,7 +196,6 @@ impl State {
         }
         match action {
             "get" => self.preferences.loading = false,
-            "logout" => self.preferences.logging_out = false,
             "privacy" | "privacy_set" => self.preferences.privacy_pending = false,
             _ => {}
         }
@@ -155,7 +206,6 @@ impl State {
             Ok(value) => match action {
                 "get" => {
                     self.preferences.report = value["storage"].clone();
-                    self.preferences.update = value["updates"].clone();
                     if !self.preferences.saving
                         && value["revision"].as_u64().unwrap_or(0)
                             >= self.preferences.settings_revision
@@ -170,7 +220,6 @@ impl State {
                         self.preferences.privacy = p;
                     }
                 }
-                "update_check" | "update_download" => self.preferences.update = value,
                 "clear" => {
                     self.images.clear();
                     self.animations.clear();
@@ -184,17 +233,6 @@ impl State {
                     );
                     self.request_preference("get", json!({}));
                 }
-                "logout" => {
-                    self.preferences.logout = false;
-                    self.preferences.open = false;
-                    self.authenticated = false;
-                    self.selected = None;
-                    self.timeline.clear();
-                    self.snapshot = Default::default();
-                    self.avatars.clear();
-                    self.images.clear();
-                    self.animations.clear();
-                }
                 _ => {}
             },
         }
@@ -205,6 +243,7 @@ pub(super) fn footer(s: &State) -> El {
     let small = !s.sidebar.is_open();
     let item = |glyph: &'static Icon, name: &str, action: fn(&mut State)| {
         let mut v = row()
+            .key(name)
             .h(super::locale::scale(38.0))
             .gap(10.0)
             .px(10.0)
@@ -228,10 +267,17 @@ pub(super) fn footer(s: &State) -> El {
         }
         v
     };
-    col()
+    let mut footer = col()
         .w_full()
         .padding(if small { 14.0 } else { 16.0 })
-        .gap(5.0)
+        .gap(5.0);
+    if small {
+        footer = footer.center_y();
+    }
+    if let Some(update) = super::updates::prompt(s) {
+        footer = footer.child(update);
+    }
+    footer
         .child(item(&SETTINGS, "Settings", |s| s.open_preferences()))
         .child(item(&LOGOUT, "Log out", |s| {
             s.preferences.logout = true;
@@ -308,7 +354,6 @@ pub(super) fn view(s: &State) -> El {
         Page::Notifications,
         Page::Privacy,
         Page::Mcp,
-        Page::Updates,
         Page::Debug,
         Page::About,
     ] {
@@ -525,66 +570,6 @@ pub(super) fn view(s: &State) -> El {
         }
         Page::Mcp => {
             body = super::mcp::view(s, body);
-        }
-        Page::Updates => {
-            body = body
-                .child(section(
-                    "Updates",
-                    "Updates are downloaded from Brazap releases on GitHub.",
-                ))
-                .child(toggle(
-                    s,
-                    "Automatic updates",
-                    "Check periodically and download updates. Restart when you are ready.",
-                    p.updates.automatic,
-                    |p| p.updates.automatic = !p.updates.automatic,
-                ))
-                .child(title(format!("Brazap {}", env!("CARGO_PKG_VERSION")), 18.0));
-            let update = &s.preferences.update;
-            let status = update["status"].as_str().unwrap_or("idle");
-            let description = match status {
-                "unpublished" => "No release has been published yet.",
-                "up_to_date" => "You are up to date.",
-                "available" => "A new version is available.",
-                "ready" => "Update downloaded. Restart to install.",
-                "checking" => "Checking for updates…",
-                "error" => "Could not check for updates.",
-                _ => "Ready to check for updates.",
-            };
-            body = body.child(label(super::locale::tr(description), 13.0, INK).wrap());
-            if let Some(latest) = update["latest"].as_str() {
-                body = body.child(label(
-                    super::locale::format("Latest: {version}", &[("version", latest.into())]),
-                    12.0,
-                    MUTED,
-                ));
-            }
-            if let Some(error) = update["error"].as_str() {
-                body = body.child(label(super::locale::tr(error), 12.0, MUTED).wrap());
-            }
-            body = body.child(button(&super::locale::tr("Check for updates"), |s, _| {
-                s.preferences.update = json!({"status":"checking"});
-                s.request_preference("update_check", json!({}));
-            }));
-            if status == "available" {
-                body = body.child(button(&super::locale::tr("Download update"), |s, _| {
-                    s.preferences.update["status"] = json!("checking");
-                    s.request_preference("update_download", json!({}));
-                }));
-            }
-            if status == "ready" {
-                body = body.child(button(
-                    &super::locale::tr("Restart and install"),
-                    |s, tx| match crate::updates::install(&s.config) {
-                        Ok(()) => tx.quit(),
-                        Err(e) => s.preferences.error = Some(e.to_string()),
-                    },
-                ));
-            }
-            body = body.child(link(
-                "View releases",
-                "https://github.com/0rdep/brazap/releases",
-            ));
         }
         Page::Debug => {
             body = body
@@ -807,8 +792,7 @@ pub(super) fn confirmation(s: &State) -> Option<El> {
                     return;
                 }
                 if logout {
-                    s.preferences.logging_out = true;
-                    s.request_preference("logout", json!({}));
+                    s.begin_logout();
                 } else {
                     s.preferences.confirm_cache = false;
                     s.request_preference("clear", json!({}));

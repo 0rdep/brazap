@@ -49,9 +49,12 @@ selects its platform's asset. It accepts download links only from this repositor
 GitHub release path. The downloaded binary must match its SHA-256 entry before
 it is marked ready. Downloads are staged in the profile's cache directory.
 
-Automatic updates check and download in the background. Installation happens
-only when the user chooses **Restart and install**. The helper waits for the app
-to exit, replaces the executable and restarts with the same data directory.
+Updates check and download in the background shortly after startup and every
+five minutes. Choose **Restart and update** above Settings in the sidebar to
+install immediately. The helper waits for the app to exit, replaces the
+executable and restarts with the same data directory. If a verified download is
+already staged, the next fresh desktop launch applies it before opening the
+window. Opening an already running/tray app does not restart it.
 On Windows, the previous executable is retained as `*.exe.previous` for recovery
 if replacement or launch fails. Running from a writable directory is required.
 
@@ -59,11 +62,14 @@ if replacement or launch fails. Running from a writable directory is required.
 
 Use a disposable profile and a copied executable, without account credentials:
 
-1. Start an older build with `--data-dir` pointing to the disposable profile.
-2. Open Settings → Updates and check for the new public release.
-3. Download it; confirm the staged binary matches the release checksum.
-4. Choose Restart and install. Confirm the old process exits, the new version
+1. Start an older build with `--demo --data-dir` pointing to the disposable profile.
+   For builds with the background updater, use `BRAZAP_DEMO_UPDATE=check` to enable
+   real release checks without creating a WhatsApp client.
+2. Wait for the update prompt above Settings. Older releases with the legacy
+   update page require checking through Settings → Updates instead.
+3. Confirm the automatically downloaded binary matches the release checksum.
+4. Choose Restart and update (Restart and install on legacy releases). Confirm the old process exits, the new version
    starts, and the selected data directory is unchanged.
-5. Confirm Settings reports the installed version as up to date.
+5. Confirm About reports the new installed version and the update prompt is gone.
 
 Never use a live account or modify a published release just to simulate an update.

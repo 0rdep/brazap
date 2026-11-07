@@ -28,3 +28,14 @@ Subjects:
   and a tiny outlined heart above the note.
 - `chat-bubble.png`: one original rounded speech bubble with three small
   hand-drawn dots, a short curved tail and two tiny playful sparkle strokes.
+- `phone.png`: one tilted smartphone with a blank screen, two hand-drawn
+  signal arcs, rounded corners and a tiny home-button dot.
+- `voice-note.png`: one upright vintage-style microphone on a short curved
+  stand, with three small sound-wave strokes.
+- `photo.png`: one slightly tilted photo print with a mountain outline and
+  small round sun inside the frame, and a tiny sparkle outside.
+
+The last three use `paper-plane.png` as a style reference only. The built-in
+image generation prompt requests a different subject, matching off-white
+chalk/ink outlines, transparent unfilled interiors, no lettering or solid
+background, and a centered composition legible at 80–120 pixels.

@@ -37,6 +37,20 @@ struct Count {
 }
 
 impl Archive {
+    pub(crate) async fn chat_unread(&self, chat: &str) -> Result<i64> {
+        let identities = self.identities().await?;
+        if identities.is_locked(chat) {
+            return Ok(0);
+        }
+        let account = self.account as i64;
+        let aliases = identities.aliases_json(chat);
+        let count: Count = self.backend.shared().read(move |conn| {
+            diesel::sql_query("SELECT COALESCE(SUM(unread),0) AS value FROM brazap_chats WHERE account=? AND jid IN (SELECT value FROM json_each(?))")
+                .bind::<BigInt,_>(account).bind::<Text,_>(aliases).get_result(conn).map_err(db_error)
+        }).await?;
+        Ok(count.value)
+    }
+
     pub(crate) async fn incoming_is_read(&self, message: &crate::model::Message) -> Result<bool> {
         let account = self.account as i64;
         let aliases = self.identities().await?.aliases_json(&message.chat);
@@ -174,13 +188,7 @@ impl Service {
     pub async fn mark_chat_read(self: &Arc<Self>, chat: String) -> Result<()> {
         let chat = self.archive.canonical_chat(&chat).await?;
         self.archive.allow_chat(&chat).await?;
-        let unread = self
-            .archive
-            .chats()
-            .await?
-            .into_iter()
-            .find(|c| c.matches_jid(&chat))
-            .map_or(0, |c| c.unread);
+        let unread = self.archive.chat_unread(&chat).await?;
         // This transaction is the local outcome; transport failure cannot undo it.
         let targets = self
             .archive

@@ -762,9 +762,20 @@
   "Showing the latest 100 matching messages": "Mostrando los últimos 100 mensajes coincidentes",
   "Open Brazap": "Abrir Brazap",
   "Quit Brazap": "Salir de Brazap",
-  "Starting Brazap…": "Iniciando Brazap…",
   "Connecting to WhatsApp…": "Conectando a WhatsApp…",
   "Syncing messages…": "Sincronizando mensajes…",
   "Syncing messages… {progress}%": "Sincronizando mensajes… {progress}%",
-  "Search": "Buscar"
+  "Search": "Buscar",
+  "Could not load Brazap": "No se pudo cargar Brazap",
+  "Could not start the local service. Try again.": "No se pudo iniciar el servicio local. Inténtalo de nuevo.",
+  "The local service is taking too long to load your conversations. Try again.": "El servicio local está tardando en cargar tus conversaciones. Inténtalo de nuevo.",
+  "or": "o",
+  "Restart and update": "Reiniciar y actualizar",
+  "Downloading update…": "Descargando actualización…",
+  "Retry update": "Reintentar actualización",
+  "Restart to install Brazap {version}.": "Reinicia para instalar Brazap {version}.",
+  "Could not install the update. Try again.": "No se pudo instalar la actualización. Inténtalo de nuevo.",
+  "Could not download update. It will retry automatically.": "No se pudo descargar la actualización. Se reintentará automáticamente.",
+  "Could not load this conversation. Retrying…": "No se pudo cargar esta conversación. Reintentando…",
+  "Drop files to attach": "Suelta los archivos para adjuntar"
 }

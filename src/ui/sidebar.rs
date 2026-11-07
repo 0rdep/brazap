@@ -14,15 +14,58 @@ const EXPAND: Icon = Icon {
     body: r#"<rect x="3" y="4" width="18" height="16" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M9 4v16m4-12 4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.6"/>"#,
 };
 pub(super) fn layout(s: &State, _cx: &mut Cx<State>, layer: &mut Vec<El>) -> El {
-    let sidebar = if s.sidebar.is_open() {
-        expanded(s)
-    } else {
-        compact(s)
+    let sidebar_open = s.sidebar.is_open();
+    // Keep the list at its full width through the transition. Remounting a virtual
+    // list during expansion causes a measurement pass that cuts the width spring.
+    let body = |key, content: El, width, visible| {
+        let pane = el()
+            .key(key)
+            .pin(Some(0.0), Some(0.0), None, Some(0.0))
+            .w(width)
+            .opacity(if visible { 1.0 } else { 0.0 })
+            .opacity_motion(if visible {
+                rune::tok::motion::CSS_ENTER
+            } else {
+                rune::tok::motion::CSS_EXIT
+            })
+            .child(content.w_full().h_full().instant_changes());
+        if visible { pane } else { pane.inert() }
     };
-    let sidebar = col()
-        .h_full()
-        .child(sidebar.grow(1.0).min_h(0.0))
+    let panes = el()
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .clip_soft(0.0)
+        .child(body(
+            "expanded-content",
+            expanded(s),
+            s.sidebar.width(),
+            sidebar_open,
+        ))
+        .child(body("compact-content", compact(s), 68.0, !sidebar_open));
+    let contents = col()
+        .w_full()
+        .child(controls(s))
+        .child(panes)
         .child(super::preferences::footer(s));
+    let branding = row()
+        .key("sidebar-brand")
+        .w_full()
+        .h(40.0)
+        .px(14.0)
+        .center_y()
+        .child(brand(s, sidebar_open));
+    let sidebar = col()
+        .key("sidebar-shell")
+        .w(if sidebar_open {
+            s.sidebar.width()
+        } else {
+            68.0
+        })
+        .h_full()
+        .gap(12.0)
+        .child(branding)
+        .child(panel(contents).clip_rounded(22.0).grow(1.0).min_h(0.0));
     let main = if s.preferences.open {
         super::preferences::view(s)
     } else if s.section == Section::Calls {
@@ -38,7 +81,8 @@ pub(super) fn layout(s: &State, _cx: &mut Cx<State>, layer: &mut Vec<El>) -> El 
         .h_full()
         .padding(16.0)
         .gap(0.0)
-        .child(panel(sidebar).instant_changes());
+        .motion(rune::tok::motion::GLIDE)
+        .child(sidebar);
     if s.sidebar.is_open() {
         body = body.child(
             el().w(12.0)
@@ -65,7 +109,49 @@ pub(super) fn layout(s: &State, _cx: &mut Cx<State>, layer: &mut Vec<El>) -> El 
     } else {
         body = body.child(el().w(12.0));
     }
-    body.child(panel(main).grow(1.0).min_w(0.0).h_full())
+    body.child(panel(main).key("main-panel").grow(1.0).min_w(0.0).h_full())
+}
+
+fn controls(s: &State) -> El {
+    let open = s.sidebar.is_open();
+    let mut header = row()
+        .key("sidebar-controls")
+        .w_full()
+        .h(56.0)
+        .px(16.0)
+        .pt(16.0)
+        .gap(10.0)
+        .center_y()
+        .justify_end();
+    if open {
+        let heading = if s.section == Section::Calls {
+            "Call history"
+        } else if s.show_archived {
+            "Archived"
+        } else {
+            "Chats"
+        };
+        header = header.child(
+            title(super::locale::tr(heading), 15.0)
+                .key("sidebar-heading")
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate(),
+        );
+    }
+    header.child(
+        icon_button(
+            if open { &COLLAPSE } else { &EXPAND },
+            if open {
+                "Collapse sidebar"
+            } else {
+                "Expand sidebar"
+            },
+            |s, _| s.sidebar.toggle(),
+        )
+        .key("sidebar-toggle")
+        .motion(rune::tok::motion::GLIDE),
+    )
 }
 
 fn navigation(s: &State, section: Section, small: bool) -> El {
@@ -112,19 +198,15 @@ fn navigation(s: &State, section: Section, small: bool) -> El {
 
 fn compact(s: &State) -> El {
     col()
-        .w(68.0)
+        .w_full()
         .h_full()
         .padding(12.0)
+        .pt(16.0)
         .gap(16.0)
         .center_y()
-        .child(logo(s, 40.0))
         .child(navigation(s, Section::Messages, true))
         .child(navigation(s, Section::Calls, true))
         .child(el().grow(1.0))
-        .child(icon_button(&EXPAND, "Expand sidebar", |s, tx| {
-            tx.instant();
-            s.sidebar.toggle();
-        }))
 }
 
 fn search_input(s: &State) -> El {
@@ -164,19 +246,10 @@ fn search_input(s: &State) -> El {
 
 fn expanded(s: &State) -> El {
     let mut panel = col()
-        .w(s.sidebar.width())
+        .w_full()
         .h_full()
         .padding(16.0)
         .gap(16.0)
-        .child(
-            row()
-                .center_y()
-                .child(brand(s).grow(1.0).min_w(0.0))
-                .child(icon_button(&COLLAPSE, "Collapse sidebar", |s, tx| {
-                    tx.instant();
-                    s.sidebar.toggle();
-                })),
-        )
         .child(
             row()
                 .gap(6.0)
@@ -186,24 +259,16 @@ fn expanded(s: &State) -> El {
         .child(search_input(s));
     if s.section == Section::Calls {
         return panel.child(
-            col()
-                .gap(10.0)
-                .padding(10.0)
-                .child(title(super::locale::tr("Call history"), 15.0))
-                .child(
-                    label(
-                        super::locale::tr("Your voice and video calls, synced from WhatsApp."),
-                        12.0,
-                        MUTED,
-                    )
-                    .wrap(),
-                ),
+            col().gap(10.0).padding(10.0).child(
+                label(
+                    super::locale::tr("Your voice and video calls, synced from WhatsApp."),
+                    12.0,
+                    MUTED,
+                )
+                .wrap(),
+            ),
         );
     }
-    panel = panel.child(row().center_y().child(title(
-        super::locale::tr(&(if s.show_archived { "Archived" } else { "Chats" })),
-        15.0,
-    )));
     let archived = s.snapshot.chats.iter().filter(|c| c.archived).count();
     if archived > 0 || s.show_archived {
         panel = panel.child(

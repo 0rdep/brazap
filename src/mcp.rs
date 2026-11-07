@@ -183,7 +183,7 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
                 .archive
                 .newer_message_page(
                     text_arg(&args, "chat")?.into(),
-                    100,
+                    args["limit"].as_u64().unwrap_or(100).clamp(1, 500) as usize,
                     serde_json::from_value(args["cursor"].clone())?,
                 )
                 .await?,

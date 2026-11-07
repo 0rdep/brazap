@@ -11,7 +11,6 @@ pub struct Settings {
     pub notifications: NotificationSettings,
     pub privacy: PrivacySettings,
     pub appearance: AppearanceSettings,
-    pub updates: UpdateSettings,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -19,7 +18,6 @@ impl Default for Settings {
             notifications: Default::default(),
             privacy: Default::default(),
             appearance: Default::default(),
-            updates: Default::default(),
         }
     }
 }
@@ -73,17 +71,6 @@ impl Default for AppearanceSettings {
         }
     }
 }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct UpdateSettings {
-    pub automatic: bool,
-}
-impl Default for UpdateSettings {
-    fn default() -> Self {
-        Self { automatic: true }
-    }
-}
-
 impl Settings {
     pub fn validate(&self) -> Result<()> {
         ensure!(
@@ -223,6 +210,15 @@ impl Service {
         Ok(())
     }
     pub async fn request_logout(&self) -> Result<()> {
+        if self.config.demo {
+            self.stop_calls().await;
+            *self.connection.write().await = crate::model::Connection::default();
+            self.changed();
+            tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+            *self.connection.write().await = crate::demo::pairing();
+            self.changed();
+            return Ok(());
+        }
         let _ = self.connected().await?;
         self.stop_calls().await;
         let (send, receive) = tokio::sync::oneshot::channel();
@@ -236,6 +232,11 @@ impl Service {
             );
             *pending = Some(send);
         }
+        *self.connection.write().await = crate::model::Connection {
+            phase: crate::model::Phase::LoggedOut,
+            ..Default::default()
+        };
+        self.changed();
         self.restart.notify_one();
         receive
             .await

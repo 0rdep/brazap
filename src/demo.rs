@@ -17,17 +17,21 @@ const ANA: &str = "12025550107@s.whatsapp.net";
 const LUCAS: &str = "12025550114@s.whatsapp.net";
 const DESIGN: &str = "120363000000001@g.us";
 
+pub(crate) fn pairing() -> crate::model::Connection {
+    crate::model::Connection {
+        phase: crate::model::Phase::Pairing,
+        qr: Some("Brazap offline QR preview - not a WhatsApp pairing code".into()),
+        ..Default::default()
+    }
+}
+
 /// Visual startup fixtures, honored only after the isolated demo profile has
 /// been selected. They never create a client or change WhatsApp credentials.
 pub(crate) fn connection() -> crate::model::Connection {
     use crate::model::{Connection, Phase};
     match std::env::var("BRAZAP_DEMO_STARTUP").as_deref() {
         Ok("loading") => Connection::default(),
-        Ok("qr") => Connection {
-            phase: Phase::Pairing,
-            qr: Some("Brazap offline QR preview - not a WhatsApp pairing code".into()),
-            ..Default::default()
-        },
+        Ok("qr") => pairing(),
         Ok("connecting") => Connection {
             phase: Phase::Reconnecting,
             has_session: true,
@@ -52,6 +56,20 @@ pub(crate) fn connection() -> crate::model::Connection {
             has_session: true,
             ..Default::default()
         },
+    }
+}
+
+/// Sidebar update states for isolated visual checks; no network or installer runs.
+pub(crate) fn updates() -> crate::updates::UpdateState {
+    let status = std::env::var("BRAZAP_DEMO_UPDATE").unwrap_or_default();
+    if !matches!(status.as_str(), "ready" | "downloading" | "error") {
+        return Default::default();
+    }
+    crate::updates::UpdateState {
+        downloaded: status == "ready",
+        status,
+        latest: Some("99.0.0".into()),
+        ..Default::default()
     }
 }
 

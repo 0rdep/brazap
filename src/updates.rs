@@ -10,7 +10,7 @@ use std::{
 use crate::{config::Config, service::Service};
 const REPO: &str = "0rdep/brazap";
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateState {
     pub status: String,
     pub current: String,
@@ -19,6 +19,19 @@ pub struct UpdateState {
     pub notes: Option<String>,
     pub error: Option<String>,
     pub downloaded: bool,
+}
+impl UpdateState {
+    pub fn newer_than(&self, current: &str) -> bool {
+        self.latest
+            .as_deref()
+            .and_then(|v| semver::Version::parse(v).ok())
+            .zip(semver::Version::parse(current).ok())
+            .is_some_and(|(latest, current)| latest > current)
+    }
+
+    pub fn ready_for(&self, current: &str) -> bool {
+        self.downloaded && self.newer_than(current)
+    }
 }
 impl Default for UpdateState {
     fn default() -> Self {
@@ -92,7 +105,48 @@ fn hash_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn check(config: &Config, download: bool) -> Result<UpdateState> {
+fn staged(config: &Config) -> Result<Staged> {
+    let dir = config.cache_dir().join("updates");
+    let mut staged: Staged = serde_json::from_slice(&std::fs::read(dir.join("staged.json"))?)?;
+    staged.path = staged.path.canonicalize()?;
+    ensure!(
+        staged.path.starts_with(dir.canonicalize()?),
+        "Update is outside its staging directory"
+    );
+    ensure!(
+        hash_file(&staged.path)? == staged.sha256,
+        "Staged update failed its SHA-256 check"
+    );
+    ensure!(
+        semver::Version::parse(&staged.version)?
+            > semver::Version::parse(env!("CARGO_PKG_VERSION"))?,
+        "Update is not newer than this version"
+    );
+    Ok(staged)
+}
+
+pub(crate) fn restored(config: &Config) -> UpdateState {
+    match staged(config) {
+        Ok(staged) => UpdateState {
+            status: "ready".into(),
+            release_url: Some(format!(
+                "https://github.com/{REPO}/releases/tag/v{}",
+                staged.version
+            )),
+            latest: Some(staged.version),
+            downloaded: true,
+            ..Default::default()
+        },
+        Err(_) => UpdateState::default(),
+    }
+}
+
+fn check(config: &Config, download: bool, progress: impl Fn(UpdateState)) -> Result<UpdateState> {
+    // Once an update is ready, keep it available offline until the user restarts.
+    let cached = restored(config);
+    if cached.ready_for(env!("CARGO_PKG_VERSION")) {
+        return Ok(cached);
+    }
     let a = agent();
     let response = a
         .get(&format!(
@@ -126,6 +180,8 @@ fn check(config: &Config, download: bool) -> Result<UpdateState> {
     if !download {
         return Ok(state);
     }
+    state.status = "downloading".into();
+    progress(state.clone());
     let binary = release
         .assets
         .iter()
@@ -212,6 +268,26 @@ fn check(config: &Config, download: bool) -> Result<UpdateState> {
 }
 
 impl Service {
+    pub(crate) fn spawn_update_checker(self: &std::sync::Arc<Self>) {
+        let service = std::sync::Arc::downgrade(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            loop {
+                let Some(service) = service.upgrade() else {
+                    break;
+                };
+                if service.stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                if let Err(error) = service.check_updates(true).await {
+                    log::debug!("Background update check: {error:#}");
+                }
+                drop(service);
+                tokio::time::sleep(Duration::from_secs(5 * 60)).await;
+            }
+        });
+    }
+
     pub async fn check_updates(&self, download: bool) -> Result<UpdateState> {
         let Ok(_guard) = self.update_lock.try_lock() else {
             return Ok(self.updates.read().await.clone());
@@ -220,16 +296,35 @@ impl Service {
             return Ok(self.updates.read().await.clone());
         }
         self.updates.write().await.status = "checking".into();
+        self.changed();
         let config = self.config.clone();
-        match tokio::task::spawn_blocking(move || check(&config, download)).await? {
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        let mut job = tokio::task::spawn_blocking(move || {
+            check(&config, download, |state| {
+                let _ = send.send(state);
+            })
+        });
+        let result = loop {
+            tokio::select! {
+                result = &mut job => break result.context("Update worker failed").and_then(|result| result),
+                Some(state) = receive.recv() => {
+                    *self.updates.write().await = state;
+                    self.changed();
+                }
+            }
+        };
+        match result {
             Ok(state) => {
                 *self.updates.write().await = state.clone();
+                self.changed();
                 Ok(state)
             }
             Err(e) => {
                 let mut state = self.updates.write().await;
                 state.status = "error".into();
+                state.downloaded = false;
                 state.error = Some(e.to_string());
+                self.changed();
                 Err(e)
             }
         }
@@ -238,22 +333,21 @@ impl Service {
 
 /// Stage a separate process to replace the executable only after this UI exits.
 pub fn install(config: &Config) -> Result<()> {
-    let dir = config.cache_dir().join("updates");
-    let staged: Staged = serde_json::from_slice(&std::fs::read(dir.join("staged.json"))?)?;
-    let source = staged.path.canonicalize()?;
-    ensure!(
-        source.starts_with(dir.canonicalize()?),
-        "Update is outside its staging directory"
-    );
-    ensure!(
-        hash_file(&source)? == staged.sha256,
-        "Staged update failed its SHA-256 check"
-    );
-    ensure!(
-        semver::Version::parse(&staged.version)?
-            > semver::Version::parse(env!("CARGO_PKG_VERSION"))?,
-        "Update is not newer than this version"
-    );
+    install_staged(config, staged(config)?)
+}
+
+/// A fresh desktop launch applies an already verified update before mounting UI.
+/// CLI/MCP invocations and launches attached to a running service do not apply it.
+pub fn install_pending(config: &Config) -> Result<bool> {
+    let Ok(staged) = staged(config) else {
+        return Ok(false);
+    };
+    install_staged(config, staged)?;
+    Ok(true)
+}
+
+fn install_staged(config: &Config, staged: Staged) -> Result<()> {
+    let source = staged.path;
     let target = std::env::current_exe()?;
     let pid = std::process::id();
     let mut command;

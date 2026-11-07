@@ -28,6 +28,9 @@ can interact with WhatsApp, including reading and sending messages.
   available through MCP for future explicitly requested E2E tests.
 - In an isolated demo profile, `BRAZAP_DEMO_STARTUP=loading|qr|connecting|syncing|restoring`
   previews startup states without a real account. Omit it for the normal connected demo.
+- `BRAZAP_DEMO_UPDATE=ready|downloading|error` previews sidebar update states.
+  `BRAZAP_DEMO_UPDATE=check` enables real release checks in an isolated demo
+  profile without creating a WhatsApp client.
 
 ## Patched Rune builds
 
@@ -76,6 +79,9 @@ can interact with WhatsApp, including reading and sending messages.
 - QR pairing must render the current payload emitted by whatsapp-rust as a
   scannable QR code, with a high-contrast background and quiet zone. Show linking
   instructions and replace expired codes when the library issues new ones.
+- Keep the centered QR logo small, use high error correction and preserve a
+  four-module quiet zone. Fall back to an unbranded QR if the payload requires
+  the larger capacity of standard error correction.
 - Phone-number linking accepts a number with country code, requests a pairing
   code, and shows instructions to enter that code in WhatsApp's Linked Devices
   flow on the phone. A phone number alone does not authenticate the client.
@@ -91,8 +97,14 @@ can interact with WhatsApp, including reading and sending messages.
   restoring that session. Sending stays disabled until connected.
 - For a new pairing, show a centered Brazap logo and name with subtle animated
   messaging doodles while waiting for the QR code or initial connection/sync.
-  Show the QR only when available, and replace it with localized connection/sync progress
-  after pairing succeeds. Keep loading motion out of the normal chat layout.
+  Show the QR only when available, and return to the logo while pairing connects
+  or syncs. Keep routine status text off this loading screen; show actionable
+  failures separately without moving the logo. Make all doodles visible from
+  the first frame with continuous motion. Keep loading motion out of the normal chat layout.
+- Offer the phone-number linking option on the QR pairing screen, never on the
+  logo/loading screen. Separate it from QR instructions with a divider and “or”.
+- Open the main desktop window maximized. Give the QR instructions enough
+  horizontal space at the selected font size; allow wrapping only as a narrow-window fallback.
 - Distinguish temporary disconnections from logout or an invalid session. Retry
   connections without discarding stored authentication or chat history; return
   to pairing when authentication is actually required.
@@ -134,6 +146,16 @@ can interact with WhatsApp, including reading and sending messages.
   actions and sending only when there is an appropriate selected chat.
 - Apply the dark glass styling and motion requirements to this initial screen.
   Route text and attachment sends through the shared WhatsApp service.
+
+## Application updates
+
+- Check GitHub Releases automatically shortly after startup and every five
+  minutes while no update is staged. Download and verify updates in the background.
+- Keep a verified update available offline until the user installs it. Show
+  “Restart and update” above Settings in the sidebar, with an icon and tooltip
+  when the sidebar is compact. Do not put the update flow in Settings.
+- Apply a verified staged update before the next fresh desktop launch, or when
+  the user presses the restart button. Never interrupt a running app silently.
 
 ## Localization
 

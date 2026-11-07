@@ -87,6 +87,13 @@ impl Service {
             || DeviceStore::load(archive.backend.as_ref())
                 .await?
                 .is_some_and(|device| device.pn.is_some() && device.account.is_some());
+        let updates =
+            if config.demo && std::env::var("BRAZAP_DEMO_UPDATE").as_deref() != Ok("check") {
+                crate::demo::updates()
+            } else {
+                let config = config.clone();
+                tokio::task::spawn_blocking(move || crate::updates::restored(&config)).await?
+            };
         Ok(Arc::new(Self {
             live_calls: Default::default(),
             read_slots: Semaphore::new(2),
@@ -94,7 +101,7 @@ impl Service {
             outbox_locks: Mutex::new(Default::default()),
             config: config.clone(),
             settings: RwLock::new(settings),
-            updates: RwLock::new(crate::updates::UpdateState::default()),
+            updates: RwLock::new(updates),
             update_lock: Mutex::new(()),
             avatar_warming: AtomicBool::new(false),
             notifications_ready: AtomicBool::new(false),
@@ -135,6 +142,9 @@ impl Service {
     }
 
     pub async fn run(self: Arc<Self>) {
+        if !self.config.demo || std::env::var("BRAZAP_DEMO_UPDATE").as_deref() == Ok("check") {
+            self.spawn_update_checker();
+        }
         if self.config.demo {
             while !self.stopping.load(Ordering::Relaxed) {
                 self.restart.notified().await;
@@ -160,23 +170,6 @@ impl Service {
             log::warn!("Could not restore deletion markers: {error}");
         }
         self.spawn_history_prefetch();
-        let updater = Arc::downgrade(&self);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                let Some(service) = updater.upgrade() else {
-                    break;
-                };
-                if service.stopping.load(Ordering::Relaxed) {
-                    break;
-                }
-                if service.settings.read().await.updates.automatic {
-                    let _ = service.check_updates(true).await;
-                }
-                drop(service);
-                tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
-            }
-        });
         loop {
             if self.stopping.load(Ordering::Relaxed) {
                 break;
@@ -299,8 +292,10 @@ impl Service {
                     } else if !self.stopping.load(Ordering::Relaxed) {
                         let mut state = self.connection.write().await;
                         *state = Connection {
-                            has_session: state.has_session,
-                            initial_sync: state.initial_sync,
+                            // A failed unlink keeps the stored login and
+                            // reconnects; the pending state hid it from the UI.
+                            has_session: logout.is_some() || state.has_session,
+                            initial_sync: logout.is_none() && state.initial_sync,
                             qr: state.qr.take(),
                             qr_expires_at: state.qr_expires_at,
                             notice: logout_result.as_ref().err().cloned(),
@@ -402,6 +397,19 @@ impl Service {
     }
 
     async fn on_event(self: &Arc<Self>, event: Arc<Event>, client: Arc<Client>) -> Result<()> {
+        if self.logout_in_progress.load(Ordering::Acquire)
+            && matches!(
+                &*event,
+                Event::Connected(_)
+                    | Event::PairSuccess(_)
+                    | Event::PairingQrCode(_)
+                    | Event::PairingCode(_)
+                    | Event::OfflineSyncPreview(_)
+                    | Event::OfflineSyncCompleted(_)
+            )
+        {
+            return Ok(());
+        }
         match &*event {
             Event::Connected(_) => {
                 self.notifications_ready.store(false, Ordering::Release);
@@ -993,7 +1001,11 @@ impl Service {
             .map(|chat| identities.canonical(&chat))
             .filter(|chat| !identities.is_locked(chat));
         let messages = match &selected_chat {
-            Some(chat) => self.archive.messages(chat.clone(), 100, None).await?,
+            Some(chat) => {
+                self.archive
+                    .messages(chat.clone(), crate::history::CHAT_PAGE_SIZE, None)
+                    .await?
+            }
             None => Vec::new(),
         };
         let all_chats = self.archive.chats().await?;
@@ -1002,6 +1014,7 @@ impl Service {
             .and_then(|jid| all_chats.iter().find(|c| &c.jid == jid).cloned());
         let chats = all_chats;
         Ok(Snapshot {
+            updates: self.updates.read().await.clone(),
             connection: self.connection.read().await.clone(),
             chats,
             messages,

@@ -136,6 +136,7 @@ fn run() -> Result<()> {
             }
             return Ok(());
         }
+        let mut service_running = false;
         if let Ok(remote) = brazap::ipc::Remote::load(&config) {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -147,6 +148,7 @@ fn run() -> Result<()> {
                 )
                 .await
             });
+            service_running = matches!(&activated, Ok(Ok(_)));
             if matches!(activated, Ok(Ok(ref value)) if value["accepted"].as_bool()==Some(true)) {
                 #[cfg(target_os = "windows")]
                 if let Ok(Ok(value)) = &activated
@@ -155,6 +157,15 @@ fn run() -> Result<()> {
                     brazap::windows_integration::allow_activation(pid as u32);
                 }
                 return Ok(());
+            }
+        }
+        if !service_running {
+            match brazap::updates::install_pending(&config) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    log::warn!("Could not apply the downloaded update on launch: {error:#}")
+                }
             }
         }
         brazap::ui::run(config, initial_chat)
