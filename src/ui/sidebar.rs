@@ -76,7 +76,7 @@ fn navigation(s: &State, section: Section, small: bool) -> El {
     };
     let selected = !s.preferences.open && s.section == section;
     let mut button = row()
-        .h(38.0)
+        .h(super::locale::scale(38.0))
         .gap(8.0)
         .center()
         .radius(11.0)
@@ -98,11 +98,14 @@ fn navigation(s: &State, section: Section, small: bool) -> El {
     if small {
         button = button.w(40.0);
     } else {
-        button = button.grow(1.0).child(label(
-            super::locale::tr(name),
-            12.0,
-            if selected { INK } else { MUTED },
-        ));
+        button = button.grow(1.0).min_w(0.0).px(6.0).child(
+            label(
+                super::locale::tr(name),
+                12.0,
+                if selected { INK } else { MUTED },
+            )
+            .truncate(),
+        );
     }
     button
 }
@@ -128,11 +131,12 @@ fn search_input(s: &State) -> El {
     let mut input = TextInput::new(&s.search.edit)
         .leading_icon(&glyphs::SEARCH)
         .placeholder(super::locale::tr(if s.section == Section::Messages {
-            "Search chats and messages"
+            "Search"
         } else {
             "Search calls"
         }))
         .width(None)
+        .height(super::locale::scale(38.0))
         .on_edit(|s: &mut State| &mut s.search.edit);
     if !s.search.edit.text.is_empty() {
         input = input.trailing(
@@ -148,7 +152,11 @@ fn search_input(s: &State) -> El {
     }
     input
         .build(kit())
-        .h(38.0)
+        .help(super::locale::tr(if s.section == Section::Messages {
+            "Search chats and messages"
+        } else {
+            "Search calls"
+        }))
         .px(12.0)
         .hover(Color::TRANSPARENT)
         .press(Color::TRANSPARENT)
@@ -163,8 +171,7 @@ fn expanded(s: &State) -> El {
         .child(
             row()
                 .center_y()
-                .child(brand(s))
-                .child(el().grow(1.0))
+                .child(brand(s).grow(1.0).min_w(0.0))
                 .child(icon_button(&COLLAPSE, "Collapse sidebar", |s, tx| {
                     tx.instant();
                     s.sidebar.toggle();
@@ -245,11 +252,11 @@ fn expanded(s: &State) -> El {
             })
             .child(
                 col()
-                    .key("chat-rows")
+                    .key(format!("chat-rows-{}", super::locale::scale(76.0)))
                     .growth(GrowthSpec::default())
                     .virtual_rows(
                         count,
-                        76.0,
+                        super::locale::scale(76.0),
                         |s: &State, i| s.visible_chats()[i].jid.clone().into(),
                         |s: &State, i| chat_row(s, s.visible_chats()[i]),
                     )
@@ -425,9 +432,9 @@ fn chat_row(s: &State, chat: &Chat) -> El {
     }
     row()
         .w_full()
-        .h(76.0)
-        .min_h(76.0)
-        .max_h(76.0)
+        .h(super::locale::scale(76.0))
+        .min_h(super::locale::scale(76.0))
+        .max_h(super::locale::scale(76.0))
         .px(10.0)
         .gap(10.0)
         .center_y()
@@ -468,11 +475,15 @@ fn chat_row(s: &State, chat: &Chat) -> El {
                                 .truncate()
                                 .help_when_truncated(&chat.name),
                         )
-                        .child(label(
-                            super::times::chat_date(chat.updated_at),
-                            9.0,
-                            if selected { MINT } else { MUTED },
-                        )),
+                        .child(
+                            label(
+                                super::times::chat_date(chat.updated_at),
+                                9.0,
+                                if selected { MINT } else { MUTED },
+                            )
+                            .max_w(104.0)
+                            .truncate(),
+                        ),
                 )
                 .child(preview),
         )
@@ -531,11 +542,11 @@ fn calls(s: &State) -> El {
             })
             .child(
                 col()
-                    .key("call-rows")
+                    .key(format!("call-rows-{}", super::locale::scale(82.0)))
                     .growth(GrowthSpec::default())
                     .virtual_rows(
                         count,
-                        82.0,
+                        super::locale::scale(82.0),
                         move |_: &State, i| format!("{}:{}", keys[i].peer, keys[i].id).into(),
                         move |s: &State, i| {
                             let c = &calls[i];
@@ -563,8 +574,8 @@ fn calls(s: &State) -> El {
                                 })
                                 .unwrap_or_default();
                             row()
-                                .h(82.0)
-                                .min_h(82.0)
+                                .h(super::locale::scale(82.0))
+                                .min_h(super::locale::scale(82.0))
                                 .w_full()
                                 .px(24.0)
                                 .gap(14.0)

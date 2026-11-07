@@ -11,6 +11,11 @@ pub(super) fn style(size: f32, weight: f32) -> TextStyle {
         TextStyle::new(size * a.font_size as f32 / 13.0, weight).family(family)
     })
 }
+/// Fixed rows and controls must grow with enlarged text instead of clipping
+/// or letting the label paint over the next row.
+pub(super) fn scale(points: f32) -> f32 {
+    APPEARANCE.with(|settings| points * (settings.borrow().font_size as f32 / 13.0).max(1.0))
+}
 fn catalog(language: &str) -> &'static std::collections::HashMap<String, String> {
     use std::{collections::HashMap, sync::OnceLock};
     static EN: OnceLock<HashMap<String, String>> = OnceLock::new();

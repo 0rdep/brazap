@@ -761,5 +761,10 @@
   "Load older matches": "Load older matches",
   "Showing the latest 100 matching messages": "Showing the latest 100 matching messages",
   "Open Brazap": "Open Brazap",
-  "Quit Brazap": "Quit Brazap"
+  "Quit Brazap": "Quit Brazap",
+  "Starting Brazap…": "Starting Brazap…",
+  "Connecting to WhatsApp…": "Connecting to WhatsApp…",
+  "Syncing messages…": "Syncing messages…",
+  "Syncing messages… {progress}%": "Syncing messages… {progress}%",
+  "Search": "Search"
 }

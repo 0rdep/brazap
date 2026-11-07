@@ -2,6 +2,14 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Connection {
+    #[serde(default)]
+    pub has_session: bool,
+    #[serde(default)]
+    pub initial_sync: bool,
+    #[serde(default)]
+    pub syncing: bool,
+    #[serde(default)]
+    pub sync_progress: Option<u32>,
     pub phase: Phase,
     pub qr: Option<String>,
     pub qr_expires_at: Option<i64>,

@@ -205,7 +205,7 @@ pub(super) fn footer(s: &State) -> El {
     let small = !s.sidebar.is_open();
     let item = |glyph: &'static Icon, name: &str, action: fn(&mut State)| {
         let mut v = row()
-            .h(38.0)
+            .h(super::locale::scale(38.0))
             .gap(10.0)
             .px(10.0)
             .center_y()
@@ -219,9 +219,12 @@ pub(super) fn footer(s: &State) -> El {
         if small {
             v = v.w(40.0).center();
         } else {
-            v = v
-                .w_full()
-                .child(label(super::locale::tr(name), 12.0, MUTED));
+            v = v.w_full().child(
+                label(super::locale::tr(name), 12.0, MUTED)
+                    .truncate()
+                    .grow(1.0)
+                    .min_w(0.0),
+            );
         }
         v
     };

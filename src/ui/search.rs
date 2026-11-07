@@ -249,6 +249,7 @@ pub(super) fn panel(s: &State) -> El {
         .placeholder(locale::tr("Search this chat"))
         .leading_icon(&glyphs::SEARCH)
         .width(None)
+        .height(locale::scale(38.0))
         .on_edit(|s: &mut State| &mut s.chat_search.edit)
         .on_key(|s: &mut State, event, tx| {
             if event.key == rune::Key::Escape {
@@ -318,7 +319,7 @@ pub(super) fn panel(s: &State) -> El {
             .instant_changes()
             .virtual_rows(
                 count,
-                86.0,
+                locale::scale(86.0),
                 |s: &State, i| {
                     let m = &s.chat_search.results.messages[i].message;
                     format!("chat-match-{}-{}", m.sender, m.id).into()
@@ -345,17 +346,22 @@ pub(super) fn panel(s: &State) -> El {
             row()
                 .gap(8.0)
                 .center_y()
-                .child(title(locale::tr("Search messages"), 14.0).grow(1.0))
+                .child(
+                    title(locale::tr("Search messages"), 14.0)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate(),
+                )
                 .child(icon_button(&glyphs::CLOSE, "Close search", |s, _| {
                     s.close_chat_search()
                 })),
         )
-        .child(input.build(kit()).h(38.0).press(Color::TRANSPARENT))
+        .child(input.build(kit()).press(Color::TRANSPARENT))
         .child(
             row()
                 .center_y()
                 .gap(5.0)
-                .child(label(summary, 11.0, MUTED).grow(1.0).min_w(0.0))
+                .child(label(summary, 11.0, MUTED).grow(1.0).min_w(0.0).truncate())
                 .child(icon_button(&glyphs::CHEVRON_UP, "Newer match", |s, tx| {
                     s.step_search_hit(false, tx)
                 }))
@@ -379,7 +385,7 @@ fn result_row(s: &State, index: usize) -> El {
     };
     col()
         .w_full()
-        .h(86.0)
+        .h(locale::scale(86.0))
         .padding(10.0)
         .gap(5.0)
         .radius(12.0)

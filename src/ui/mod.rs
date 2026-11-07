@@ -17,6 +17,7 @@ mod recording;
 mod render;
 mod search;
 mod sidebar;
+mod startup;
 mod times;
 mod view;
 
@@ -174,6 +175,7 @@ pub(super) struct State {
     image_pending: HashSet<String>,
     image_failures: HashMap<String, (i64, Option<String>)>,
     logo: Option<Image>,
+    startup_art: Vec<Image>,
     snapshot: Snapshot,
     selected: Option<String>,
     draft: TextEdit,
@@ -304,6 +306,7 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         image_pending: HashSet::new(),
         image_failures: HashMap::new(),
         logo: None,
+        startup_art: Vec::new(),
         snapshot: Snapshot::default(),
         selected: None,
         draft: TextEdit::new(""),
@@ -405,10 +408,14 @@ fn setup(state: &mut State, wake: Waker) {
     state.logo = image::load_from_memory(include_bytes!("../../assets/logo.png"))
         .ok()
         .map(|image| {
-            let pixels = image.thumbnail(192, 192).into_rgba8();
+            let pixels = image
+                .crop_imm(318, 64, 894, 894)
+                .thumbnail(192, 192)
+                .into_rgba8();
             cache.rgba(pixels.width(), pixels.height(), pixels.into_raw())
         });
     state.image_cache = Some(cache);
+    startup::sync_art(state);
     state.load_phone_flags(false);
     if let Ok(mut slot) = state.wake.lock() {
         slot.waker = Some(wake);
@@ -726,6 +733,7 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
             .values()
             .chain(state.avatars.values())
             .chain(state.logo.iter())
+            .chain(state.startup_art.iter())
             .chain(state.picker.images.values())
             .chain(
                 state
@@ -743,6 +751,7 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
     IMAGE_COUNT.store(
         state.images.len()
             + state.avatars.len()
+            + state.startup_art.len()
             + state.picker.images.len()
             + state
                 .attachments
@@ -1097,6 +1106,7 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
         tx.wake_after(Duration::from_secs(1));
         changed = true;
     }
+    changed |= startup::sync_art(state);
     state.update_viewing();
     changed |= state.update_picker_query(tx);
     state.update_animations();
@@ -1299,14 +1309,10 @@ fn receive_snapshot(state: &mut State, mut snapshot: Snapshot, tx: &mut Tx) -> b
         if !state.history_focus {
             state.merge_messages(snapshot.messages.clone());
         }
-        match snapshot.connection.phase {
-            crate::model::Phase::Connected => state.authenticated = true,
-            crate::model::Phase::Pairing | crate::model::Phase::LoggedOut => {
-                state.authenticated = false
-            }
-            _ => {}
-        }
-        if state.authenticated {
+        state.authenticated = (snapshot.connection.has_session
+            || snapshot.connection.phase == crate::model::Phase::Connected)
+            && !snapshot.connection.initial_sync;
+        if state.authenticated || snapshot.connection.initial_sync {
             state.qr_payload = None;
             state.qr = None;
         } else if let Some(payload) = &snapshot.connection.qr

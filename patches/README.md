@@ -24,6 +24,8 @@ The tracked patch also carries desktop text-input fixes against the same pin:
 - Word boundaries also handle Unicode whitespace (including pasted non-breaking
   spaces), punctuation and emoji. Navigation and deletion preserve atomic pills
   and hidden secure fields instead of treating an entire pasted phrase as a word.
+- Single-line placeholders stay on one line and clip inside their input at large
+  font sizes, instead of wrapping over neighboring controls.
 
 These fixes are applied to normal windows and native overlays. No reference
 checkout or unrecorded build-source edits are used.

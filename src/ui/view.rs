@@ -244,7 +244,7 @@ pub(super) fn brand(s: &State) -> El {
         .gap(8.0)
         .center_y()
         .child(logo(s, 40.0))
-        .child(title(super::locale::tr("brazap"), 21.0))
+        .child(title(super::locale::tr("brazap"), 21.0).truncate())
 }
 
 pub(super) fn logo(s: &State, size: f32) -> El {
@@ -262,6 +262,8 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
     let mut layer = Vec::new();
     let content = if connected {
         sidebar::layout(s, cx, &mut layer)
+    } else if super::startup::loading(s) {
+        super::startup::view(s, cx.is_reduced_motion())
     } else {
         pairing(s, &mut layer)
     };
@@ -289,14 +291,6 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
                 a: 1.0,
             },
         );
-    if connected {
-        root = root.child(
-            el().size(450.0, 450.0)
-                .absolute(-150.0, -180.0)
-                .radius(225.0)
-                .fill(MINT.alpha(0.035)),
-        );
-    }
     root = root.child(content);
     if let Some(error) = &s.error {
         root = root.child(

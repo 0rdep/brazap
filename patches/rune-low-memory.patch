@@ -283,6 +283,33 @@ diff --git a/crates/rune/src/render.rs b/crates/rune/src/render.rs
              trace: Default::default(),
          }))
          .map_err(|error| format!("no GPU device: {error}"))
+diff --git a/crates/rune/src/runtime/paint/content.rs b/crates/rune/src/runtime/paint/content.rs
+--- a/crates/rune/src/runtime/paint/content.rs
++++ b/crates/rune/src/runtime/paint/content.rs
+@@ -193,7 +193,13 @@
+                     let pl_indent = spec.blocks.first().map_or(0.0, |b| (b.indent_pt(spec.style.size) * s).round() * tk);
+                     let pl_origin = [rest_origin[0] + pl_indent, rest_origin[1]];
+                     let pl_r_origin = if scale_motion == ScaleMotion::Still { pl_origin } else { [0.0, 0.0] };
+-                    let pl = self.text.layout_rich(&inp.placeholder, &[], spec.style, s, Some((w - pl_indent).max(1.0) / tk.max(1e-4)));
++                    // A single-line editor's placeholder must not wrap below
++                    // its field when the font grows or the sidebar narrows.
++                    let wrap = if inp.single_line { None } else { Some((w - pl_indent).max(1.0) / tk.max(1e-4)) };
++                    let pl = self.text.layout_rich(&inp.placeholder, &[], spec.style, s, wrap);
++                    let placeholder_clip = if inp.single_line {
++                        [clip[0].max(x0), clip[1].max(zr[1]), clip[2].min(x1), clip[3].min(zr[3])]
++                    } else { clip };
+                     self.glyph_scratch.clear();
+                     self.text.set_glyph_inks(inp.placeholder_color, &[]);
+                     self.text.set_glide(glide);
+@@ -201,7 +207,7 @@
+                     self.text.set_glide([0.0; 2]);
+                     let pc = premul(inp.placeholder_color, o, srgb);
+                     for q in &self.glyph_scratch {
+-                        self.instances.extend(glyph_or_image(q, &self.text, &mut self.images, pc, clip, fade)
++                        self.instances.extend(glyph_or_image(q, &self.text, &mut self.images, pc, placeholder_clip, fade)
+                             .map(|g| zoom_glyph(g, pl_origin, pl_r_origin, tk / raster)));
+                     }
+                 }
 diff --git a/crates/rune/src/text.rs b/crates/rune/src/text.rs
 --- a/crates/rune/src/text.rs
 +++ b/crates/rune/src/text.rs

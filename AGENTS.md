@@ -26,6 +26,8 @@ can interact with WhatsApp, including reading and sending messages.
   fixtures. Demo mode uses a separate SQLite profile and must never initialize a
   WhatsApp client, modify a real profile, or send real messages. Its data is also
   available through MCP for future explicitly requested E2E tests.
+- In an isolated demo profile, `BRAZAP_DEMO_STARTUP=loading|qr|connecting|syncing|restoring`
+  previews startup states without a real account. Omit it for the normal connected demo.
 
 ## Patched Rune builds
 
@@ -84,8 +86,13 @@ can interact with WhatsApp, including reading and sending messages.
   through expiry and reconnection until its replacement is ready; do not show
   QR-expired messages. Respect phone-code expiry and pairing cooldowns, and
   keep QR rotation separate from phone code refreshes.
-- Enter the chat layout after the library confirms authentication. Restore the
-  saved session on subsequent launches without requiring another pairing.
+- Open cached conversations when the library's saved device contains a linked
+  session, and reconnect in the background. Do not briefly show pairing while
+  restoring that session. Sending stays disabled until connected.
+- For a new pairing, show a centered Brazap logo and name with subtle animated
+  messaging doodles while waiting for the QR code or initial connection/sync.
+  Show the QR only when available, and replace it with localized connection/sync progress
+  after pairing succeeds. Keep loading motion out of the normal chat layout.
 - Distinguish temporary disconnections from logout or an invalid session. Retry
   connections without discarding stored authentication or chat history; return
   to pairing when authentication is actually required.

@@ -17,6 +17,44 @@ const ANA: &str = "12025550107@s.whatsapp.net";
 const LUCAS: &str = "12025550114@s.whatsapp.net";
 const DESIGN: &str = "120363000000001@g.us";
 
+/// Visual startup fixtures, honored only after the isolated demo profile has
+/// been selected. They never create a client or change WhatsApp credentials.
+pub(crate) fn connection() -> crate::model::Connection {
+    use crate::model::{Connection, Phase};
+    match std::env::var("BRAZAP_DEMO_STARTUP").as_deref() {
+        Ok("loading") => Connection::default(),
+        Ok("qr") => Connection {
+            phase: Phase::Pairing,
+            qr: Some("Brazap offline QR preview - not a WhatsApp pairing code".into()),
+            ..Default::default()
+        },
+        Ok("connecting") => Connection {
+            phase: Phase::Reconnecting,
+            has_session: true,
+            initial_sync: true,
+            ..Default::default()
+        },
+        Ok("syncing") => Connection {
+            phase: Phase::Connected,
+            has_session: true,
+            initial_sync: true,
+            syncing: true,
+            sync_progress: Some(45),
+            ..Default::default()
+        },
+        Ok("restoring") => Connection {
+            phase: Phase::Reconnecting,
+            has_session: true,
+            ..Default::default()
+        },
+        _ => Connection {
+            phase: Phase::Connected,
+            has_session: true,
+            ..Default::default()
+        },
+    }
+}
+
 pub(crate) fn prepare(config: &Config) -> Result<()> {
     let marker = config.data_dir.join(".brazap-demo");
     ensure!(

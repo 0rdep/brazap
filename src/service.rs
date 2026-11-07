@@ -80,6 +80,13 @@ impl Service {
         archive.recover_live_calls().await?;
         archive.recover_pending_sends().await?;
         let settings = archive.app_settings().await?;
+        // Load and validate the library's saved device, rather than guessing
+        // authentication from a database file or the presence of archived chats.
+        use whatsapp_rust::wacore::store::traits::DeviceStore;
+        let has_session = config.demo
+            || DeviceStore::load(archive.backend.as_ref())
+                .await?
+                .is_some_and(|device| device.pn.is_some() && device.account.is_some());
         Ok(Arc::new(Self {
             live_calls: Default::default(),
             read_slots: Semaphore::new(2),
@@ -99,12 +106,12 @@ impl Service {
             logout_request: Mutex::new(None),
             archive,
             connection: RwLock::new(if config.demo {
+                crate::demo::connection()
+            } else {
                 Connection {
-                    phase: Phase::Connected,
+                    has_session,
                     ..Default::default()
                 }
-            } else {
-                Connection::default()
             }),
             client: RwLock::new(None),
             revision: Arc::new(AtomicU64::new(0)),
@@ -292,6 +299,8 @@ impl Service {
                     } else if !self.stopping.load(Ordering::Relaxed) {
                         let mut state = self.connection.write().await;
                         *state = Connection {
+                            has_session: state.has_session,
+                            initial_sync: state.initial_sync,
                             qr: state.qr.take(),
                             qr_expires_at: state.qr_expires_at,
                             notice: logout_result.as_ref().err().cloned(),
@@ -397,14 +406,40 @@ impl Service {
             Event::Connected(_) => {
                 self.notifications_ready.store(false, Ordering::Release);
                 self.connected_at.store(now() as u64, Ordering::Release);
+                {
+                    let mut state = self.connection.write().await;
+                    let initial_sync = state.initial_sync;
+                    *state = Connection {
+                        phase: Phase::Connected,
+                        has_session: true,
+                        initial_sync,
+                        syncing: initial_sync,
+                        ..Default::default()
+                    };
+                }
                 let weak = Arc::downgrade(self);
                 let ready_client = client.clone();
                 tokio::spawn(async move {
-                    if ready_client
+                    let ready = ready_client
                         .wait_for_startup_sync(std::time::Duration::from_secs(120))
                         .await
-                        .is_ok()
-                    {
+                        .is_ok();
+                    if let Some(service) = weak.upgrade() {
+                        let current = service.client.read().await;
+                        if current
+                            .as_ref()
+                            .is_some_and(|c| Arc::ptr_eq(c, &ready_client))
+                        {
+                            let mut state = service.connection.write().await;
+                            state.initial_sync = false;
+                            state.syncing = false;
+                            if ready {
+                                state.sync_progress = None;
+                            }
+                            service.changed();
+                        }
+                    }
+                    if ready {
                         if let Some(service) = weak.upgrade() {
                             if !service.chat_locks_ready.load(Ordering::Acquire) {
                                 // The app previously ignored lock mutations. Replay this
@@ -442,10 +477,6 @@ impl Service {
                         }
                     }
                 });
-                *self.connection.write().await = Connection {
-                    phase: Phase::Connected,
-                    ..Default::default()
-                };
                 self.history_prefetch.synced();
                 let archive = self.archive.clone();
                 tokio::spawn(async move {
@@ -475,6 +506,19 @@ impl Service {
             }
             Event::OfflineSyncCompleted(_) => {
                 self.notifications_ready.store(true, Ordering::Release);
+            }
+            Event::OfflineSyncPreview(_) => {
+                self.connection.write().await.syncing = true;
+            }
+            Event::PairSuccess(_) => {
+                let mut state = self.connection.write().await;
+                state.has_session = true;
+                state.initial_sync = true;
+                state.syncing = false;
+                state.phase = Phase::Reconnecting;
+                state.qr = None;
+                state.pairing_code = None;
+                state.notice = None;
             }
             Event::Disconnected(_) => {
                 if let Some(call) = self.live_call().await.filter(|c| !c.ended()) {
@@ -526,6 +570,9 @@ impl Service {
             }
             Event::PairingQrCode(qr) => {
                 let mut state = self.connection.write().await;
+                state.has_session = false;
+                state.initial_sync = false;
+                state.syncing = false;
                 state.phase = Phase::Pairing;
                 state.notice = None;
                 state.qr = Some(qr.code.clone());
@@ -889,6 +936,12 @@ impl Service {
                     != wa::history_sync::HistorySyncType::ON_DEMAND as i32
                     && history.sync_type()
                         != wa::history_sync::HistorySyncType::RECENT_CONVERSATIONS_ON_DEMAND as i32;
+                if background {
+                    let mut state = self.connection.write().await;
+                    state.syncing = true;
+                    state.sync_progress = progress.map(|value| value.clamp(0, 100) as u32);
+                    self.changed();
+                }
                 let history = history.clone();
                 let decoded = tokio::task::spawn_blocking(move || history.get().cloned()).await?;
                 if let Some(decoded) = decoded {
@@ -898,6 +951,10 @@ impl Service {
                         .await?;
                 }
                 if background {
+                    let mut state = self.connection.write().await;
+                    if state.sync_progress == Some(100) {
+                        state.syncing = false;
+                    }
                     self.history_prefetch.synced();
                 }
             }
