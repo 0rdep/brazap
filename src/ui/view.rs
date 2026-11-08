@@ -122,7 +122,16 @@ pub(super) fn kind_icon(kind: &str) -> Option<&'static Icon> {
 
 pub(super) fn status_icon(status: &str, size: f32) -> El {
     let (glyph, name, color) = match status {
-        "read" => (&CHECKS, "Read", MINT),
+        "read" => (
+            &CHECKS,
+            "Read",
+            Color {
+                r: 0.12,
+                g: 0.55,
+                b: 1.0,
+                a: 1.0,
+            },
+        ),
         "delivered" => (&CHECKS, "Delivered", MUTED),
         "sent" => (&CHECK, "Sent", MUTED),
         "sending" => (&CLOCK, "Sending", MUTED),

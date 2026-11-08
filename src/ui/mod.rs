@@ -50,6 +50,9 @@ static MESSAGE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 static VIDEO_STATUS: std::sync::Mutex<Option<video::Status>> = std::sync::Mutex::new(None);
 static VOICE_STATUS: std::sync::Mutex<Option<video::Status>> = std::sync::Mutex::new(None);
 
+const SNAPSHOT_LOAD_ERROR: &str =
+    "The local service is taking too long to load your conversations. Try again.";
+
 pub(crate) fn memory_report() -> Value {
     use std::sync::atomic::Ordering::Relaxed;
     json!({"renderer":render::report(),"decoded_image_estimate_bytes":IMAGE_BYTES.load(Relaxed),"image_count":IMAGE_COUNT.load(Relaxed),"timeline_messages":MESSAGE_COUNT.load(Relaxed),"video":VIDEO_STATUS.lock().unwrap_or_else(|e|e.into_inner()).clone(),"voice":VOICE_STATUS.lock().unwrap_or_else(|e|e.into_inner()).clone(),"sticker_animations":animation::report()})
@@ -531,7 +534,11 @@ async fn worker(
     let media_slots = Arc::new(tokio::sync::Semaphore::new(4));
     let mut assets = tokio::task::JoinSet::new();
     let mut interval = tokio::time::interval(Duration::from_millis(700));
+    // Resuming after sleep must not replay every missed polling tick.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut snapshot_retry_at = None;
+    let mut snapshot_failures = 0u32;
+    let mut snapshot_loaded = false;
     let (snapshot_done, mut snapshot_results) =
         tokio::sync::mpsc::unbounded_channel::<(u64, Option<String>, Result<Snapshot, String>)>();
     let mut snapshot_generation = 0u64;
@@ -755,13 +762,22 @@ async fn worker(
                 match result {
                     Ok(snapshot)=>{
                         snapshot_retry_at=None;
+                        snapshot_failures=0;
+                        snapshot_loaded=true;
                         preview_call=snapshot.live_call.clone();
                         emit(&events,&wake,Event::Snapshot(snapshot));
                     },
                     Err(error)=>{
                         log::warn!("Could not load the local snapshot: {error}");
-                        snapshot_retry_at=Some(tokio::time::Instant::now()+Duration::from_secs(10));
-                        emit(&events,&wake,Event::SnapshotFailed("The local service is taking too long to load your conversations. Try again.".into()));
+                        snapshot_failures=snapshot_failures.saturating_add(1);
+                        // A request spanning suspend can expire as soon as the
+                        // machine wakes. Keep the cached conversation and give
+                        // a fresh request a chance before showing an error.
+                        let delay=if snapshot_failures==1 {1} else {10};
+                        snapshot_retry_at=Some(tokio::time::Instant::now()+Duration::from_secs(delay));
+                        if !snapshot_loaded || snapshot_failures>1 {
+                            emit(&events,&wake,Event::SnapshotFailed(SNAPSHOT_LOAD_ERROR.into()));
+                        }
                     },
                 }
             },
@@ -1397,7 +1413,14 @@ fn receive_snapshot(state: &mut State, mut snapshot: Snapshot, tx: &mut Tx) -> b
     {
         return false;
     }
-    let recovered = state.startup_error.take().is_some();
+    let mut recovered = state.startup_error.take().is_some();
+    // Clear only the refresh error: a successful poll must not dismiss an
+    // unrelated send, attachment, or update failure. Do this even when the
+    // snapshot itself is unchanged so the recovery schedules a redraw.
+    if state.error.as_deref() == Some(SNAPSHOT_LOAD_ERROR) {
+        state.error = None;
+        recovered = true;
+    }
     if let Some(viewing) = state.viewing_sent.as_deref() {
         for chat in &mut snapshot.chats {
             if chat.matches_jid(viewing) {

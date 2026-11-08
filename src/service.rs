@@ -1580,15 +1580,7 @@ pub(crate) async fn ingest_history(archive: &Archive, history: &wa::HistorySync)
                     continue;
                 }
                 if row.view.from_me {
-                    use wa::web_message_info::Status;
-                    row.view.status = match info.status {
-                        Some(Status::READ) | Some(Status::PLAYED) => "read",
-                        Some(Status::DELIVERY_ACK) => "delivered",
-                        Some(Status::ERROR) => "failed",
-                        Some(Status::PENDING) => "sending",
-                        _ => "sent",
-                    }
-                    .into();
+                    row.view.status = crate::storage::history_status(info, &row.view.chat).into();
                 }
                 rows.push(row);
             }

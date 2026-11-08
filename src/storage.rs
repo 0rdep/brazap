@@ -168,6 +168,9 @@ impl Archive {
                         .bind::<Text,_>(&m.sender).bind::<Text,_>(&m.id).bind::<BigInt,_>(m.timestamp)
                         .bind::<Text,_>(&m.status).bind::<Text,_>(payload).bind::<Binary,_>(row.encoded)
                         .bind::<Text,_>(row.metadata).execute(conn)?;
+                    if m.from_me {
+                        apply_receipts(conn, account as i64, &aliases, &m.id)?;
+                    }
                     crate::message_actions::store_reaction(conn, account as i64, &m)?;
                     if !m.visible() {continue;}
                     diesel::sql_query("INSERT INTO brazap_message_search(account,chat,sender,id,text) VALUES(?,?,?,?,?) ON CONFLICT(account,chat,sender,id) DO UPDATE SET text=excluded.text")
@@ -298,8 +301,7 @@ impl Archive {
                 for id in ids {
                     diesel::sql_query("INSERT INTO brazap_receipts(account,chat,id,status) VALUES(?,?,?,?) ON CONFLICT(account,chat,id) DO UPDATE SET status=CASE WHEN (CASE excluded.status WHEN 'read' THEN 4 WHEN 'delivered' THEN 3 WHEN 'sent' THEN 2 WHEN 'failed' THEN 1 ELSE 0 END) >= (CASE brazap_receipts.status WHEN 'read' THEN 4 WHEN 'delivered' THEN 3 WHEN 'sent' THEN 2 WHEN 'failed' THEN 1 ELSE 0 END) THEN excluded.status ELSE brazap_receipts.status END")
                         .bind::<BigInt,_>(account).bind::<Text,_>(&chat).bind::<Text,_>(&id).bind::<Text,_>(&status).execute(conn)?;
-                    diesel::sql_query("UPDATE brazap_messages SET status=? WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND id=? AND json_extract(payload,'$.from_me')=1 AND (CASE status WHEN 'read' THEN 4 WHEN 'delivered' THEN 3 WHEN 'sent' THEN 2 ELSE 0 END) <= ?")
-                        .bind::<Text,_>(&status).bind::<BigInt,_>(account).bind::<Text,_>(&aliases).bind::<Text,_>(&id).bind::<BigInt,_>(status_rank(&status)).execute(conn)?;
+                    apply_receipts(conn, account, &aliases, &id)?;
                 }
                 Ok(())
             }).map_err(db_error)
@@ -558,6 +560,51 @@ pub(crate) fn status_rank(status: &str) -> i64 {
         "failed" => 1,
         _ => 0,
     }
+}
+
+/// Receipts can be delivered before a phone's outgoing message is synced.
+/// Reconcile all known aliases without ever downgrading confirmed progress.
+pub(crate) fn apply_receipts(
+    conn: &mut diesel::SqliteConnection,
+    account: i64,
+    aliases: &str,
+    id: &str,
+) -> diesel::QueryResult<usize> {
+    diesel::sql_query(include_str!("../queries/apply_receipts.sql"))
+        .bind::<BigInt, _>(account)
+        .bind::<Text, _>(aliases)
+        .bind::<Text, _>(id)
+        .execute(conn)
+}
+
+pub(crate) fn history_status(info: &wa::WebMessageInfo, chat: &str) -> &'static str {
+    use wa::web_message_info::Status;
+    let mut status = match info.status {
+        Some(Status::READ | Status::PLAYED) => "read",
+        Some(Status::DELIVERY_ACK) => "delivered",
+        Some(Status::ERROR) => "failed",
+        Some(Status::PENDING) => "sending",
+        _ => "sent",
+    };
+    // Per-recipient timestamps may carry newer progress than the aggregate
+    // status. A single member's receipt does not establish group delivery.
+    if chat.ends_with("@s.whatsapp.net") || chat.ends_with("@lid") {
+        for receipt in &info.user_receipt {
+            let progress = if receipt.read_timestamp.is_some_and(|t| t > 0)
+                || receipt.played_timestamp.is_some_and(|t| t > 0)
+            {
+                "read"
+            } else if receipt.receipt_timestamp.is_some_and(|t| t > 0) {
+                "delivered"
+            } else {
+                continue;
+            };
+            if status_rank(progress) > status_rank(status) {
+                status = progress;
+            }
+        }
+    }
+    status
 }
 
 fn store_deletion(

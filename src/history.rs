@@ -205,12 +205,13 @@ impl Archive {
 
     pub async fn rebuild_projections(&self) -> Result<()> {
         if self
-            .preference("message_projection_v4".into())
+            .preference("message_projection_v5".into())
             .await?
             .is_some()
         {
             return Ok(());
         }
+        let identities = self.identities().await?;
         let mut cursor = 0;
         loop {
             let account = self.account as i64;
@@ -236,26 +237,24 @@ impl Archive {
                     String::new(),
                 )
                 .view;
-                let metadata: serde_json::Value =
-                    serde_json::from_str(&row.metadata).unwrap_or_default();
-                let receipt = metadata.get("status").and_then(|v| v.as_str());
-                if message.from_me {
-                    message.status = match receipt {
-                        Some("READ" | "PLAYED") => "read",
-                        Some("DELIVERY_ACK") => "delivered",
-                        _ => "sent",
-                    }
-                    .into();
+                if message.from_me
+                    && let Ok(info) = serde_json::from_str::<wa::WebMessageInfo>(&row.metadata)
+                {
+                    message.status = crate::storage::history_status(&info, &message.chat).into();
                 }
-                updates.push((row.cursor, message_payload(&message)?, message));
+                let aliases = identities.aliases_json(&message.chat);
+                updates.push((row.cursor, message_payload(&message)?, message, aliases));
             }
             self.backend.shared().run(move |conn| {
                 conn.transaction::<_,diesel::result::Error,_>(|conn| {
-                    for (rowid,payload,m) in updates {
+                    for (rowid,payload,m,aliases) in updates {
                         crate::message_actions::store_reaction(conn, account, &m)?;
                         diesel::sql_query("UPDATE brazap_messages SET payload=? WHERE rowid=?").bind::<Text,_>(payload).bind::<BigInt,_>(rowid).execute(conn)?;
                         if m.from_me && crate::storage::status_rank(&m.status)>2 {
                             diesel::sql_query("UPDATE brazap_messages SET status=? WHERE rowid=? AND status!='read'").bind::<Text,_>(&m.status).bind::<BigInt,_>(rowid).execute(conn)?;
+                        }
+                        if m.from_me {
+                            crate::storage::apply_receipts(conn, account, &aliases, &m.id)?;
                         }
                         if m.visible(){diesel::sql_query("INSERT INTO brazap_message_search(account,chat,sender,id,text) VALUES(?,?,?,?,?) ON CONFLICT(account,chat,sender,id) DO UPDATE SET text=excluded.text").bind::<BigInt,_>(account).bind::<Text,_>(m.chat.clone()).bind::<Text,_>(m.sender.clone()).bind::<Text,_>(m.id.clone()).bind::<Text,_>(searchable(&m)).execute(conn)?;}
                         else {diesel::sql_query("DELETE FROM brazap_message_search WHERE account=? AND chat=? AND sender=? AND id=?").bind::<BigInt,_>(account).bind::<Text,_>(&m.chat).bind::<Text,_>(&m.sender).bind::<Text,_>(&m.id).execute(conn)?;}
@@ -263,7 +262,7 @@ impl Archive {
                 }).map_err(db_error)
             }).await?;
         }
-        self.set_preference("message_projection_v4".into(), "1".into())
+        self.set_preference("message_projection_v5".into(), "1".into())
             .await
     }
 
