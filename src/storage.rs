@@ -579,22 +579,78 @@ pub(crate) fn apply_receipts(
 
 pub(crate) fn history_status(info: &wa::WebMessageInfo, chat: &str) -> &'static str {
     use wa::web_message_info::Status;
-    let mut status = match info.status {
+    let status = match info.status {
         Some(Status::READ | Status::PLAYED) => "read",
         Some(Status::DELIVERY_ACK) => "delivered",
         Some(Status::ERROR) => "failed",
         Some(Status::PENDING) => "sending",
         _ => "sent",
     };
+    upgrade_history_status(
+        status,
+        chat,
+        info.user_receipt.iter().map(|receipt| {
+            (
+                receipt.read_timestamp.is_some_and(|t| t > 0)
+                    || receipt.played_timestamp.is_some_and(|t| t > 0),
+                receipt.receipt_timestamp.is_some_and(|t| t > 0),
+            )
+        }),
+    )
+}
+
+/// The pinned SDK only derives Serialize for these messages. Read archived
+/// metadata as JSON instead of requiring its optional Deserialize feature.
+pub(crate) fn archived_history_status(metadata: &serde_json::Value, chat: &str) -> &'static str {
+    let status = match metadata.get("status").and_then(serde_json::Value::as_str) {
+        Some("READ" | "PLAYED") => "read",
+        Some("DELIVERY_ACK") => "delivered",
+        Some("ERROR") => "failed",
+        Some("PENDING") => "sending",
+        _ => "sent",
+    };
+    let positive = |receipt: &serde_json::Value, snake: &str, camel: &str| {
+        receipt
+            .get(snake)
+            .or_else(|| receipt.get(camel))
+            .is_some_and(|value| {
+                value
+                    .as_i64()
+                    .or_else(|| value.as_str()?.parse::<i64>().ok())
+                    .is_some_and(|t| t > 0)
+            })
+    };
+    let receipts = metadata
+        .get("user_receipt")
+        .or_else(|| metadata.get("userReceipt"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten();
+    upgrade_history_status(
+        status,
+        chat,
+        receipts.map(|receipt| {
+            (
+                positive(receipt, "read_timestamp", "readTimestamp")
+                    || positive(receipt, "played_timestamp", "playedTimestamp"),
+                positive(receipt, "receipt_timestamp", "receiptTimestamp"),
+            )
+        }),
+    )
+}
+
+fn upgrade_history_status(
+    mut status: &'static str,
+    chat: &str,
+    receipts: impl Iterator<Item = (bool, bool)>,
+) -> &'static str {
     // Per-recipient timestamps may carry newer progress than the aggregate
     // status. A single member's receipt does not establish group delivery.
     if chat.ends_with("@s.whatsapp.net") || chat.ends_with("@lid") {
-        for receipt in &info.user_receipt {
-            let progress = if receipt.read_timestamp.is_some_and(|t| t > 0)
-                || receipt.played_timestamp.is_some_and(|t| t > 0)
-            {
+        for (read, delivered) in receipts {
+            let progress = if read {
                 "read"
-            } else if receipt.receipt_timestamp.is_some_and(|t| t > 0) {
+            } else if delivered {
                 "delivered"
             } else {
                 continue;

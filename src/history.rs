@@ -238,9 +238,10 @@ impl Archive {
                 )
                 .view;
                 if message.from_me
-                    && let Ok(info) = serde_json::from_str::<wa::WebMessageInfo>(&row.metadata)
+                    && let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&row.metadata)
                 {
-                    message.status = crate::storage::history_status(&info, &message.chat).into();
+                    message.status =
+                        crate::storage::archived_history_status(&metadata, &message.chat).into();
                 }
                 let aliases = identities.aliases_json(&message.chat);
                 updates.push((row.cursor, message_payload(&message)?, message, aliases));
