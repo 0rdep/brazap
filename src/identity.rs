@@ -381,6 +381,10 @@ impl Archive {
         id: &str,
     ) -> Result<MessageSource> {
         let identities = self.identities().await?;
+        anyhow::ensure!(
+            chat != crate::stories::CHAT || !identities.is_locked(sender),
+            "This conversation is locked on WhatsApp and is excluded from Brazap."
+        );
         let chats = identities.aliases_json(chat);
         let senders = identities.aliases_json(sender);
         let account = self.account as i64;

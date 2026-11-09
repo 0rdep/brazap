@@ -364,7 +364,7 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
     if let Some(picker) = actions::forward_picker(s) {
         layer.push(picker);
     }
-    if let Some(viewer) = media::viewer(s) {
+    if let Some(viewer) = super::stories::viewer(s).or_else(|| media::viewer(s)) {
         layer.push(viewer);
     }
     if let Some(diagnostics) = super::diagnostics::modal(s) {
@@ -1003,7 +1003,7 @@ fn message_bubble(s: &State, message: &Message) -> El {
                 ),
         );
     } else if !message.text.is_empty() {
-        bubble = bubble.child(label(&message.text, 14.0, INK).wrap().selectable(true));
+        bubble = bubble.child(super::links::text(&message.text, 14.0));
     }
     if matches!(message.kind.as_str(), "image" | "video" | "sticker") {
         bubble = bubble.child(media::thumbnail(s, message));
@@ -1052,6 +1052,9 @@ fn message_bubble(s: &State, message: &Message) -> El {
     }
     if !message.footer.is_empty() && !message.is_call() {
         bubble = bubble.child(label(&message.footer, 11.0, MUTED).wrap());
+    }
+    if let Some(preview) = super::links::preview(s, message) {
+        bubble = bubble.child(preview);
     }
     for action in &message.actions {
         let mut item = col()

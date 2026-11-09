@@ -41,6 +41,11 @@ pub enum AssetRequest {
         sender: String,
         id: String,
     },
+    LinkPreview {
+        chat: String,
+        sender: String,
+        id: String,
+    },
 }
 
 impl AssetRequest {
@@ -51,6 +56,7 @@ impl AssetRequest {
             Self::Profile { jid } => format!("profile:{jid}"),
             Self::Thumbnail { chat, sender, id } => format!("thumb:{chat}:{sender}:{id}"),
             Self::Image { chat, sender, id } => format!("image:{chat}:{sender}:{id}"),
+            Self::LinkPreview { chat, sender, id } => format!("link:{chat}:{sender}:{id}"),
         }
     }
 }
@@ -131,11 +137,18 @@ impl Archive {
 
 impl Service {
     pub async fn asset(&self, request: AssetRequest) -> Result<Option<Asset>> {
+        if let AssetRequest::Thumbnail { chat, sender, .. }
+        | AssetRequest::Image { chat, sender, .. }
+        | AssetRequest::LinkPreview { chat, sender, .. } = &request
+            && chat == crate::stories::CHAT
+        {
+            self.archive.allow_chat(sender).await?;
+        }
         let jid = match &request {
             AssetRequest::Avatar { jid, .. } | AssetRequest::Profile { jid } => Some(jid.as_str()),
-            AssetRequest::Thumbnail { chat, .. } | AssetRequest::Image { chat, .. } => {
-                Some(chat.as_str())
-            }
+            AssetRequest::Thumbnail { chat, .. }
+            | AssetRequest::Image { chat, .. }
+            | AssetRequest::LinkPreview { chat, .. } => Some(chat.as_str()),
             AssetRequest::Sticker { .. } => None,
         };
         if let Some(jid) = jid {
@@ -198,6 +211,23 @@ impl Service {
             }));
         }
         let data = match &request {
+            AssetRequest::LinkPreview { chat, sender, id } => {
+                use whatsapp_rust::prelude::MessageExt;
+                let raw = self
+                    .archive
+                    .raw_message(chat.clone(), sender.clone(), id.clone())
+                    .await?;
+                match raw
+                    .get_base_message()
+                    .extended_text_message
+                    .as_option()
+                    .and_then(|m| m.jpeg_thumbnail.clone())
+                    .filter(|b| !b.is_empty())
+                {
+                    Some(bytes) => Some(resize(bytes, 480).await?),
+                    None => None,
+                }
+            }
             AssetRequest::Sticker { hash } => {
                 let bytes = self.sticker_bytes(hash.clone()).await?;
                 Some(if animated_webp(&bytes) {

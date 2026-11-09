@@ -205,6 +205,7 @@ impl State {
         self.draft.focused = false;
         self.jump_to_quote(
             &crate::model::Quote {
+                chat: None,
                 id: hit.message.id,
                 sender: hit.message.sender,
                 text: String::new(),

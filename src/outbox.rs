@@ -61,6 +61,19 @@ impl Service {
         id: String,
         timestamp: Option<i64>,
     ) -> Result<Message> {
+        self.send_text_with_source(chat, text, reply, None, id, timestamp)
+            .await
+    }
+
+    pub(crate) async fn send_text_with_source(
+        &self,
+        chat: String,
+        text: String,
+        reply: Option<MessageCursor>,
+        source_chat: Option<String>,
+        id: String,
+        timestamp: Option<i64>,
+    ) -> Result<Message> {
         ensure!(
             !text.trim().is_empty() && text.len() <= 65_536,
             "Enter a message up to 65,536 bytes"
@@ -105,13 +118,18 @@ impl Service {
         } else {
             let jid = chat.parse()?;
             let proto = if let Some(target) = reply {
+                let source = source_chat.as_deref().unwrap_or(&chat);
                 let original = self
                     .archive
-                    .raw_message(chat.clone(), target.sender.clone(), target.id.clone())
+                    .raw_message(source.to_owned(), target.sender.clone(), target.id.clone())
                     .await?;
                 let author = self.author(&target.sender).await?;
                 let context = whatsapp_rust::wacore::proto_helpers::build_quote_context_with_info(
-                    target.id, &author, &jid, &jid, &original,
+                    target.id,
+                    &author,
+                    &source.parse()?,
+                    &jid,
+                    &original,
                 );
                 wa::Message::text_with_context(text, context)
             } else {

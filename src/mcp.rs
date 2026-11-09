@@ -49,6 +49,20 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
             Ok(json!({"phase":snapshot.connection.phase,"notice":snapshot.connection.notice}))
         }
         "list_chats" => Ok(json!({"chats":service.archive.chats().await?})),
+        "list_statuses" => Ok(json!({"statuses":service.archive.statuses().await?})),
+        "reply_status" => Ok(
+            json!({"message":service.reply_status(text_arg(&args,"sender")?.into(),text_arg(&args,"id")?.into(),text_arg(&args,"text")?.into(),args["message_id"].as_str().map(str::to_owned).unwrap_or_else(crate::outbox::new_id)).await?}),
+        ),
+        "next_audio" => Ok(
+            json!({"message":service.archive.next_audio(text_arg(&args,"chat")?.into(),serde_json::from_value(args["cursor"].clone())?).await?}),
+        ),
+        "view_status" => service
+            .view_status(
+                text_arg(&args, "sender")?.into(),
+                text_arg(&args, "id")?.into(),
+            )
+            .await
+            .map(|_| json!({"viewed":true})),
         "get_current_call" => Ok(json!({"call": service.live_call().await})),
         "start_call" => service
             .start_call(
@@ -280,6 +294,34 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
 
 pub(crate) fn tools() -> Value {
     let definitions = [
+        (
+            "reply_status",
+            "Reply privately to a status, quoting the original update in the author's chat.",
+            json!({"sender":{"type":"string"},"id":{"type":"string"},"text":{"type":"string"},"message_id":{"type":"string"}}),
+            vec!["sender", "id", "text"],
+            false,
+        ),
+        (
+            "list_statuses",
+            "List unexpired status updates and their viewed state, excluding locked contacts.",
+            json!({}),
+            vec![],
+            true,
+        ),
+        (
+            "view_status",
+            "Mark a status update viewed and send a read receipt when enabled.",
+            json!({"sender":{"type":"string"},"id":{"type":"string"}}),
+            vec!["sender", "id"],
+            false,
+        ),
+        (
+            "next_audio",
+            "Find the next audio message in a conversation.",
+            json!({"chat":{"type":"string"},"cursor":{"type":"object"}}),
+            vec!["chat", "cursor"],
+            true,
+        ),
         (
             "get_status",
             "Check WhatsApp connection status.",

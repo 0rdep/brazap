@@ -703,6 +703,17 @@ impl Service {
                     ReceiptType::ReadSelf | ReceiptType::PlayedSelf
                 ) && receipt.source.is_from_me
                 {
+                    if receipt.source.chat.to_string() == crate::stories::CHAT {
+                        let author = receipt.source.recipient.as_ref().map(ToString::to_string);
+                        let ids: Vec<_> = receipt
+                            .message_ids
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect();
+                        self.archive
+                            .mark_status_views(author.as_deref(), &ids)
+                            .await?;
+                    }
                     self.archive
                         .read_self(
                             &receipt.source.chat.to_string(),
@@ -999,7 +1010,7 @@ impl Service {
         let identities = self.archive.identities().await?;
         let selected_chat = selected_chat
             .map(|chat| identities.canonical(&chat))
-            .filter(|chat| !identities.is_locked(chat));
+            .filter(|chat| chat != crate::stories::CHAT && !identities.is_locked(chat));
         let messages = match &selected_chat {
             Some(chat) => {
                 self.archive
@@ -1014,6 +1025,7 @@ impl Service {
             .and_then(|jid| all_chats.iter().find(|c| &c.jid == jid).cloned());
         let chats = all_chats;
         Ok(Snapshot {
+            statuses: self.archive.statuses().await?,
             updates: self.updates.read().await.clone(),
             connection: self.connection.read().await.clone(),
             chats,
@@ -1568,6 +1580,7 @@ pub(crate) async fn ingest_history(archive: &Archive, history: &wa::HistorySync)
                     conversation.id.clone(),
                     key.participant
                         .clone()
+                        .or_else(|| info.participant.clone())
                         .unwrap_or_else(|| conversation.id.clone()),
                     key.id.clone().unwrap_or_default(),
                     key.from_me.unwrap_or(false),

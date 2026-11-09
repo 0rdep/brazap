@@ -29,7 +29,7 @@ impl State {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
     }
-    fn play_voice(&mut self, message: Message) {
+    pub(super) fn play_voice(&mut self, message: Message) {
         if let Some(voice) = &self.voice
             && voice.message.id == message.id
             && voice.message.sender == message.sender
@@ -37,6 +37,8 @@ impl State {
             && let Some(player) = &voice.player
             && player.status().error.is_none()
         {
+            // A manual pause/replay cancels any queued automatic continuation.
+            self.voice_generation = self.voice_generation.wrapping_add(1);
             player.toggle();
             return;
         }
@@ -157,6 +159,8 @@ pub(super) fn view(s: &State, message: &Message) -> El {
                         .on_press(move |s: &mut State| {
                             if s.forwarding.is_some() {
                                 s.toggle_forward(&target);
+                            } else if s.story.is_some() {
+                                s.pause_story();
                             } else {
                                 s.play_voice(target.clone());
                             }

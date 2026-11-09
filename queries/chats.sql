@@ -24,7 +24,7 @@ LEFT JOIN brazap_messages m ON m.rowid=(
       AND json_extract(latest.payload,'$.kind')!='protocol'
     ORDER BY latest.timestamp DESC,latest.id DESC,latest.sender DESC LIMIT 1
 )
-WHERE c.account=? AND (m.rowid IS NOT NULL OR NOT EXISTS(
+WHERE c.account=? AND c.jid!='status@broadcast' AND (m.rowid IS NOT NULL OR NOT EXISTS(
     SELECT 1 FROM brazap_messages any_message WHERE any_message.account=c.account AND any_message.chat=c.jid
 ))
 ORDER BY pinned DESC,updated_at DESC,c.jid

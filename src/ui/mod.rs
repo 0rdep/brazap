@@ -7,6 +7,7 @@ mod calling;
 mod details;
 mod diagnostics;
 mod fonts;
+mod links;
 mod locale;
 mod mcp;
 mod media;
@@ -19,6 +20,7 @@ mod render;
 mod search;
 mod sidebar;
 mod startup;
+mod stories;
 mod times;
 mod updates;
 mod view;
@@ -65,6 +67,9 @@ struct UiWake {
 }
 
 enum Command {
+    ReplyStatus(String, String, String, String),
+    ViewStatus(String, String),
+    NextAudio(u64, Message),
     Start,
     Refresh,
     Update,
@@ -93,6 +98,8 @@ enum Command {
     Newer(String, MessageCursor, u64),
 }
 enum Event {
+    StatusReplied(String, Result<Message, String>),
+    NextAudio(u64, Result<Option<Message>, String>),
     Activate(Option<String>),
     Call(Result<Value, String>),
     CallFrame(
@@ -132,6 +139,7 @@ enum Event {
 enum Section {
     Messages,
     Calls,
+    Status,
 }
 
 struct PairingQr {
@@ -141,6 +149,7 @@ struct PairingQr {
 }
 
 pub(super) struct State {
+    story: Option<stories::Playback>,
     background: background::Background,
     config: Config,
     preferences: preferences::Panel,
@@ -272,6 +281,11 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
             }
         })?;
     let start = tx.clone();
+    // Rune's headless snapshots have no native on_ready callback. Demo mode
+    // only opens the isolated archive, so it can populate those views now.
+    if ui_config.demo {
+        let _ = start.send(Command::Start);
+    }
     let window = Arc::new(std::sync::Mutex::new(None));
     let window_created = window.clone();
     let mut state = State {
@@ -301,6 +315,7 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         attachment_sequence: 0,
         diagnostics: diagnostics::Panel::default(),
         section: Section::Messages,
+        story: None,
         sidebar: rune_kit::shell::PaneState::new(305.0).range(260.0, 440.0),
         search: search::Panel::default(),
         chat_search: search::Panel::default(),
@@ -554,6 +569,28 @@ async fn worker(
         tokio::select! {
             command=commands.recv()=>{
                 match command {
+                    Some(Command::ReplyStatus(sender,id,text,message_id))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=remote.call("reply_status",json!({"sender":sender,"id":id,"text":text,"message_id":message_id})).await
+                                .and_then(|v|Ok(serde_json::from_value(v["message"].clone())?)).map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::StatusReplied(message_id,result));
+                        });continue;
+                    }
+                    Some(Command::ViewStatus(sender,id))=>{
+                        let remote=remote.clone();
+                        assets.spawn(async move {
+                            if let Err(error)=remote.call("view_status",json!({"sender":sender,"id":id})).await { log::debug!("Could not mark status viewed: {error}"); }
+                        });continue;
+                    }
+                    Some(Command::NextAudio(generation,message))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=remote.call("next_audio",json!({"chat":message.chat,"cursor":message.cursor()})).await
+                                .and_then(|v|Ok(serde_json::from_value(v["message"].clone())?)).map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::NextAudio(generation,result));
+                        });continue;
+                    }
                     None=>break,
                     Some(Command::Start)=>continue,
                     Some(Command::Refresh)=>{
@@ -875,6 +912,22 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
     while let Ok(event) = state.rx.try_recv() {
         match event {
+            Event::StatusReplied(id, result) => {
+                state.receive_status_reply(id, result);
+                changed = true;
+            }
+            Event::NextAudio(generation, result) => {
+                if generation == state.voice_generation && state.story.is_none() {
+                    match result {
+                        Ok(Some(message)) if state.selected.as_deref() == Some(&message.chat) => {
+                            state.play_voice(message)
+                        }
+                        Err(error) => log::debug!("Could not load next audio message: {error}"),
+                        _ => {}
+                    }
+                    changed = true;
+                }
+            }
             Event::AttachmentPrepared(generation, id, result) => {
                 state.receive_attachment(generation, id, result);
                 changed = true;
@@ -1277,6 +1330,16 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
         && let Some(player) = &voice.player
     {
         let status = player.status();
+        if status.ended
+            && status.error.is_none()
+            && !voice.last_status.as_ref().is_some_and(|s| s.ended)
+            && state.story.is_none()
+        {
+            let _ = state.tx.send(Command::NextAudio(
+                state.voice_generation,
+                voice.message.clone(),
+            ));
+        }
         if status.playing
             && state
                 .voice_next_tick
@@ -1311,6 +1374,7 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
             changed = true;
         }
     }
+    changed |= stories::poll(state, elapsed, tx);
     changed |= search::poll(state, elapsed, tx);
     if let Some(at) = state.composer_focus_at {
         if let Some(delay) = at.checked_duration_since(std::time::Instant::now()) {
@@ -1526,6 +1590,9 @@ fn receive_snapshot(state: &mut State, mut snapshot: Snapshot, tx: &mut Tx) -> b
         });
         let refreshed = state.snapshot.revision != snapshot.revision;
         state.snapshot = snapshot;
+        if state.section == Section::Status {
+            state.request_status_avatars();
+        }
         if refreshed && state.picker.open && !state.picker.loading {
             state.load_picker_catalog(false);
         }
@@ -1647,6 +1714,7 @@ impl State {
             && !self.details
             && self.contact.is_none()
             && self.viewer.is_none()
+            && self.story.is_none()
             && !self.new_chat
             && !self.diagnostics.open
             && self.attachments.is_none()
@@ -1737,6 +1805,8 @@ impl State {
         self.attachments_open = false;
         self.close_viewer();
         self.section = Section::Messages;
+        self.story = None;
+        self.stop_voice();
         let _ = self.tx.send(Command::Select(chat, self.history_generation));
         self.update_viewing();
     }
@@ -1783,6 +1853,7 @@ impl State {
                 kind: "text".into(),
                 status: "sending".into(),
                 quote: reply.as_ref().map(|r| crate::model::Quote {
+                    chat: None,
                     id: r.id.clone(),
                     sender: r.sender.clone(),
                     text: r.preview(),
@@ -1856,6 +1927,21 @@ fn message_enter(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
 }
 
 fn on_key(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
+    if s.story.is_some() {
+        if s.story.as_ref().is_some_and(|story| story.reply.focused)
+            && event.key != rune::Key::Escape
+        {
+            return false;
+        }
+        match &event.key {
+            rune::Key::Escape => s.close_story(),
+            rune::Key::Left => s.step_story(false),
+            rune::Key::Right => s.step_story(true),
+            rune::Key::Text(key) if key == " " => s.pause_story(),
+            _ => return false,
+        }
+        return true;
+    }
     if event.is_command('f')
         && !event.mods.shift
         && s.authenticated
@@ -1971,6 +2057,10 @@ fn on_key(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
 
 impl State {
     fn jump_to_quote(&mut self, quote: &crate::model::Quote, chat: &str, tx: &mut Tx) {
+        if quote.chat.as_deref() == Some(crate::stories::CHAT) {
+            self.open_quoted_status(&quote.sender, &quote.id);
+            return;
+        }
         if self.forwarding.is_some() {
             return;
         }
@@ -2128,6 +2218,14 @@ impl State {
             .cloned()
             .collect();
         for m in visible {
+            if m.link_preview.is_some() {
+                let request = AssetRequest::LinkPreview {
+                    chat: m.chat.clone(),
+                    sender: m.sender.clone(),
+                    id: m.id.clone(),
+                };
+                self.request_asset(request.key(), request);
+            }
             if !m.from_me && m.chat.ends_with("@g.us") {
                 self.request_asset(
                     media::avatar_key(&m.sender, m.sender_photo_version),

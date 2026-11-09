@@ -131,6 +131,8 @@ impl Archive {
                 conn.batch_execute(include_str!("../migrations/016_read_state.sql"))
                     .map_err(db_error)?;
                 conn.batch_execute(include_str!("../migrations/017_search_index.sql"))
+                    .map_err(db_error)?;
+                conn.batch_execute(include_str!("../migrations/018_status_views.sql"))
                     .map_err(db_error)
             })
             .await?;
@@ -336,6 +338,9 @@ impl Archive {
     }
 
     pub async fn media(&self, chat: String, sender: String, id: String) -> Result<Option<Vec<u8>>> {
+        if chat == crate::stories::CHAT {
+            self.allow_chat(&sender).await?;
+        }
         let account = self.account as i64;
         let identities = self.identities().await?;
         let chat = identities.aliases_json(&chat);

@@ -70,6 +70,8 @@ pub(super) fn layout(s: &State, _cx: &mut Cx<State>, layer: &mut Vec<El>) -> El 
         super::preferences::view(s)
     } else if s.section == Section::Calls {
         calls(s)
+    } else if s.section == Section::Status {
+        super::stories::empty()
     } else {
         match &s.selected {
             Some(jid) => conversation(s, jid, layer),
@@ -124,7 +126,9 @@ fn controls(s: &State) -> El {
         .center_y()
         .justify_end();
     if open {
-        let heading = if s.section == Section::Calls {
+        let heading = if s.section == Section::Status {
+            "Status"
+        } else if s.section == Section::Calls {
             "Call history"
         } else if s.show_archived {
             "Archived"
@@ -155,15 +159,19 @@ fn controls(s: &State) -> El {
 }
 
 fn navigation(s: &State, section: Section, small: bool) -> El {
-    let (glyph, name) = if section == Section::Messages {
-        (&CHAT, "Messages")
-    } else {
-        (&PHONE, "Calls")
+    let (glyph, name) = match section {
+        Section::Messages => (&CHAT, "Messages"),
+        Section::Calls => (&PHONE, "Calls"),
+        Section::Status => (&super::stories::STATUS, "Status"),
     };
     let selected = !s.preferences.open && s.section == section;
-    let mut button = row()
-        .h(super::locale::scale(38.0))
-        .gap(8.0)
+    let mut button = (if small { row() } else { col() })
+        .key(format!(
+            "nav-{name}-{}",
+            if small { "compact" } else { "expanded" }
+        ))
+        .h(super::locale::scale(if small { 38.0 } else { 54.0 }))
+        .gap(4.0)
         .center()
         .radius(11.0)
         .role("tab")
@@ -176,15 +184,19 @@ fn navigation(s: &State, section: Section, small: bool) -> El {
         })
         .hover(Color::WHITE.alpha(0.045))
         .on_press(move |s: &mut State| {
+            s.close_story();
             s.preferences.open = false;
             s.section = section;
+            if section == Section::Status {
+                s.request_status_avatars();
+            }
             s.attachments_open = false;
         })
         .child(icon(glyph, 18.0).color(if selected { MINT } else { MUTED }));
     if small {
         button = button.w(40.0);
     } else {
-        button = button.grow(1.0).min_w(0.0).px(6.0).child(
+        button = button.grow(1.0).min_w(0.0).px(3.0).child(
             label(
                 super::locale::tr(name),
                 12.0,
@@ -206,6 +218,7 @@ fn compact(s: &State) -> El {
         .center_y()
         .child(navigation(s, Section::Messages, true))
         .child(navigation(s, Section::Calls, true))
+        .child(navigation(s, Section::Status, true))
         .child(el().grow(1.0))
 }
 
@@ -245,18 +258,17 @@ fn search_input(s: &State) -> El {
 }
 
 fn expanded(s: &State) -> El {
-    let mut panel = col()
-        .w_full()
-        .h_full()
-        .padding(16.0)
-        .gap(16.0)
-        .child(
-            row()
-                .gap(6.0)
-                .child(navigation(s, Section::Messages, false))
-                .child(navigation(s, Section::Calls, false)),
-        )
-        .child(search_input(s));
+    let mut panel = col().w_full().h_full().padding(16.0).gap(16.0).child(
+        row()
+            .gap(6.0)
+            .child(navigation(s, Section::Messages, false))
+            .child(navigation(s, Section::Calls, false))
+            .child(navigation(s, Section::Status, false)),
+    );
+    if s.section == Section::Status {
+        return panel.child(super::stories::list(s));
+    }
+    panel = panel.child(search_input(s));
     if s.section == Section::Calls {
         return panel.child(
             col().gap(10.0).padding(10.0).child(
@@ -517,13 +529,7 @@ fn chat_row(s: &State, chat: &Chat) -> El {
             tx.instant();
             tx.scroll_to_bottom_instant("messages");
         })
-        .child(media::avatar(
-            s,
-            &chat.jid,
-            &chat.name,
-            chat.photo_version,
-            38.0,
-        ))
+        .child(super::stories::chat_avatar(s, chat))
         .child(
             col()
                 .grow(1.0)

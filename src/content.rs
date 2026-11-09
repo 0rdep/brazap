@@ -182,6 +182,32 @@ fn template(view: &mut Message, t: &wa::message::TemplateMessage) {
 /// The archive keeps the original protobuf. This is only its user-visible projection.
 pub fn project(view: &mut Message, message: &wa::Message) {
     let base = message.get_base_message();
+    if let Some(text) = base.extended_text_message.as_option() {
+        view.background_argb = text.background_argb;
+        if let Some((_, url)) = crate::links::detect(
+            text.matched_text
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or(&view.text),
+        )
+        .into_iter()
+        .next()
+        {
+            view.link_preview = Some(crate::model::LinkPreview {
+                url,
+                title: text.title.clone().unwrap_or_default(),
+                description: text.description.clone().unwrap_or_default(),
+            });
+        }
+    }
+    if view.link_preview.is_none()
+        && let Some((_, url)) = crate::links::detect(&view.text).into_iter().next()
+    {
+        view.link_preview = Some(crate::model::LinkPreview {
+            url,
+            ..Default::default()
+        });
+    }
     if project_call(view, message) {
         return;
     }
@@ -208,6 +234,7 @@ pub fn project(view: &mut Message, message: &wa::Message) {
                     }
                 });
             view.quote = Some(crate::model::Quote {
+                chat: context.remote_jid.clone(),
                 id: id.clone(),
                 sender: context.participant.clone().unwrap_or_default(),
                 text: text.chars().take(280).collect(),
@@ -325,6 +352,7 @@ pub fn project(view: &mut Message, message: &wa::Message) {
     } else if let Some(m) = media.video_message.as_option() {
         view.kind = "video".into();
         view.mime = m.mimetype.clone();
+        view.duration_seconds = m.seconds;
     } else if let Some(m) = media.audio_message.as_option() {
         view.kind = "audio".into();
         view.mime = m.mimetype.clone();

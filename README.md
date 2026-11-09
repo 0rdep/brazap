@@ -27,6 +27,8 @@
 | --- | --- |
 | **Native desktop** | Dark surfaces, smooth transitions, a resizable sidebar and a compact navigation rail. Built with [Rune](https://github.com/anomalyco/rune). |
 | **Conversations** | Personal and group chats, quoted replies, emoji reactions, multi-message forwarding, delivery/read indicators and day separators. |
+| **Links** | Click URLs to open your default browser. Preview cards show titles, descriptions and thumbnails supplied with WhatsApp messages. |
+| **Status** | A dedicated Status tab with a story viewer, private text and emoji replies, automatic progression, pause and previous/next controls. Unread statuses add a clickable ring to chat avatars. Viewed state is stored locally and status updates disappear from browsing after 24 hours. |
 | **Media** | Inline image previews, video playback, voice recording with pause, resume, local preview, waveform and timer, voice-note playback speed, clipboard image/file pasting with previews and emoji captions, files and animated WebP stickers. |
 | **Calls** | One-to-one voice and video calls, incoming-call controls, microphone mute, camera toggle and a floating call panel. [Calling details](docs/CALLING.md). |
 | **Find anything** | Search chat names, phone numbers, filenames and message contents. Jump directly to a matching message. |
@@ -36,6 +38,8 @@
 | **Privacy controls** | Control read receipts, typing indicators, notifications and supported WhatsApp privacy settings. Optionally retain content when a sender deletes a message. |
 | **Windows integration** | Native notifications with message previews and sound. Clicking a notification opens the conversation. |
 | **Updates** | Checks GitHub Releases automatically every five minutes, verifies downloads, and shows **Restart and update** above Settings. A pending update also installs on the next full app launch. |
+
+Audio messages continue automatically to the next audio message in the same conversation, including messages outside the currently loaded page.
 
 Brazap uses [whatsapp-rust](https://github.com/oxidezap/whatsapp-rust) for the WhatsApp connection. It is an independent project and is not affiliated with WhatsApp or Meta.
 
@@ -101,6 +105,7 @@ On Linux or macOS, replace `command` with the absolute path to the downloaded ex
 | `get_status`, `list_chats`, `list_calls` | `send_message`, `react_message` |
 | `search`, `read_messages`, `sticker_catalog` | `forward_messages`, `send_attachment` |
 | `get_current_call` | `start_call`, `answer_call`, `end_call`, `mute_call`, `camera_call` |
+| `list_statuses`, `next_audio` | `view_status`, `reply_status` |
 | | `send_sticker`, `save_attachment` |
 
 The MCP adapter connects to the existing service over authenticated loopback. It uses the same SQLite archive and WhatsApp session as the UI. Use chat identifiers returned by `list_chats`; sending tools deliver real WhatsApp messages.

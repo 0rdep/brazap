@@ -381,6 +381,94 @@ pub(crate) async fn seed(archive: &Archive) -> Result<()> {
     archive
         .complete_history(DESIGN.into(), "demo_profile")
         .await?;
+    // Offline fixtures for link previews, story progression and queued audio.
+    let mut preview = wa::message::ExtendedTextMessage::default();
+    preview.text = Some("A useful link: https://www.rust-lang.org/learn".into());
+    preview.matched_text = Some("https://www.rust-lang.org/learn".into());
+    preview.title = Some("Learn Rust".into());
+    preview.description = Some("A collection of resources to get started with Rust.".into());
+    preview.jpeg_thumbnail = Some(picture()?);
+    let mut link = wa::Message::default();
+    link.extended_text_message = MessageField::some(preview);
+    archive
+        .store_messages(
+            vec![project_message(
+                DESIGN.into(),
+                ANA.into(),
+                "demo-link".into(),
+                false,
+                base + 215,
+                &link,
+                String::new(),
+                "{}".into(),
+            )],
+            false,
+        )
+        .await?;
+    for index in 0..2 {
+        let mut audio = wa::message::AudioMessage::default();
+        audio.mimetype = Some("audio/wav".into());
+        audio.seconds = Some(3);
+        let mut proto = wa::Message::default();
+        proto.audio_message = MessageField::some(audio);
+        let row = project_message(
+            DESIGN.into(),
+            ANA.into(),
+            format!("demo-audio-next-{index}"),
+            false,
+            base + 212 + index,
+            &proto,
+            String::new(),
+            "{}".into(),
+        );
+        let message = row.view.clone();
+        archive.store_messages(vec![row], false).await?;
+        archive.put_media(&message, voice()).await?;
+    }
+    for (index, sender, text, color) in [
+        (0, ANA, "A little sunshine for your day ☀️", 0xff184a47),
+        (1, ANA, "Ready for the weekend! 🌿", 0xff374971),
+        (2, LUCAS, "Working on something new ✨", 0xff51325c),
+    ] {
+        let mut body = wa::message::ExtendedTextMessage::default();
+        body.text = Some(text.into());
+        body.background_argb = Some(color);
+        let mut proto = wa::Message::default();
+        proto.extended_text_message = MessageField::some(body);
+        archive
+            .store_messages(
+                vec![project_message(
+                    crate::stories::CHAT.into(),
+                    sender.into(),
+                    format!("demo-status-{index}"),
+                    false,
+                    base + 600 + index,
+                    &proto,
+                    String::new(),
+                    "{}".into(),
+                )],
+                false,
+            )
+            .await?;
+    }
+    let mut image = wa::message::ImageMessage::default();
+    image.mimetype = Some("image/png".into());
+    image.caption = Some("Weekend colors 🌅".into());
+    let mut proto = wa::Message::default();
+    proto.image_message = MessageField::some(image);
+    let row = project_message(
+        crate::stories::CHAT.into(),
+        LUCAS.into(),
+        "demo-status-image".into(),
+        false,
+        base + 605,
+        &proto,
+        String::new(),
+        "{}".into(),
+    );
+    let message = row.view.clone();
+    archive.store_messages(vec![row], false).await?;
+    archive.put_media(&message, picture()?).await?;
     archive
         .set_preference("demo_seed_v1".into(), "1".into())
         .await?;

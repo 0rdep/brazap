@@ -109,6 +109,10 @@ pub struct Call {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     #[serde(default)]
+    pub link_preview: Option<LinkPreview>,
+    #[serde(default)]
+    pub background_argb: Option<u32>,
+    #[serde(default)]
     pub deleted_at: Option<i64>,
     pub id: String,
     pub chat: String,
@@ -147,8 +151,23 @@ pub struct Message {
     pub waveform: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LinkPreview {
+    pub url: String,
+    pub title: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StatusUpdate {
+    pub message: Message,
+    pub viewed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Quote {
+    #[serde(default)]
+    pub chat: Option<String>,
     pub id: String,
     pub sender: String,
     pub text: String,
@@ -291,6 +310,8 @@ pub struct SearchResults {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub statuses: Vec<StatusUpdate>,
     #[serde(default)]
     pub updates: crate::updates::UpdateState,
     #[serde(default)]
