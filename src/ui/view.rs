@@ -953,7 +953,14 @@ fn message_bubble(s: &State, message: &Message) -> El {
                 .hover(MINT.alpha(0.14))
                 .on_press_tx(move |s: &mut State, tx| s.jump_to_quote(&quoted, &chat, tx))
                 .child(label(name, 11.0, MINT))
-                .child(label(&quote.text, 12.0, MUTED).truncate()),
+                .child(
+                    label(
+                        super::links::expand_mentions(&quote.text, &quote.mentions).0,
+                        12.0,
+                        MUTED,
+                    )
+                    .truncate(),
+                ),
         );
     }
     if !message.title.is_empty() {

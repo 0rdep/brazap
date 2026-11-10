@@ -191,13 +191,16 @@ pub struct StatusUpdate {
     pub viewed: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Quote {
     #[serde(default)]
     pub chat: Option<String>,
     pub id: String,
     pub sender: String,
     pub text: String,
+    /// People tagged in the quoted text, found when the message is loaded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<Mention>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

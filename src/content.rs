@@ -246,6 +246,7 @@ pub fn project(view: &mut Message, message: &wa::Message) {
                 id: id.clone(),
                 sender: context.participant.clone().unwrap_or_default(),
                 text: text.chars().take(280).collect(),
+                ..Default::default()
             });
         }
     }

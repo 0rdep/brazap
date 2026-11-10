@@ -209,6 +209,7 @@ impl State {
                 id: hit.message.id,
                 sender: hit.message.sender,
                 text: String::new(),
+                ..Default::default()
             },
             &hit.message.chat,
             tx,

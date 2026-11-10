@@ -1922,6 +1922,7 @@ impl State {
                     id: r.id.clone(),
                     sender: r.sender.clone(),
                     text: r.preview(),
+                    ..Default::default()
                 }),
                 ..Default::default()
             };

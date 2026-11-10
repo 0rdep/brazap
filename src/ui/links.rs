@@ -8,34 +8,35 @@ pub(super) fn text(value: &str, size: f32) -> El {
 
 const MENTION_SCHEME: &str = "brazap-mention:";
 
-/// Message body with `@number` tags replaced by the person's name. Tags of
-/// other people in groups open their profile; the account's own tag reads
-/// "@me" and does nothing.
-pub(super) fn message_text(message: &Message, size: f32) -> El {
-    let group = message.chat.ends_with("@g.us");
-    let mut text = String::with_capacity(message.text.len());
-    let mut spans = Vec::new();
-    let mut targets = Vec::new();
-    let mut rest = message.text.as_str();
+/// Replace `@number` tags with the person's name. Returns the new text and,
+/// for every replaced tag, its byte range and the mention it stands for.
+pub(super) fn expand_mentions(
+    text: &str,
+    mentions: &[crate::model::Mention],
+) -> (String, Vec<(std::ops::Range<usize>, usize)>) {
+    let mut out = String::with_capacity(text.len());
+    let mut tags = Vec::new();
+    let mut rest = text;
     while let Some(at) = rest.find('@') {
-        text.push_str(&rest[..at]);
+        out.push_str(&rest[..at]);
         rest = &rest[at..];
         // Longest tag first so `@1234` never swallows part of `@12345`.
-        let found = message
-            .mentions
+        let found = mentions
             .iter()
-            .filter_map(|m| {
+            .enumerate()
+            .filter_map(|(index, m)| {
                 let token = m.token();
                 let tail = rest.get(token.len()..)?;
                 (rest.starts_with(&token) && !tail.starts_with(|c: char| c.is_alphanumeric()))
-                    .then_some((m, token.len()))
+                    .then_some((index, token.len()))
             })
             .max_by_key(|(_, len)| *len);
-        let Some((mention, len)) = found else {
-            text.push('@');
+        let Some((index, len)) = found else {
+            out.push('@');
             rest = &rest[1..];
             continue;
         };
+        let mention = &mentions[index];
         let shown = if mention.me {
             super::locale::tr("@me")
         } else if mention.name.is_empty() {
@@ -43,15 +44,29 @@ pub(super) fn message_text(message: &Message, size: f32) -> El {
         } else {
             format!("@{}", mention.name.trim_start_matches('@'))
         };
-        let range = text.len()..text.len() + shown.len();
-        spans.push(range.clone());
-        if group && !mention.me && !mention.name.is_empty() {
-            targets.push((range, format!("{MENTION_SCHEME}{}", mention.jid)));
-        }
-        text.push_str(&shown);
+        tags.push((out.len()..out.len() + shown.len(), index));
+        out.push_str(&shown);
         rest = &rest[len..];
     }
-    text.push_str(rest);
+    out.push_str(rest);
+    (out, tags)
+}
+
+/// Message body with `@number` tags replaced by the person's name. Tags of
+/// other people in groups open their profile; the account's own tag reads
+/// "@me" and does nothing.
+pub(super) fn message_text(message: &Message, size: f32) -> El {
+    let group = message.chat.ends_with("@g.us");
+    let (text, tags) = expand_mentions(&message.text, &message.mentions);
+    let spans = tags.iter().map(|(range, _)| range.clone()).collect();
+    let targets = tags
+        .into_iter()
+        .filter_map(|(range, index)| {
+            let mention = &message.mentions[index];
+            (group && !mention.me && !mention.name.is_empty())
+                .then(|| (range, format!("{MENTION_SCHEME}{}", mention.jid)))
+        })
+        .collect();
     let mentions = message.mentions.clone();
     rich_text(&text, size, spans, targets).on_link(move |s: &mut State, url, tx| {
         if let Some(jid) = url.strip_prefix(MENTION_SCHEME) {

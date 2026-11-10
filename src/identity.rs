@@ -149,10 +149,39 @@ impl Identities {
         mention.jid = jid;
     }
 
+    /// A quoted message keeps only its text, so identify `@number` tags by their
+    /// digits, which are the user part of the tagged person's address.
+    fn tagged_in(&self, text: &str) -> Vec<crate::model::Mention> {
+        let mut found = Vec::<crate::model::Mention>::new();
+        for part in text.split('@').skip(1) {
+            let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+            if digits.len() < 7 {
+                continue;
+            }
+            for server in ["lid", "s.whatsapp.net"] {
+                let mut mention = crate::model::Mention {
+                    jid: format!("{digits}@{server}"),
+                    ..Default::default()
+                };
+                self.mention(&mut mention);
+                if (mention.me || !mention.name.is_empty())
+                    && !found.iter().any(|m| m.jid == mention.jid)
+                {
+                    found.push(mention);
+                    break;
+                }
+            }
+        }
+        found
+    }
+
     pub(crate) fn message(&self, mut message: Message) -> Message {
         message.chat = self.canonical(&message.chat);
         for mention in &mut message.mentions {
             self.mention(mention);
+        }
+        if let Some(quote) = &mut message.quote {
+            quote.mentions = self.tagged_in(&quote.text);
         }
         if !message.from_me {
             let sender = self.canonical(&message.sender);
