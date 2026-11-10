@@ -834,5 +834,7 @@
   "Choose how long downloaded media stays on this device after you last opened it.": "Escolha por quanto tempo a mídia baixada fica neste dispositivo depois da última vez que você a abriu.",
   "Messages, chat history and their original data are always kept. Removed media is downloaded again when you open it, as long as WhatsApp or your phone still has it.": "Mensagens, histórico de conversas e seus dados originais são sempre mantidos. A mídia removida é baixada novamente quando você a abre, enquanto o WhatsApp ou seu celular ainda a tiver.",
   "Database {size} · {free} can be released": "Banco de dados {size} · {free} podem ser liberados",
-  "@me": "@eu"
+  "@me": "@eu",
+  "history": "Histórico original",
+  "other": "Outros dados (busca, índices)"
 }

@@ -125,8 +125,33 @@ fn staged(config: &Config) -> Result<Staged> {
     Ok(staged)
 }
 
+/// Downloaded installers pile up in the cache, roughly 100 MiB per release.
+/// Keep only the verified update that is still waiting to be installed.
+fn prune_downloads(folder: &Path, keep: Option<&std::ffi::OsStr>) {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    let suffix = format!("-{}", asset_name());
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let text = name.to_string_lossy();
+        if (text.ends_with(&suffix) || text.ends_with(".partial")) && Some(&*name) != keep {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 pub(crate) fn restored(config: &Config) -> UpdateState {
-    match staged(config) {
+    let folder = config.cache_dir().join("updates");
+    let current = staged(config);
+    prune_downloads(
+        &folder,
+        current
+            .as_ref()
+            .ok()
+            .and_then(|staged| staged.path.file_name()),
+    );
+    match current {
         Ok(staged) => UpdateState {
             status: "ready".into(),
             release_url: Some(format!(
@@ -254,6 +279,7 @@ fn check(config: &Config, download: bool, progress: impl Fn(UpdateState)) -> Res
         }
         outcome?;
     }
+    let target_name = target.file_name().map(std::ffi::OsStr::to_os_string);
     std::fs::write(
         folder.join("staged.json"),
         serde_json::to_vec(&Staged {
@@ -262,6 +288,7 @@ fn check(config: &Config, download: bool, progress: impl Fn(UpdateState)) -> Res
             sha256: expected,
         })?,
     )?;
+    prune_downloads(&folder, target_name.as_deref());
     state.status = "ready".into();
     state.downloaded = true;
     Ok(state)

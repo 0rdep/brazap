@@ -678,11 +678,13 @@ pub(super) fn view(s: &State) -> El {
                             .gap(12.0)
                             .child(title(super::locale::tr(kind), 13.0).grow(1.0))
                             .child(label(
-                                format!(
-                                    "{} · {}",
-                                    item["count"].as_u64().unwrap_or(0),
-                                    bytes(item["bytes"].as_u64().unwrap_or(0))
-                                ),
+                                match item["count"].as_u64().unwrap_or(0) {
+                                    0 => bytes(item["bytes"].as_u64().unwrap_or(0)),
+                                    count => format!(
+                                        "{count} · {}",
+                                        bytes(item["bytes"].as_u64().unwrap_or(0))
+                                    ),
+                                },
                                 12.0,
                                 MUTED,
                             )),
