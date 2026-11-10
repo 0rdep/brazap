@@ -58,6 +58,19 @@ can interact with WhatsApp, including reading and sending messages.
   supported by the pinned revision. Commit to SQLite before acknowledging
   successful persistence, and make replay idempotent using account-scoped message
   identities.
+- Keep message data reprocessable. `brazap_messages.encoded` (the raw message
+  protobuf) and the envelope in `metadata` are never discarded. `metadata` is
+  stored without unset (`null`) fields and without a copy of the message body;
+  new features that need body fields must read `encoded`, or call
+  `compaction::rehydrate_metadata`, and never depend on `metadata.message`.
+  Any storage reduction of message data must be lossless and verified per row.
+- Downloaded media follows the per-type retention settings (Settings → Storage;
+  defaults: videos 1 week, photos 1 month, stickers/audio/files never). Retention
+  is measured from the last open (`brazap_media_usage`), only removes media that
+  can be downloaded again from the retained message, skips locked chats and unsent
+  uploads, and never removes messages. Videos download when played, not on open.
+- Deleting rows does not shrink SQLite. `Archive::reclaim_space` rebuilds the file
+  once (enabling incremental auto-vacuum) and then trims freed pages.
 - Respect WhatsApp chat locks: exclude locked chats from browsing, search, media
   downloads, and automatic older-history requests. Keep already archived bytes
   without exposing them while the chat is locked.

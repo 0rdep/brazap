@@ -4,6 +4,7 @@ mod attachments;
 mod audio;
 mod background;
 mod calling;
+mod context_menu;
 mod details;
 mod diagnostics;
 mod fonts;
@@ -67,6 +68,9 @@ struct UiWake {
 }
 
 enum Command {
+    Deselect,
+    ManageChat(&'static str, Value),
+    CopyMedia(u64, Message),
     ReplyStatus(String, String, String, String),
     ViewStatus(String, String),
     NextAudio(u64, Message),
@@ -98,6 +102,7 @@ enum Command {
     Newer(String, MessageCursor, u64),
 }
 enum Event {
+    MediaCopied(u64, Result<rune::ClipboardContent, String>),
     StatusReplied(String, Result<Message, String>),
     NextAudio(u64, Result<Option<Message>, String>),
     Activate(Option<String>),
@@ -149,6 +154,10 @@ struct PairingQr {
 }
 
 pub(super) struct State {
+    context_menu: Option<context_menu::Open>,
+    delete_chat: Option<Chat>,
+    viewport: [f32; 2],
+    copy_generation: u64,
     story: Option<stories::Playback>,
     background: background::Background,
     config: Config,
@@ -289,6 +298,10 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
     let window = Arc::new(std::sync::Mutex::new(None));
     let window_created = window.clone();
     let mut state = State {
+        context_menu: None,
+        delete_chat: None,
+        viewport: [1180.0, 800.0],
+        copy_generation: 0,
         background: Default::default(),
         config: ui_config,
         preferences: Default::default(),
@@ -569,6 +582,24 @@ async fn worker(
         tokio::select! {
             command=commands.recv()=>{
                 match command {
+                    Some(Command::Deselect)=>{
+                        selected=None;viewing=None;snapshot_generation=snapshot_generation.wrapping_add(1);
+                        snapshot_retry_at=None;interval.reset_immediately();continue;
+                    }
+                    Some(Command::ManageChat(name,args))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=remote.call(name,args).await.map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Done(result));
+                        });continue;
+                    }
+                    Some(Command::CopyMedia(generation,message))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();let config=config.clone();
+                        assets.spawn(async move {
+                            let result=context_menu::prepare_copy(&remote,&config,message).await.map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::MediaCopied(generation,result));
+                        });continue;
+                    }
                     Some(Command::ReplyStatus(sender,id,text,message_id))=>{
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
                         assets.spawn(async move {
@@ -912,6 +943,18 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
     while let Ok(event) = state.rx.try_recv() {
         match event {
+            Event::MediaCopied(generation, result) => {
+                if generation == state.copy_generation {
+                    match result {
+                        Ok(content) => tx.copy_rich(content),
+                        Err(error) => {
+                            log::warn!("Could not copy media: {error}");
+                            state.error = Some("Could not copy media. Try again.".into());
+                        }
+                    }
+                    changed = true;
+                }
+            }
             Event::StatusReplied(id, result) => {
                 state.receive_status_reply(id, result);
                 changed = true;
@@ -1519,6 +1562,7 @@ fn receive_snapshot(state: &mut State, mut snapshot: Snapshot, tx: &mut Tx) -> b
                 state.timeline.clear();
                 state.history_focus = false;
                 state.history_generation = state.history_generation.wrapping_add(1);
+                state.stop_voice();
                 state.close_viewer();
                 state.details = false;
                 state.picker.open = false;
@@ -1734,7 +1778,28 @@ impl State {
         }
     }
 
+    fn is_current_chat(&self, chat: &str) -> bool {
+        self.section == Section::Messages
+            && !self.preferences.open
+            && self.story.is_none()
+            && self.selected.as_ref().is_some_and(|selected| {
+                selected == chat
+                    || self
+                        .snapshot
+                        .chats
+                        .iter()
+                        .any(|c| c.matches_jid(chat) && c.matches_jid(selected))
+            })
+    }
+
     fn select(&mut self, chat: String) {
+        self.select_chat(chat, false);
+    }
+
+    fn select_chat(&mut self, chat: String, force: bool) {
+        if !force && self.is_current_chat(&chat) {
+            return;
+        }
         let chat = self
             .snapshot
             .chats
@@ -1927,6 +1992,14 @@ fn message_enter(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
 }
 
 fn on_key(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
+    if event.key == rune::Key::Escape
+        && (s.context_menu.is_some() || s.delete_chat.is_some() || s.media_menu.is_some())
+    {
+        s.context_menu = None;
+        s.delete_chat = None;
+        s.media_menu = None;
+        return true;
+    }
     if s.story.is_some() {
         if s.story.as_ref().is_some_and(|story| story.reply.focused)
             && event.key != rune::Key::Escape
@@ -2105,7 +2178,7 @@ impl State {
     }
 
     fn jump(&mut self, hit: SearchHit) {
-        self.select(hit.message.chat.clone());
+        self.select_chat(hit.message.chat.clone(), true);
         self.history_focus = true;
         self.highlighted = Some(hit.message.id.clone());
         self.loading_older = true;
@@ -2173,6 +2246,28 @@ impl State {
         }
     }
 
+    /// Show the profile of someone tagged in a group message.
+    fn open_mention(&mut self, mention: &crate::model::Mention) {
+        let version = self
+            .avatar_versions
+            .get(&mention.jid)
+            .copied()
+            .unwrap_or_default();
+        self.request_asset(
+            format!("profile:{}:{version}", mention.jid),
+            AssetRequest::Profile {
+                jid: mention.jid.clone(),
+            },
+        );
+        self.contact = Some(Message {
+            sender: mention.jid.clone(),
+            sender_name: mention.name.clone(),
+            sender_phone: mention.phone.clone(),
+            sender_photo_version: version,
+            ..Default::default()
+        });
+    }
+
     fn request_avatar(&mut self, jid: &str, version: i64) {
         self.request_asset(
             media::avatar_key(jid, version),
@@ -2189,7 +2284,8 @@ impl State {
         }
         let mut prefetch = Vec::new();
         for m in &self.timeline {
-            if matches!(m.kind.as_str(), "image" | "video" | "sticker")
+            // Videos download when played; photos and stickers when a chat opens.
+            if matches!(m.kind.as_str(), "image" | "sticker")
                 && !m.has_media
                 && self
                     .prefetched
@@ -2242,7 +2338,8 @@ impl State {
 
     fn request_thumbnail(&mut self, m: &Message) {
         if matches!(m.kind.as_str(), "image" | "video" | "sticker") {
-            if !m.has_media
+            if m.kind != "video"
+                && !m.has_media
                 && self
                     .prefetched
                     .insert(format!("{}:{}:{}", m.chat, m.sender, m.id))
@@ -2336,7 +2433,7 @@ impl State {
         if self.history_focus
             && let Some(chat) = self.selected.clone()
         {
-            self.select(chat);
+            self.select_chat(chat, true);
         }
         self.detached = false;
         tx.scroll_to_bottom("messages");

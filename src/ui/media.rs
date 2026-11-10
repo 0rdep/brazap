@@ -200,6 +200,8 @@ pub(super) fn tile(s: &State, message: &Message, w: f32, h: f32, scope: &str) ->
                             "Preview unavailable"
                         } else if message.has_media {
                             "Loading preview…"
+                        } else if message.kind == "video" {
+                            "Play video"
                         } else {
                             "Downloading media…"
                         }),
@@ -257,34 +259,7 @@ pub(super) fn tile(s: &State, message: &Message, w: f32, h: f32, scope: &str) ->
 }
 
 pub(super) fn menu(s: &State) -> Vec<El> {
-    let Some((key, message)) = &s.media_menu else {
-        return Vec::new();
-    };
-    let download = message.clone();
-    let content = col().w(200.0).padding(6.0).gap(4.0).child(
-        label(super::locale::tr("Download media"), 12.0, INK)
-            .padding(12.0)
-            .radius(8.0)
-            .role("button")
-            .hover(rune::Color::WHITE.alpha(0.06))
-            .on_press_tx(move |s: &mut State, tx| {
-                s.media_menu = None;
-                save_file(s, tx, download.clone());
-            }),
-    );
-    vec![
-        el().absolute(0.0, 0.0)
-            .w_full()
-            .h_full()
-            .on_press(|s: &mut State| s.media_menu = None),
-        rune_kit::popover::anchored(
-            kit(),
-            rune_kit::popover::raised(kit(), content, 12.0),
-            &format!("options-{key}"),
-            rune_kit::Placement::BottomEnd,
-            6.0,
-        ),
-    ]
+    super::context_menu::menu(s)
 }
 
 pub(super) fn viewer(s: &State) -> Option<El> {

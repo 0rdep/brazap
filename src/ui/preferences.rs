@@ -27,6 +27,7 @@ pub(super) enum Page {
     Appearance,
     Notifications,
     Privacy,
+    Storage,
     Mcp,
     Debug,
     About,
@@ -37,6 +38,7 @@ impl Page {
             Self::Appearance => "Appearance",
             Self::Notifications => "Notifications",
             Self::Privacy => "Privacy",
+            Self::Storage => "Storage",
             Self::Mcp => "MCP",
             Self::Debug => "Debug",
             Self::About => "About",
@@ -149,7 +151,7 @@ impl State {
             self.preferences.privacy_pending = true;
             self.request_preference("privacy", json!({}));
         }
-        if page == Page::Debug {
+        if matches!(page, Page::Debug | Page::Storage) {
             self.request_preference("get", json!({}));
         }
     }
@@ -347,12 +349,37 @@ fn choice(name: &str, selected: bool, action: impl Fn(&mut State) + 'static) -> 
     .on_press(action)
 }
 
+fn retention_label(days: u32) -> &'static str {
+    match days {
+        0 => "Never delete",
+        1 => "1 day",
+        3 => "3 days",
+        7 => "1 week",
+        14 => "2 weeks",
+        30 => "1 month",
+        90 => "3 months",
+        _ => "Custom",
+    }
+}
+fn set_retention(settings: &mut Settings, kind: &str, days: u32) {
+    let retention = &mut settings.storage.retention;
+    match kind {
+        "Photos" => retention.photos = days,
+        "Videos" => retention.videos = days,
+        "Stickers" => retention.stickers = days,
+        "Audio" => retention.audio = days,
+        "Files" => retention.files = days,
+        _ => {}
+    }
+}
+
 pub(super) fn view(s: &State) -> El {
     let mut navigation = col().w(154.0).h_full().padding(16.0).gap(8.0);
     for page in [
         Page::Appearance,
         Page::Notifications,
         Page::Privacy,
+        Page::Storage,
         Page::Mcp,
         Page::Debug,
         Page::About,
@@ -567,6 +594,63 @@ pub(super) fn view(s: &State) -> El {
                     s.request_preference("privacy", json!({}));
                 },
             ));
+        }
+        Page::Storage => {
+            body = body.child(section(
+                "Storage",
+                "Choose how long downloaded media stays on this device after you last opened it.",
+            ));
+            let retention = &p.storage.retention;
+            for (name, days) in [
+                ("Photos", retention.photos),
+                ("Videos", retention.videos),
+                ("Stickers", retention.stickers),
+                ("Audio", retention.audio),
+                ("Files", retention.files),
+            ] {
+                let mut options = row().gap(8.0).flex_wrap();
+                for option in crate::settings::RETENTION_CHOICES {
+                    options =
+                        options.child(choice(retention_label(option), days == option, move |s| {
+                            s.edit_preferences(move |p| set_retention(p, name, option))
+                        }));
+                }
+                body = body.child(card(
+                    col()
+                        .gap(10.0)
+                        .child(title(super::locale::tr(name), 13.0))
+                        .child(options),
+                ));
+            }
+            body = body.child(
+                label(
+                    super::locale::tr("Messages, chat history and their original data are always kept. Removed media is downloaded again when you open it, as long as WhatsApp or your phone still has it."),
+                    11.0,
+                    MUTED,
+                )
+                .wrap(),
+            );
+            let report = &s.preferences.report;
+            body = body.child(
+                label(
+                    super::locale::format(
+                        "Database {size} · {free} can be released",
+                        &[
+                            (
+                                "size",
+                                bytes(report["database_bytes"].as_u64().unwrap_or(0)),
+                            ),
+                            (
+                                "free",
+                                bytes(report["reclaimable_bytes"].as_u64().unwrap_or(0)),
+                            ),
+                        ],
+                    ),
+                    11.0,
+                    MUTED,
+                )
+                .wrap(),
+            );
         }
         Page::Mcp => {
             body = super::mcp::view(s, body);

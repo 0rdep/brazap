@@ -11,6 +11,7 @@ pub struct Settings {
     pub notifications: NotificationSettings,
     pub privacy: PrivacySettings,
     pub appearance: AppearanceSettings,
+    pub storage: StorageSettings,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -18,7 +19,50 @@ impl Default for Settings {
             notifications: Default::default(),
             privacy: Default::default(),
             appearance: Default::default(),
+            storage: Default::default(),
         }
+    }
+}
+/// Retention choices in days; `0` keeps downloaded media forever.
+pub const RETENTION_CHOICES: [u32; 7] = [1, 3, 7, 14, 30, 90, 0];
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StorageSettings {
+    pub retention: RetentionSettings,
+}
+/// How long downloaded media stays on this device after it was last opened.
+/// Messages and their raw data are never removed; removed media is downloaded
+/// again when opened, while WhatsApp (or the phone) still has it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetentionSettings {
+    pub photos: u32,
+    pub videos: u32,
+    pub stickers: u32,
+    pub audio: u32,
+    pub files: u32,
+}
+impl Default for RetentionSettings {
+    fn default() -> Self {
+        Self {
+            photos: 30,
+            videos: 7,
+            stickers: 0,
+            audio: 0,
+            files: 0,
+        }
+    }
+}
+impl RetentionSettings {
+    /// Message kinds (as stored in `payload.kind`) with their retention in days.
+    pub fn by_kind(&self) -> [(&'static str, u32); 5] {
+        [
+            ("image", self.photos),
+            ("video", self.videos),
+            ("sticker", self.stickers),
+            ("audio", self.audio),
+            ("file", self.files),
+        ]
     }
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -86,6 +130,12 @@ impl Settings {
             ["en", "pt-BR", "es"].contains(&self.appearance.language.as_str()),
             "Unsupported language"
         );
+        for (_, days) in self.storage.retention.by_kind() {
+            ensure!(
+                RETENTION_CHOICES.contains(&days),
+                "Unsupported media retention"
+            );
+        }
         Ok(())
     }
 }

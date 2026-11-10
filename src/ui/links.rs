@@ -3,14 +3,85 @@ use crate::{assets::AssetRequest, model::Message};
 use rune::{El, Link, Span, SurfaceFit, col, el};
 
 pub(super) fn text(value: &str, size: f32) -> El {
-    let ranges = crate::links::detect(value);
-    let mut body = label(value, size, INK).wrap().selectable(true).spans(
-        ranges
+    rich_text(value, size, Vec::new(), Vec::new())
+}
+
+const MENTION_SCHEME: &str = "brazap-mention:";
+
+/// Message body with `@number` tags replaced by the person's name. Tags of
+/// other people in groups open their profile; the account's own tag reads
+/// "@me" and does nothing.
+pub(super) fn message_text(message: &Message, size: f32) -> El {
+    let group = message.chat.ends_with("@g.us");
+    let mut text = String::with_capacity(message.text.len());
+    let mut spans = Vec::new();
+    let mut targets = Vec::new();
+    let mut rest = message.text.as_str();
+    while let Some(at) = rest.find('@') {
+        text.push_str(&rest[..at]);
+        rest = &rest[at..];
+        // Longest tag first so `@1234` never swallows part of `@12345`.
+        let found = message
+            .mentions
             .iter()
-            .map(|(range, _)| Span::new(range.start, range.end).color(MINT))
-            .collect::<Vec<_>>(),
+            .filter_map(|m| {
+                let token = m.token();
+                let tail = rest.get(token.len()..)?;
+                (rest.starts_with(&token) && !tail.starts_with(|c: char| c.is_alphanumeric()))
+                    .then_some((m, token.len()))
+            })
+            .max_by_key(|(_, len)| *len);
+        let Some((mention, len)) = found else {
+            text.push('@');
+            rest = &rest[1..];
+            continue;
+        };
+        let shown = if mention.me {
+            super::locale::tr("@me")
+        } else if mention.name.is_empty() {
+            rest[..len].to_owned()
+        } else {
+            format!("@{}", mention.name.trim_start_matches('@'))
+        };
+        let range = text.len()..text.len() + shown.len();
+        spans.push(range.clone());
+        if group && !mention.me && !mention.name.is_empty() {
+            targets.push((range, format!("{MENTION_SCHEME}{}", mention.jid)));
+        }
+        text.push_str(&shown);
+        rest = &rest[len..];
+    }
+    text.push_str(rest);
+    let mentions = message.mentions.clone();
+    rich_text(&text, size, spans, targets).on_link(move |s: &mut State, url, tx| {
+        if let Some(jid) = url.strip_prefix(MENTION_SCHEME) {
+            if let Some(mention) = mentions.iter().find(|m| m.jid == jid) {
+                s.open_mention(mention);
+            }
+        } else if let Err(error) = tx.open_url(url) {
+            s.error = Some(error.to_string());
+        }
+    })
+}
+
+fn rich_text(
+    value: &str,
+    size: f32,
+    highlights: Vec<std::ops::Range<usize>>,
+    mut targets: Vec<(std::ops::Range<usize>, String)>,
+) -> El {
+    let urls = crate::links::detect(value);
+    let mut spans = highlights
+        .iter()
+        .map(|range| Span::new(range.start, range.end).color(MINT))
+        .collect::<Vec<_>>();
+    spans.extend(
+        urls.iter()
+            .map(|(range, _)| Span::new(range.start, range.end).color(MINT)),
     );
-    for (range, url) in ranges {
+    targets.extend(urls);
+    let mut body = label(value, size, INK).wrap().selectable(true).spans(spans);
+    for (range, url) in targets {
         body = body.link(Link::new(range, url));
     }
     body.on_link(|s: &mut State, url, tx| {

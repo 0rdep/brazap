@@ -26,14 +26,15 @@
 | | What you can do |
 | --- | --- |
 | **Native desktop** | Dark surfaces, smooth transitions, a resizable sidebar and a compact navigation rail. Built with [Rune](https://github.com/anomalyco/rune). |
-| **Conversations** | Personal and group chats, quoted replies, emoji reactions, multi-message forwarding, delivery/read indicators and day separators. |
+| **Conversations** | Personal and group chats, quoted replies, tagged people with clickable profiles in groups, emoji reactions, multi-message forwarding, delivery/read indicators and day separators. |
 | **Links** | Click URLs to open your default browser. Preview cards show titles, descriptions and thumbnails supplied with WhatsApp messages. |
 | **Status** | A dedicated Status tab with a story viewer, private text and emoji replies, automatic progression, pause and previous/next controls. Unread statuses add a clickable ring to chat avatars. Viewed state is stored locally and status updates disappear from browsing after 24 hours. |
-| **Media** | Inline image previews, video playback, voice recording with pause, resume, local preview, waveform and timer, voice-note playback speed, clipboard image/file pasting with previews and emoji captions, files and animated WebP stickers. |
+| **Media** | Inline image previews, video playback, voice recording with pause, resume, local preview, waveform and timer, voice-note playback speed, clipboard image/file pasting with previews and emoji captions, files and animated WebP stickers. Right-click messages to copy text, images, or audio/video files. |
 | **Calls** | One-to-one voice and video calls, incoming-call controls, microphone mute, camera toggle and a floating call panel. [Calling details](docs/CALLING.md). |
 | **Find anything** | Search chat names, phone numbers, filenames and message contents. Jump directly to a matching message. |
-| **Make it yours** | Pin, mute and archive chats. Choose fonts, text size and English, Brazilian Portuguese or Spanish. |
+| **Make it yours** | Right-click chats to pin, mute, archive, mark read/unread or delete, with changes synced to WhatsApp. Pinned and muted chats have sidebar indicators. Choose fonts, text size and English, Brazilian Portuguese or Spanish. |
 | **Local archive** | SQLite stores session state, messages, contacts and original attachment bytes. Browse saved conversations offline. |
+| **Storage control** | Keep downloaded photos, videos, stickers, audio and files for as long as you choose (Settings → Storage). Messages and their original data are always kept, and removed media is downloaded again when opened. The database is compacted losslessly and trimmed automatically. |
 | **Your AI tools** | Let local MCP clients search conversations, read messages, send replies, react, forward and share attachments through the same app session. |
 | **Privacy controls** | Control read receipts, typing indicators, notifications and supported WhatsApp privacy settings. Optionally retain content when a sender deletes a message. |
 | **Windows integration** | Native notifications with message previews and sound. Clicking a notification opens the conversation. |

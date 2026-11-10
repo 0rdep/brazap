@@ -205,7 +205,7 @@ impl Archive {
 
     pub async fn rebuild_projections(&self) -> Result<()> {
         if self
-            .preference("message_projection_v6".into())
+            .preference("message_projection_v7".into())
             .await?
             .is_some()
         {
@@ -263,7 +263,7 @@ impl Archive {
                 }).map_err(db_error)
             }).await?;
         }
-        self.set_preference("message_projection_v6".into(), "1".into())
+        self.set_preference("message_projection_v7".into(), "1".into())
             .await
     }
 

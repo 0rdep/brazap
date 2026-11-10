@@ -154,6 +154,9 @@ impl Service {
         if let Err(error) = self.archive.restore_chat_settings().await {
             log::warn!("Could not restore chat settings: {error}");
         }
+        if let Err(error) = self.archive.restore_contact_names().await {
+            log::warn!("Could not restore contact names: {error}");
+        }
         if let Err(error) = self.archive.backfill_calls().await {
             log::warn!("Could not restore cached call history: {error}");
         }
@@ -170,6 +173,7 @@ impl Service {
             log::warn!("Could not restore deletion markers: {error}");
         }
         self.spawn_history_prefetch();
+        self.spawn_storage_maintenance();
         loop {
             if self.stopping.load(Ordering::Relaxed) {
                 break;
@@ -475,6 +479,25 @@ impl Service {
                                 service.changed();
                             }
                             drop(current);
+                            if service
+                                .archive
+                                .preference("phone_contacts_synced_v1".into())
+                                .await
+                                .ok()
+                                .flatten()
+                                .is_none()
+                            {
+                                match ready_client.resync_app_state(
+                                    [whatsapp_rust::wacore::appstate::patch_decode::WAPatchName::CriticalUnblockLow],
+                                    whatsapp_rust::AppStateResyncMode::Snapshot,
+                                ).await {
+                                    Ok(report) if report.all_synced() => {
+                                        if let Err(error) = service.archive.set_preference("phone_contacts_synced_v1".into(),"1".into()).await { log::warn!("Could not save contact sync coverage: {error}"); }
+                                        service.changed();
+                                    }
+                                    result => log::debug!("Phone contact snapshot not ready: {result:?}"),
+                                }
+                            }
                             service.flush_read_sync().await;
                             if let Err(error) = service.refresh_chat_names().await {
                                 log::debug!("Chat names refresh: {error}");
@@ -805,6 +828,19 @@ impl Service {
                     )
                     .await?;
             }
+            Event::DeleteChatUpdate(update) => {
+                let chat = update.jid.to_string();
+                let through = match update
+                    .action
+                    .message_range
+                    .as_option()
+                    .and_then(|r| r.last_message_timestamp)
+                {
+                    Some(timestamp) => timestamp,
+                    None => self.archive.chat_boundary(&chat).await?,
+                };
+                self.archive.delete_chat_through(&chat, through).await?;
+            }
             Event::ContactUpdate(contact) => {
                 let name = contact
                     .action
@@ -1020,6 +1056,13 @@ impl Service {
             None => Vec::new(),
         };
         let all_chats = self.archive.chats().await?;
+        let selected_chat =
+            selected_chat.filter(|jid| all_chats.iter().any(|c| c.matches_jid(jid)));
+        let messages = if selected_chat.is_some() {
+            messages
+        } else {
+            Vec::new()
+        };
         let current_chat = selected_chat
             .as_ref()
             .and_then(|jid| all_chats.iter().find(|c| &c.jid == jid).cloned());
@@ -1357,7 +1400,8 @@ impl Service {
                         String::new(),
                         String::new(),
                     );
-                    if matches!(row.view.kind.as_str(), "image" | "video" | "sticker") {
+                    // Videos are large; they download when played, not when a chat opens.
+                    if matches!(row.view.kind.as_str(), "image" | "sticker") {
                         service.queue_media(row.view, proto);
                     }
                 }

@@ -488,6 +488,20 @@ fn chat_row(s: &State, chat: &Chat) -> El {
         .min_w(0.0)
         .truncate(),
     );
+    if chat.pinned {
+        preview = preview.child(
+            icon(&super::context_menu::PIN, 13.0)
+                .color(MUTED)
+                .help(super::locale::tr("Pinned chat")),
+        );
+    }
+    if chat.muted {
+        preview = preview.child(
+            icon(&super::context_menu::MUTE, 13.0)
+                .color(MUTED)
+                .help(super::locale::tr("Muted notifications")),
+        );
+    }
     if chat.unread > 0 {
         preview = preview.child(
             el().min_w(17.0)
@@ -507,7 +521,9 @@ fn chat_row(s: &State, chat: &Chat) -> El {
                 )),
         );
     }
+    let context = chat.clone();
     row()
+        .key(format!("chat-row-{}", chat.jid))
         .w_full()
         .h(super::locale::scale(76.0))
         .min_h(super::locale::scale(76.0))
@@ -524,7 +540,11 @@ fn chat_row(s: &State, chat: &Chat) -> El {
         .hover(Color::WHITE.alpha(0.035))
         .role("button")
         .label(&chat.name)
+        .on_secondary_press(move |s: &mut State, p, _| s.chat_menu(context.clone(), p))
         .on_press_tx(move |s: &mut State, tx| {
+            if s.is_current_chat(&jid) {
+                return;
+            }
             s.select(jid.clone());
             tx.instant();
             tx.scroll_to_bottom_instant("messages");

@@ -35,6 +35,64 @@ struct HistoryRow {
 }
 
 impl Archive {
+    pub(crate) async fn restore_contact_names(&self) -> Result<()> {
+        if self.preference("contact_names_v1".into()).await?.is_some() {
+            return Ok(());
+        }
+        let mut cursor = 0;
+        loop {
+            let account = self.account as i64;
+            let rows:Vec<EventRow>=self.backend.shared().read(move |conn| {
+                diesel::sql_query("SELECT rowid AS cursor,payload FROM brazap_events WHERE account=? AND rowid>? AND kind IN ('ContactUpdate','ContactRemoved') ORDER BY rowid LIMIT 256")
+                    .bind::<BigInt,_>(account).bind::<BigInt,_>(cursor).load(conn).map_err(db_error)
+            }).await?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                cursor = row.cursor;
+                let value: serde_json::Value = serde_json::from_str(&row.payload)?;
+                if let Some(contact) = value.get("ContactUpdate")
+                    && let Some(jid) = contact["jid"].as_str()
+                {
+                    let name = contact["action"]["full_name"]
+                        .as_str()
+                        .filter(|n| !n.trim().is_empty())
+                        .or_else(|| contact["action"]["first_name"].as_str())
+                        .unwrap_or("");
+                    self.contact(
+                        jid.into(),
+                        name.into(),
+                        serde_json::to_string(contact)?,
+                        true,
+                    )
+                    .await?;
+                }
+                if let Some(contact) = value.get("ContactRemoved")
+                    && let Some(jid) = contact["jid"].as_str()
+                {
+                    let account = self.account as i64;
+                    let jid = jid.to_owned();
+                    self.backend
+                        .shared()
+                        .run(move |conn| {
+                            diesel::sql_query(
+                                "DELETE FROM brazap_saved_contacts WHERE account=? AND jid=?",
+                            )
+                            .bind::<BigInt, _>(account)
+                            .bind::<Text, _>(jid)
+                            .execute(conn)
+                            .map_err(db_error)?;
+                            Ok(())
+                        })
+                        .await?;
+                }
+            }
+        }
+        self.set_preference("contact_names_v1".into(), "1".into())
+            .await
+    }
+
     pub async fn set_chat_action(
         &self,
         jid: String,
@@ -242,6 +300,7 @@ impl Archive {
 
 impl crate::service::Service {
     pub async fn chat_action(&self, chat: String, action: ChatAction, enabled: bool) -> Result<()> {
+        self.archive.allow_chat(&chat).await?;
         let jid = chat.parse::<whatsapp_rust::Jid>()?;
         if self.config.demo {
             self.archive

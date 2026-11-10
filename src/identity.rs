@@ -18,6 +18,7 @@ pub(crate) struct Identities {
     saved_names: HashMap<String, String>,
     known_names: HashMap<String, String>,
     locked: HashSet<String>,
+    own: HashSet<String>,
 }
 #[derive(QueryableByName)]
 struct Mapping {
@@ -129,8 +130,30 @@ impl Identities {
         display_identity(&jid, name, &phone)
     }
 
+    pub(crate) fn mention(&self, mention: &mut crate::model::Mention) {
+        let jid = self.canonical(&mention.jid);
+        mention.me = self.own.contains(&jid);
+        let named = self
+            .saved_names
+            .get(&jid)
+            .or_else(|| self.known_names.get(&jid))
+            .is_some();
+        let (name, phone) = self.person(&jid, "");
+        // Without a name or number there is nothing better than the raw tag.
+        mention.name = if named || !phone.is_empty() {
+            name
+        } else {
+            String::new()
+        };
+        mention.phone = phone;
+        mention.jid = jid;
+    }
+
     pub(crate) fn message(&self, mut message: Message) -> Message {
         message.chat = self.canonical(&message.chat);
+        for mention in &mut message.mentions {
+            self.mention(mention);
+        }
         if !message.from_me {
             let sender = self.canonical(&message.sender);
             if let Some(name) = self.saved_names.get(&sender) {
@@ -335,6 +358,8 @@ impl Archive {
                 identities.locked.remove(&jid);
             }
         }
+        let own = self.own_jids().await?;
+        identities.own = own.iter().map(|jid| identities.canonical(jid)).collect();
         for contact in names {
             if meaningful_name(&contact.jid, &contact.name) {
                 let jid = identities.canonical(&contact.jid);
@@ -343,7 +368,7 @@ impl Archive {
         }
         for contact in saved {
             let jid = identities.canonical(&contact.jid);
-            if meaningful_name(&jid, &contact.name) {
+            if meaningful_name(&contact.jid, &contact.name) {
                 identities.saved_names.insert(jid, contact.name);
             }
         }

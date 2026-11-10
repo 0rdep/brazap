@@ -7,10 +7,7 @@ use diesel::{
 };
 use whatsapp_rust::{prelude::wa, waproto::buffa::Message as ProtoMessage};
 
-use crate::{
-    model::Call,
-    storage::{Archive, display_identity},
-};
+use crate::{model::Call, storage::Archive};
 
 fn db_error(error: diesel::result::Error) -> whatsapp_rust::store::error::StoreError {
     whatsapp_rust::store::error::StoreError::Database(Box::new(error))
@@ -22,8 +19,6 @@ struct CallRow {
     payload: String,
     #[diesel(sql_type=Text)]
     name: String,
-    #[diesel(sql_type=Text)]
-    phone: String,
     #[diesel(sql_type=BigInt)]
     photo_version: i64,
 }
@@ -133,7 +128,7 @@ impl Archive {
             .into_iter()
             .map(|row| {
                 let mut call: Call = serde_json::from_str(&row.payload)?;
-                call.name = display_identity(&call.peer, &row.name, &row.phone).0;
+                call.name = identities.person(&call.peer, &row.name).0;
                 call.photo_version = row.photo_version;
                 Ok(call)
             })

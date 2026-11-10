@@ -308,6 +308,7 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
     };
     let mut root = el()
         .key("brazap-window")
+        .on_layout(|s: &mut State, b| s.viewport = [b[2], b[3]])
         .w_full()
         .h_full()
         .fill(Color {
@@ -371,6 +372,9 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
         layer.push(diagnostics);
     }
     if let Some(confirm) = super::preferences::confirmation(s) {
+        layer.push(confirm);
+    }
+    if let Some(confirm) = super::context_menu::confirmation(s) {
         layer.push(confirm);
     }
     if let Some((modal, above)) = super::attachments::modal(s) {
@@ -869,6 +873,7 @@ fn row_day(timestamp: i64) -> El {
 }
 
 fn message_bubble(s: &State, message: &Message) -> El {
+    let context = message.clone();
     let mine = message.from_me;
     let actions = if s.forwarding.is_some() { 37.0 } else { 113.0 };
     let avatar = if !mine && message.chat.ends_with("@g.us") {
@@ -878,6 +883,7 @@ fn message_bubble(s: &State, message: &Message) -> El {
     };
     let width = (s.chat_bounds[2] - 48.0 - actions - avatar).clamp(120.0, 480.0);
     let mut bubble = col()
+        .on_secondary_press(move |s: &mut State, p, _| s.message_menu(context.clone(), p))
         .key(format!("message-{}-{}", message.sender, message.id))
         .max_w(width)
         .padding(13.0)
@@ -1002,8 +1008,6 @@ fn message_bubble(s: &State, message: &Message) -> El {
                         .child(detail),
                 ),
         );
-    } else if !message.text.is_empty() {
-        bubble = bubble.child(super::links::text(&message.text, 14.0));
     }
     if matches!(message.kind.as_str(), "image" | "video" | "sticker") {
         bubble = bubble.child(media::thumbnail(s, message));
@@ -1048,6 +1052,14 @@ fn message_bubble(s: &State, message: &Message) -> El {
                         ))
                         .child(label(super::locale::tr("Click to save"), 10.0, MUTED)),
                 ),
+        );
+    }
+    // Text follows the attachment, so captions sit under their media.
+    if !message.is_call() && !message.text.is_empty() {
+        let context = message.clone();
+        bubble = bubble.child(
+            super::links::message_text(message, 14.0)
+                .on_secondary_press(move |s: &mut State, p, _| s.message_menu(context.clone(), p)),
         );
     }
     if !message.footer.is_empty() && !message.is_call() {

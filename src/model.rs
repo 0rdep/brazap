@@ -149,6 +149,33 @@ pub struct Message {
     pub duration_seconds: Option<u32>,
     #[serde(default)]
     pub waveform: Vec<u8>,
+    /// People tagged with `@number` in the text. Only `jid` is stored; the
+    /// display fields are filled from current contacts when a message is loaded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<Mention>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Mention {
+    pub jid: String,
+    /// Contact name or phone number; empty when the person cannot be identified.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub phone: String,
+    /// The connected WhatsApp account itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub me: bool,
+}
+
+impl Mention {
+    /// The `@…` text WhatsApp puts in the message body for this person.
+    pub fn token(&self) -> String {
+        format!(
+            "@{}",
+            self.jid.split(['@', ':']).next().unwrap_or(&self.jid)
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

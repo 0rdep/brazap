@@ -71,6 +71,14 @@ pub struct BytesRow {
 }
 
 #[derive(QueryableByName)]
+struct MediaRow {
+    #[diesel(sql_type = Binary)]
+    data: Vec<u8>,
+    #[diesel(sql_type = BigInt)]
+    accessed_at: i64,
+}
+
+#[derive(QueryableByName)]
 pub struct RecoveryRow {
     #[diesel(sql_type = Text)]
     pub chat: String,
@@ -133,6 +141,10 @@ impl Archive {
                 conn.batch_execute(include_str!("../migrations/017_search_index.sql"))
                     .map_err(db_error)?;
                 conn.batch_execute(include_str!("../migrations/018_status_views.sql"))
+                    .map_err(db_error)?;
+                conn.batch_execute(include_str!("../migrations/019_deleted_chats.sql"))
+                    .map_err(db_error)?;
+                conn.batch_execute(include_str!("../migrations/020_media_retention.sql"))
                     .map_err(db_error)
             })
             .await?;
@@ -159,6 +171,17 @@ impl Archive {
             conn.transaction::<_, diesel::result::Error, _>(|conn| {
                 for (row,aliases,senders) in rows {
                     let m = row.view;
+                    let fresh_outgoing=m.from_me && m.status=="sending" && row.metadata=="{}";
+                    let deleted:CountRow=diesel::sql_query("SELECT (EXISTS(SELECT 1 FROM brazap_deleted_message_ids WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND sender IN (SELECT value FROM json_each(?)) AND id=?) OR (?=0 AND EXISTS(SELECT 1 FROM brazap_deleted_chats WHERE account=? AND jid IN (SELECT value FROM json_each(?)) AND (through_timestamp>? OR (?=0 AND through_timestamp=?))))) AS count")
+                        .bind::<BigInt,_>(account as i64).bind::<Text,_>(&aliases).bind::<Text,_>(&senders).bind::<Text,_>(&m.id)
+                        .bind::<BigInt,_>(i64::from(fresh_outgoing)).bind::<BigInt,_>(account as i64).bind::<Text,_>(&aliases)
+                        .bind::<BigInt,_>(m.timestamp).bind::<BigInt,_>(i64::from(live)).bind::<BigInt,_>(m.timestamp).get_result(conn)?;
+                    if deleted.count>0 {
+                        if fresh_outgoing {
+                            return Err(diesel::result::Error::QueryBuilderError(Box::new(std::io::Error::other("This message was deleted"))));
+                        }
+                        continue;
+                    }
                     crate::stickers::index(conn, account as i64, &m, &row.encoded)?;
                     store_deletion(conn, account as i64, &m.chat, m.timestamp, &row.encoded)?;
                     let payload = message_payload(&m).map_err(|error| diesel::result::Error::SerializationError(Box::new(error)))?;
@@ -204,10 +227,11 @@ impl Archive {
                     .map_err(db_error)
             })
             .await?;
-        Ok(self
+        let chats = self
             .identities()
             .await?
-            .chats(chats, self.alias_settings().await?))
+            .chats(chats, self.alias_settings().await?);
+        self.filter_deleted_chats(chats).await
     }
 
     pub async fn messages(
@@ -326,6 +350,10 @@ impl Archive {
             diesel::sql_query("INSERT INTO brazap_media(account,chat,sender,id,data) VALUES(?,?,?,?,?) ON CONFLICT(account,chat,sender,id) DO UPDATE SET data=excluded.data")
                 .bind::<BigInt,_>(account).bind::<Text,_>(&chat).bind::<Text,_>(&sender)
                 .bind::<Text,_>(&id).bind::<Binary,_>(bytes).execute(conn).map_err(db_error)?;
+            let now = chrono::Utc::now().timestamp_millis();
+            diesel::sql_query("INSERT INTO brazap_media_usage(account,chat,sender,id,stored_at,accessed_at) VALUES(?,?,?,?,?,?) ON CONFLICT(account,chat,sender,id) DO UPDATE SET accessed_at=excluded.accessed_at")
+                .bind::<BigInt,_>(account).bind::<Text,_>(&chat).bind::<Text,_>(&sender)
+                .bind::<Text,_>(&id).bind::<BigInt,_>(now).bind::<BigInt,_>(now).execute(conn).map_err(db_error)?;
             diesel::sql_query("UPDATE brazap_assets SET expires_at=0 WHERE account=? AND key=?")
                 .bind::<BigInt,_>(account).bind::<Text,_>(format!("thumb:{chat}:{sender}:{id}")).execute(conn).map_err(db_error)?;
             for alias in serde_json::from_str::<Vec<String>>(&aliases).unwrap_or_default() {
@@ -345,12 +373,24 @@ impl Archive {
         let identities = self.identities().await?;
         let chat = identities.aliases_json(&chat);
         let sender = identities.aliases_json(&sender);
-        let row: Option<BytesRow> = self.backend.shared().read(move |conn| {
-            diesel::sql_query("SELECT data FROM brazap_media WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND sender IN (SELECT value FROM json_each(?)) AND id=? LIMIT 1")
+        let (usage_chat, usage_sender, usage_id) = (chat.clone(), sender.clone(), id.clone());
+        let row: Option<MediaRow> = self.backend.shared().read(move |conn| {
+            diesel::sql_query("SELECT b.data AS data,COALESCE(u.accessed_at,0) AS accessed_at FROM brazap_media b LEFT JOIN brazap_media_usage u ON u.account=b.account AND u.chat=b.chat AND u.sender=b.sender AND u.id=b.id WHERE b.account=? AND b.chat IN (SELECT value FROM json_each(?)) AND b.sender IN (SELECT value FROM json_each(?)) AND b.id=? LIMIT 1")
                 .bind::<BigInt,_>(account).bind::<Text,_>(chat).bind::<Text,_>(sender)
                 .bind::<Text,_>(id).get_result(conn).optional().map_err(db_error)
         }).await?;
-        Ok(row.map(|r| r.data))
+        let Some(row) = row else { return Ok(None) };
+        // Opening media restarts its retention clock; write at most once a day.
+        let now = chrono::Utc::now().timestamp_millis();
+        if now - row.accessed_at >= crate::retention::TOUCH_INTERVAL_MS {
+            self.backend.shared().run(move |conn| {
+                diesel::sql_query("UPDATE brazap_media_usage SET accessed_at=? WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND sender IN (SELECT value FROM json_each(?)) AND id=?")
+                    .bind::<BigInt,_>(now).bind::<BigInt,_>(account).bind::<Text,_>(usage_chat)
+                    .bind::<Text,_>(usage_sender).bind::<Text,_>(usage_id).execute(conn).map_err(db_error)?;
+                Ok(())
+            }).await?;
+        }
+        Ok(Some(row.data))
     }
 
     pub async fn raw_message(
@@ -437,10 +477,18 @@ pub(crate) fn meaningful_name(jid: &str, name: &str) -> bool {
     {
         return false;
     }
-    let bare = jid
-        .parse::<whatsapp_rust::Jid>()
-        .ok()
-        .is_some_and(|jid| name == jid.user());
+    let bare = jid.parse::<whatsapp_rust::Jid>().ok().is_some_and(|jid| {
+        let phone_like = name
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '(' | ')' | ' '));
+        name == jid.user()
+            || (phone_like
+                && name
+                    .chars()
+                    .filter(char::is_ascii_digit)
+                    .collect::<String>()
+                    == jid.user())
+    });
     name != jid && !bare && name.parse::<whatsapp_rust::Jid>().is_err()
 }
 
@@ -515,6 +563,9 @@ pub fn project_message(
     if !view.is_call() {
         crate::content::project_call_stub(&mut view, &metadata);
     }
+    // Store the envelope without unset fields or a second copy of the body;
+    // the raw message stays in `encoded` (see compaction::rehydrate_metadata).
+    let metadata = crate::compaction::compact_metadata(&metadata, message).0;
     StoredMessage {
         view,
         encoded: message.encode_to_vec(),

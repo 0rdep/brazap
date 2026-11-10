@@ -213,6 +213,14 @@ pub fn project(view: &mut Message, message: &wa::Message) {
     }
     if let Some(context) = base.context_info() {
         view.forwarded = context.is_forwarded.unwrap_or(false);
+        for jid in &context.mentioned_jid {
+            if !jid.is_empty() && !view.mentions.iter().any(|m| &m.jid == jid) {
+                view.mentions.push(crate::model::Mention {
+                    jid: jid.clone(),
+                    ..Default::default()
+                });
+            }
+        }
         if let (Some(id), Some(quoted)) = (&context.stanza_id, context.quoted_message.as_option()) {
             let quoted = quoted.get_base_message();
             let text = quoted

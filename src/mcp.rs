@@ -49,6 +49,14 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
             Ok(json!({"phase":snapshot.connection.phase,"notice":snapshot.connection.notice}))
         }
         "list_chats" => Ok(json!({"chats":service.archive.chats().await?})),
+        "delete_chat" => service
+            .delete_chat(text_arg(&args, "chat")?.into())
+            .await
+            .map(|_| json!({"deleted":true})),
+        "mark_unread" => service
+            .mark_chat_unread(text_arg(&args, "chat")?.into())
+            .await
+            .map(|_| json!({"updated":true})),
         "list_statuses" => Ok(json!({"statuses":service.archive.statuses().await?})),
         "reply_status" => Ok(
             json!({"message":service.reply_status(text_arg(&args,"sender")?.into(),text_arg(&args,"id")?.into(),text_arg(&args,"text")?.into(),args["message_id"].as_str().map(str::to_owned).unwrap_or_else(crate::outbox::new_id)).await?}),
@@ -294,6 +302,20 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
 
 pub(crate) fn tools() -> Value {
     let definitions = [
+        (
+            "delete_chat",
+            "Delete a chat and its local messages and sync the action to linked devices.",
+            json!({"chat":{"type":"string"}}),
+            vec!["chat"],
+            false,
+        ),
+        (
+            "mark_unread",
+            "Mark a chat unread on linked devices.",
+            json!({"chat":{"type":"string"}}),
+            vec!["chat"],
+            false,
+        ),
         (
             "reply_status",
             "Reply privately to a status, quoting the original update in the author's chat.",

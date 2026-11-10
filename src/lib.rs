@@ -2,7 +2,9 @@ pub mod assets;
 pub mod calling;
 pub mod calls;
 pub mod chat;
+pub(crate) mod chat_management;
 pub(crate) mod chat_sync_policy;
+pub mod compaction;
 pub mod config;
 pub mod content;
 pub(crate) mod demo;
@@ -24,6 +26,7 @@ pub(crate) mod playback;
 pub(crate) mod read_state;
 #[cfg(feature = "desktop")]
 pub(crate) mod recording;
+pub mod retention;
 pub mod search;
 pub mod service;
 pub mod settings;
