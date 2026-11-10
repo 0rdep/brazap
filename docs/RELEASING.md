@@ -22,6 +22,11 @@ uploads their executables, license notices and `checksums.sha256` together.
 A tag/package mismatch fails before building. Pre-release tags produce GitHub
 pre-releases and do not replace the latest stable release.
 
+Pushing dependency, patch, script or workflow changes to `main` runs the same
+builds without publishing, which saves the Rust dependency cache. A tag can only
+restore caches saved by `main` (or by that same tag), so release builds reuse the
+cache from the previous `main` build instead of compiling every dependency again.
+
 Running the workflow manually builds downloadable workflow artifacts without
 publishing a release. The workflow does not run automated tests. Binaries are
 currently unsigned; checksums establish download integrity against the release,
