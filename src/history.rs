@@ -203,13 +203,15 @@ impl Archive {
         Ok(page)
     }
 
-    pub async fn rebuild_projections(&self) -> Result<()> {
+    /// Re-derive every stored message view from its raw protobuf. Returns
+    /// whether the upgrade ran, so callers can refresh what is on screen.
+    pub async fn rebuild_projections(&self) -> Result<bool> {
         if self
             .preference("message_projection_v7".into())
             .await?
             .is_some()
         {
-            return Ok(());
+            return Ok(false);
         }
         let identities = self.identities().await?;
         let mut cursor = 0;
@@ -264,7 +266,8 @@ impl Archive {
             }).await?;
         }
         self.set_preference("message_projection_v7".into(), "1".into())
-            .await
+            .await?;
+        Ok(true)
     }
 
     pub async fn recover_archived_history(&self) -> Result<()> {

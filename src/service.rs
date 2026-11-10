@@ -163,8 +163,12 @@ impl Service {
         if let Err(error) = self.archive.recover_archived_history().await {
             log::warn!("History recovery failed: {error}");
         }
-        if let Err(error) = self.archive.rebuild_projections().await {
-            log::warn!("Message projection upgrade failed: {error}");
+        match self.archive.rebuild_projections().await {
+            // The open conversation may have been read while the upgrade was
+            // still rewriting messages; reload it with the new projection.
+            Ok(true) => self.changed(),
+            Ok(false) => {}
+            Err(error) => log::warn!("Message projection upgrade failed: {error}"),
         }
         if let Err(error) = self.archive.backfill_call_messages().await {
             log::warn!("Call message projection upgrade failed: {error}");
