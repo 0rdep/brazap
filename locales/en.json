@@ -840,5 +840,7 @@
   "Download image": "Download image",
   "Copy": "Copy",
   "Copy Pix code": "Copy Pix code",
-  "This button cannot be used in Brazap yet. Open the message on your phone.": "This button cannot be used in Brazap yet. Open the message on your phone."
+  "This button cannot be used in Brazap yet. Open the message on your phone.": "This button cannot be used in Brazap yet. Open the message on your phone.",
+  "1 unread message": "1 unread message",
+  "{count} unread messages": "{count} unread messages"
 }

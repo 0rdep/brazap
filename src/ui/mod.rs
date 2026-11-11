@@ -233,6 +233,7 @@ pub(super) struct State {
     media_menu: Option<(String, Message)>,
     detached: bool,
     show_archived: bool,
+    badge: Option<u32>,
     visible_media: Vec<(String, String)>,
     prefetched: HashSet<String>,
     scroll_height: std::rc::Rc<std::cell::Cell<f32>>,
@@ -377,6 +378,7 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         media_menu: None,
         detached: false,
         show_archived: false,
+        badge: None,
         visible_media: Vec::new(),
         prefetched: HashSet::new(),
         scroll_height: std::rc::Rc::new(std::cell::Cell::new(1.0)),
@@ -424,6 +426,9 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
             s.focused = focused;
             let _ = s.tx.send(Command::Focused(focused));
             s.update_viewing();
+            // Windows drops the overlay when the taskbar button is recreated after a hide.
+            s.badge = None;
+            s.update_badge();
         })
         .compositor(render::Renderer::default())
         .on_window(move |handle| {
@@ -1659,6 +1664,7 @@ fn receive_snapshot(state: &mut State, mut snapshot: Snapshot, tx: &mut Tx) -> b
         });
         let refreshed = state.snapshot.revision != snapshot.revision;
         state.snapshot = snapshot;
+        state.update_badge();
         if state.section == Section::Status {
             state.request_status_avatars();
         }
@@ -1773,6 +1779,61 @@ impl State {
         }
         self.timeline
             .sort_by(|a, b| (a.timestamp, &a.id, &a.sender).cmp(&(b.timestamp, &b.id, &b.sender)));
+    }
+
+    /// Unread messages in chats that are neither muted nor archived, as WhatsApp counts them.
+    fn unread_total(&self) -> u32 {
+        self.snapshot
+            .chats
+            .iter()
+            .filter(|chat| !chat.muted && !chat.archived)
+            .map(|chat| chat.unread.max(0))
+            .sum::<i64>()
+            .min(i64::from(u32::MAX)) as u32
+    }
+
+    /// Mirrors the unread count onto the taskbar icon and the tray tooltip.
+    fn update_badge(&mut self) {
+        let count = if self.authenticated {
+            self.unread_total()
+        } else {
+            0
+        };
+        if self.badge == Some(count) {
+            return;
+        }
+        let title = if self.config.demo {
+            "Brazap — Demo"
+        } else {
+            "Brazap"
+        };
+        let description = match count {
+            0 => String::new(),
+            1 => locale::tr("1 unread message"),
+            _ => locale::format("{count} unread messages", &[("count", count.to_string())]),
+        };
+        if let Some(tray) = &self.background.tray {
+            tray.set_tooltip(if description.is_empty() {
+                title.to_owned()
+            } else {
+                format!("{title} — {description}")
+            });
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let applied = self.window.lock().is_ok_and(|window| {
+                window.as_ref().is_some_and(|window| {
+                    crate::windows_integration::set_unread_badge(window, count, &description)
+                })
+            });
+            // A refused overlay is retried on the next snapshot or focus change.
+            self.badge = applied.then_some(count);
+            return;
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.badge = Some(count);
+        }
     }
 
     fn update_viewing(&mut self) {

@@ -1,4 +1,6 @@
 pub mod assets;
+#[cfg(feature = "desktop")]
+pub mod badge;
 pub mod calling;
 pub mod calls;
 pub mod chat;

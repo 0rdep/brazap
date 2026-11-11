@@ -10,6 +10,7 @@ use windows::{
     UI::Notifications::{ToastNotification, ToastNotificationManager},
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, PROPERTYKEY, WPARAM},
+        Graphics::Gdi::{CreateBitmap, DeleteObject},
         System::{
             Com::{
                 CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -25,10 +26,13 @@ use windows::{
         },
         UI::{
             Shell::{
-                IShellLinkW, PropertiesSystem::IPropertyStore,
-                SetCurrentProcessExplicitAppUserModelID, ShellLink,
+                IShellLinkW, ITaskbarList3, PropertiesSystem::IPropertyStore,
+                SetCurrentProcessExplicitAppUserModelID, ShellLink, TaskbarList,
             },
-            WindowsAndMessaging::{IMAGE_ICON, LR_SHARED, LoadImageW, SendMessageW, WM_SETICON},
+            WindowsAndMessaging::{
+                CreateIconIndirect, HICON, ICONINFO, IMAGE_ICON, LR_SHARED, LoadImageW,
+                SendMessageW, WM_SETICON,
+            },
         },
     },
     core::{GUID, HSTRING, Interface, PCWSTR},
@@ -147,6 +151,86 @@ pub fn set_window_icon(window: &rune::WindowHandle) {
             }
         }
     });
+}
+
+thread_local! {
+    static TASKBAR: std::cell::RefCell<Option<ITaskbarList3>> = const { std::cell::RefCell::new(None) };
+    // Badge icons are tiny and few, so they are kept for the life of the process.
+    static BADGES: std::cell::RefCell<std::collections::HashMap<String, HICON>> = Default::default();
+}
+
+fn badge_icon(count: u32) -> Option<HICON> {
+    let label = crate::badge::label(count);
+    if let Some(icon) = BADGES.with_borrow(|icons| icons.get(&label).copied()) {
+        return Some(icon);
+    }
+    let size = crate::badge::SIZE as i32;
+    // 32-bit bitmaps hold premultiplied BGRA; the mask is ignored when the colors carry alpha.
+    let bgra = crate::badge::render(count)
+        .chunks_exact(4)
+        .flat_map(|p| {
+            let alpha = u16::from(p[3]);
+            let scale = |c: u8| ((u16::from(c) * alpha + 127) / 255) as u8;
+            [scale(p[2]), scale(p[1]), scale(p[0]), p[3]]
+        })
+        .collect::<Vec<u8>>();
+    unsafe {
+        let color = CreateBitmap(size, size, 1, 32, Some(bgra.as_ptr().cast()));
+        let mask = CreateBitmap(size, size, 1, 1, None);
+        let info = ICONINFO {
+            fIcon: true.into(),
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: mask,
+            hbmColor: color,
+        };
+        let icon = CreateIconIndirect(&info).ok();
+        let _ = DeleteObject(color.into());
+        let _ = DeleteObject(mask.into());
+        if let Some(icon) = icon {
+            BADGES.with_borrow_mut(|icons| icons.insert(label, icon));
+        }
+        icon
+    }
+}
+
+/// Shows `count` unread messages over the taskbar icon, or clears it at zero.
+/// Returns whether Windows accepted it; it refuses while the window has no taskbar button.
+pub fn set_unread_badge(window: &rune::WindowHandle, count: u32, description: &str) -> bool {
+    window
+        .with_raw_handle(|handle| {
+            let rune::raw_window_handle::RawWindowHandle::Win32(handle) = handle.as_raw() else {
+                return false;
+            };
+            let hwnd = HWND(handle.hwnd.get() as *mut _);
+            unsafe {
+                // The window thread is normally an apartment already; a mismatch is harmless.
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                let Some(taskbar) = TASKBAR.with_borrow_mut(|cached| {
+                    if cached.is_none() {
+                        let list: ITaskbarList3 =
+                            CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER).ok()?;
+                        list.HrInit().ok()?;
+                        *cached = Some(list);
+                    }
+                    cached.clone()
+                }) else {
+                    return false;
+                };
+                if count == 0 {
+                    return taskbar
+                        .SetOverlayIcon(hwnd, HICON::default(), PCWSTR::null())
+                        .is_ok();
+                }
+                let Some(icon) = badge_icon(count) else {
+                    return false;
+                };
+                taskbar
+                    .SetOverlayIcon(hwnd, icon, &HSTRING::from(description))
+                    .is_ok()
+            }
+        })
+        .unwrap_or(false)
 }
 
 /// Opaque dark call windows use native rounded corners, without the Windows
