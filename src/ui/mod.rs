@@ -532,8 +532,13 @@ async fn worker(
     wake: Arc<std::sync::Mutex<UiWake>>,
     initial_chat: Option<String>,
 ) {
-    if !matches!(commands.recv().await, Some(Command::Start)) {
-        return;
+    // The window may report focus or other changes before it is ready; only Start begins.
+    loop {
+        match commands.recv().await {
+            Some(Command::Start) => break,
+            Some(_) => {}
+            None => return,
+        }
     }
     let instance = loop {
         match ipc::start_or_connect(config.clone()).await {
