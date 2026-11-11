@@ -4,7 +4,7 @@ use rune_kit::{Kit, glyphs};
 use serde_json::json;
 
 use super::{State, actions, details, media, sidebar};
-use crate::model::{Message, Phase};
+use crate::model::{Message, MessageAction, Phase};
 
 pub(super) const BRAND_HERO: &str = "brazap-logo";
 
@@ -1075,30 +1075,8 @@ fn message_bubble(s: &State, message: &Message) -> El {
     if let Some(preview) = super::links::preview(s, message) {
         bubble = bubble.child(preview);
     }
-    for action in &message.actions {
-        let mut item = col()
-            .gap(4.0)
-            .padding(10.0)
-            .radius(9.0)
-            .fill(Color::WHITE.alpha(0.025))
-            .border(1.0, BORDER)
-            .child(label(&action.label, 12.0, MINT).wrap());
-        if let Some(target) = &action.target {
-            if target.starts_with("https://") || target.starts_with("http://") {
-                let url = target.clone();
-                item = item
-                    .role("link")
-                    .help(target)
-                    .on_press_tx(move |s: &mut State, tx| {
-                        if let Err(error) = tx.open_url(&url) {
-                            s.error = Some(error.to_string());
-                        }
-                    });
-            } else {
-                item = item.child(label(target, 11.0, MUTED).wrap().selectable(true));
-            }
-        }
-        bubble = bubble.child(item);
+    for (index, action) in message.actions.iter().enumerate() {
+        bubble = bubble.child(action_button(s, message, index, action));
     }
     let mut metadata = row().gap(6.0).center_y().child(el().grow(1.0)).child(
         label(clock(message.timestamp), 9.0, MUTED)
@@ -1310,6 +1288,97 @@ pub(super) fn pick_file(s: &mut State, tx: &mut Tx, kind: &'static str) {
         Ok(_) => {}
         Err(error) => s.error = Some(error.to_string()),
     });
+}
+
+/// One button of a business message. Each kind does what WhatsApp's own apps do with it.
+fn action_button(s: &State, message: &Message, index: usize, action: &MessageAction) -> El {
+    let kind = if action.kind.is_empty() {
+        // Saved before buttons were interactive: only web addresses were clickable.
+        match action.target.as_deref() {
+            Some(t) if t.starts_with("https://") || t.starts_with("http://") => "url",
+            _ => "unsupported",
+        }
+    } else {
+        action.kind.as_str()
+    };
+    let target = action.target.clone();
+    let mut item = col()
+        .key(format!(
+            "message-button-{}-{}-{index}",
+            message.sender, message.id
+        ))
+        .gap(4.0)
+        .padding(10.0)
+        .radius(9.0)
+        .fill(Color::WHITE.alpha(0.025))
+        .border(1.0, BORDER)
+        .hover(Color::WHITE.alpha(0.05))
+        .role("button")
+        .child(label(super::locale::tr(&action.label), 12.0, MINT).wrap());
+    match (kind, target) {
+        ("url", Some(url)) if url.starts_with("https://") || url.starts_with("http://") => {
+            item = item
+                .role("link")
+                .help(&url)
+                .on_press_tx(move |s: &mut State, tx| {
+                    if let Err(error) = tx.open_url(&url) {
+                        s.error = Some(error.to_string());
+                    }
+                });
+        }
+        ("copy", Some(code)) => {
+            item = item
+                .help(super::locale::tr("Copy"))
+                .on_press_tx(move |_: &mut State, tx| {
+                    tx.copy_rich(rune::ClipboardContent::new(code.clone()))
+                });
+        }
+        ("call", Some(phone)) => {
+            item = item
+                .help(super::locale::tr("Copy phone number"))
+                .child(label(&phone, 11.0, MUTED).wrap())
+                .on_press_tx(move |_: &mut State, tx| {
+                    tx.copy_rich(rune::ClipboardContent::new(phone.clone()))
+                });
+        }
+        ("voice_call", _) => {
+            let enabled = s.snapshot.connection.phase == Phase::Connected;
+            item = item.on_press(move |s: &mut State| {
+                if enabled {
+                    s.start_call(false);
+                }
+            });
+            if !enabled {
+                item = item.dim(0.5).inert();
+            }
+        }
+        ("reply", _) if !message.from_me => {
+            let enabled = !s.busy && s.snapshot.connection.phase == Phase::Connected;
+            let cursor = message.cursor();
+            let chat = message.chat.clone();
+            if let Some(description) = &action.target {
+                item = item.child(label(description, 11.0, MUTED).wrap());
+            }
+            item = item.on_press(move |s: &mut State| {
+                s.tool(
+                    "press_message_button",
+                    json!({"chat":chat,"target":cursor,"button":index}),
+                )
+            });
+            if !enabled {
+                item = item.dim(0.5).inert();
+            }
+        }
+        _ => {
+            item = item.on_press(|s: &mut State| {
+                s.error = Some(
+                    "This button cannot be used in Brazap yet. Open the message on your phone."
+                        .into(),
+                )
+            });
+        }
+    }
+    item
 }
 
 pub(super) fn save_file(_s: &mut State, tx: &mut Tx, message: Message) {

@@ -48,6 +48,10 @@ pub(super) fn modal(s: &State, _layer: &mut Vec<El>) -> Option<El> {
     } else {
         media::avatar(s, &chat.jid, &chat.name, chat.photo_version, 142.0)
     };
+    let picture = picture.on_secondary_press({
+        let (jid, name) = (chat.jid.clone(), chat.name.clone());
+        move |s: &mut State, p, _| s.profile_menu(jid.clone(), name.clone(), p)
+    });
     let header = row()
         .px(24.0)
         .h(58.0)
@@ -232,6 +236,11 @@ pub(super) fn modal(s: &State, _layer: &mut Vec<El>) -> Option<El> {
                             for m in items {
                                 s.request_thumbnail(&m);
                             }
+                            // Fetch the next page before the grid runs out.
+                            if range.end * 3 + 6 >= s.gallery.len() && s.gallery_next.is_some() {
+                                s.load_gallery();
+                                return s.gallery_loading;
+                            }
                             false
                         }),
                 ),
@@ -262,7 +271,7 @@ pub(super) fn modal(s: &State, _layer: &mut Vec<El>) -> Option<El> {
                                 )),
                         )
                         .child(icon_button(
-                            &glyphs::CHEVRON_DOWN,
+                            &media::DOWNLOAD,
                             "Download voice message",
                             move |s, tx| save_file(s, tx, download.clone()),
                         )),
@@ -291,22 +300,19 @@ pub(super) fn modal(s: &State, _layer: &mut Vec<El>) -> Option<El> {
                             )),
                     )
                     .child(icon_button(
-                        &glyphs::CHEVRON_DOWN,
+                        &media::DOWNLOAD,
                         "Download attachment",
                         move |s, tx| save_file(s, tx, download.clone()),
                     )),
             );
         }
     }
-    if s.gallery_next.is_some() {
-        gallery = gallery.child(button(
-            if s.gallery_loading {
-                "Loading…"
-            } else {
-                "Load more"
-            },
-            |s, _| s.load_gallery(),
-        ));
+    if s.gallery_loading {
+        gallery = gallery.child(row().w_full().center().child(label(
+            super::locale::tr("Loading…"),
+            12.0,
+            MUTED,
+        )));
     }
     body = body.child(gallery);
     let card = glass(
@@ -326,6 +332,13 @@ pub(super) fn modal(s: &State, _layer: &mut Vec<El>) -> Option<El> {
                         stick_bottom: false,
                     })
                     .scroll_edge_fade(14.0)
+                    // The files and voice lists end at the bottom of this scroll; the media
+                    // grid has its own and loads from there.
+                    .on_at_bottom(|s: &mut State, at| {
+                        if at && s.gallery_next.is_some() {
+                            s.load_gallery();
+                        }
+                    })
                     .child(body),
             )
             .on_press(|_: &mut State| {}),
@@ -369,6 +382,10 @@ pub(super) fn contact_modal(s: &State) -> Option<El> {
             160.0,
         )
     };
+    let picture = picture.on_secondary_press({
+        let (jid, name) = (contact.sender.clone(), contact.sender_name.clone());
+        move |s: &mut State, p, _| s.profile_menu(jid.clone(), name.clone(), p)
+    });
     let open = contact.sender.clone();
     let mut body = col()
         .w(380.0)

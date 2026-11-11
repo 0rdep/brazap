@@ -224,6 +224,13 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
             args.get("message_id").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(crate::outbox::new_id),
             args.get("timestamp").and_then(Value::as_i64),
         ).await?})),
+        "press_message_button" => Ok(json!({"message":service
+            .press_button(
+                text_arg(&args, "chat")?.into(),
+                serde_json::from_value(args["target"].clone())?,
+                args["button"].as_u64().context("button must be a number")? as usize,
+            )
+            .await?})),
         "react_message" => {
             service
                 .react(
@@ -433,6 +440,13 @@ pub(crate) fn tools() -> Value {
             "React to a saved message with an emoji, or an empty string to remove your reaction.",
             json!({"chat":{"type":"string"},"target":{"type":"object","properties":{"timestamp":{"type":"integer"},"id":{"type":"string"},"sender":{"type":"string"}},"required":["timestamp","id","sender"]},"emoji":{"type":"string"}}),
             vec!["chat", "target", "emoji"],
+            false,
+        ),
+        (
+            "press_message_button",
+            "Press a quick-reply button of a business message (its button number, counting from 0, is its position in the message's actions). Sends the same response WhatsApp's apps send.",
+            json!({"chat":{"type":"string"},"target":{"type":"object","properties":{"timestamp":{"type":"integer"},"id":{"type":"string"},"sender":{"type":"string"}},"required":["timestamp","id","sender"]},"button":{"type":"integer","minimum":0}}),
+            vec!["chat", "target", "button"],
             false,
         ),
         (

@@ -71,6 +71,8 @@ enum Command {
     Deselect,
     ManageChat(&'static str, Value),
     CopyMedia(u64, Message),
+    CopyProfile(u64, String),
+    SaveProfile(String, std::path::PathBuf),
     ReplyStatus(String, String, String, String),
     ViewStatus(String, String),
     NextAudio(u64, Message),
@@ -598,6 +600,20 @@ async fn worker(
                         assets.spawn(async move {
                             let result=context_menu::prepare_copy(&remote,&config,message).await.map_err(|e|format!("{e:#}"));
                             emit(&events,&wake,Event::MediaCopied(generation,result));
+                        });continue;
+                    }
+                    Some(Command::CopyProfile(generation,jid))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=context_menu::copy_profile(&remote,jid).await.map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::MediaCopied(generation,result));
+                        });continue;
+                    }
+                    Some(Command::SaveProfile(jid,path))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=context_menu::save_profile(&remote,jid,path).await.map(|_|json!({"saved":true})).map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Done(result));
                         });continue;
                     }
                     Some(Command::ReplyStatus(sender,id,text,message_id))=>{

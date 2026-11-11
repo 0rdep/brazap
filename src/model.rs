@@ -224,10 +224,26 @@ pub struct ForwardResult {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MessageAction {
     pub label: String,
+    /// The URL, phone number or code the button carries.
     pub target: Option<String>,
+    /// `url`, `call`, `copy`, `reply`, `voice_call` or `unsupported`; empty in data stored before
+    /// buttons were interactive (those fall back to opening `target` when it is a web address).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    /// Which protocol button a `reply` answers: `native`, `template` or `buttons`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub flow: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub index: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -3,7 +3,7 @@ use crate::{assets::AssetRequest, model::Message};
 use rune::{El, SurfaceFit, col, el, icon, row};
 use rune_kit::glyphs;
 
-const DOWNLOAD: rune::Icon = rune::Icon {
+pub(super) const DOWNLOAD: rune::Icon = rune::Icon {
     name: "save-original",
     view: 24.0,
     body: r#"<path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,

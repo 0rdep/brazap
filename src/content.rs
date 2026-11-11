@@ -79,12 +79,85 @@ pub(crate) fn project_call_stub(view: &mut Message, metadata: &str) -> bool {
     true
 }
 
-fn action(view: &mut Message, label: Option<&str>, target: Option<&str>) {
+fn action(view: &mut Message, label: Option<&str>, kind: &str, target: Option<&str>) {
     if let Some(label) = label.filter(|s| !s.trim().is_empty()) {
         view.actions.push(MessageAction {
             label: label.to_owned(),
-            target: target.map(str::to_owned),
+            target: target.filter(|s| !s.is_empty()).map(str::to_owned),
+            kind: kind.into(),
+            ..Default::default()
         });
+    }
+}
+
+fn reply(
+    view: &mut Message,
+    label: Option<&str>,
+    flow: &str,
+    id: Option<&str>,
+    index: Option<u32>,
+) {
+    let before = view.actions.len();
+    action(view, label, "reply", None);
+    if let Some(button) = view.actions.get_mut(before) {
+        button.flow = flow.into();
+        button.id = id.map(str::to_owned);
+        button.index = index.unwrap_or(before as u32);
+    }
+}
+
+/// The Pix "copy and paste" code of a payment button, when the business included one.
+fn pix_code(params: &serde_json::Value) -> Option<&str> {
+    params
+        .get("copy_code")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            params
+                .get("payment_settings")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .chain(params.get("payment_setting"))
+                .find_map(|setting| {
+                    setting
+                        .get("pix_dynamic_code")
+                        .and_then(|v| v.get("code"))
+                        .and_then(|v| v.as_str())
+                })
+        })
+        .filter(|code| !code.trim().is_empty())
+}
+
+/// Buttons of an interactive ("native flow") message. `name` identifies the button type and
+/// `params` carries its details as JSON.
+fn native_flow(view: &mut Message, name: &str, params: &str) {
+    let params = serde_json::from_str::<serde_json::Value>(params).unwrap_or_default();
+    let text = |key: &str| {
+        params
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+    };
+    let label = text("display_text");
+    match name {
+        "quick_reply" => reply(view, label, "native", text("id"), None),
+        "cta_url" => action(view, label, "url", text("url").or(text("merchant_url"))),
+        "cta_call" => action(view, label, "call", text("phone_number")),
+        "voice_call" => action(view, label.or(Some("Call")), "voice_call", None),
+        "cta_copy" => action(view, label, "copy", text("copy_code")),
+        _ => {
+            if let Some(code) = pix_code(&params) {
+                action(view, label.or(Some("Copy Pix code")), "copy", Some(code));
+            } else if let Some(url) = text("url") {
+                action(view, label, "url", Some(url));
+            } else if let Some(code) = text("copy_code") {
+                action(view, label, "copy", Some(code));
+            } else if let Some(phone) = text("phone_number") {
+                action(view, label, "call", Some(phone));
+            } else {
+                action(view, label, "unsupported", None);
+            }
+        }
     }
 }
 
@@ -99,15 +172,22 @@ fn hydrated(view: &mut Message, t: &wa::message::template_message::HydratedFourR
     for button in &t.hydrated_buttons {
         use wa::hydrated_template_button::HydratedButton;
         match &button.hydrated_button {
-            Some(HydratedButton::QuickReplyButton(b)) => {
-                action(view, b.display_text.as_deref(), None)
-            }
+            Some(HydratedButton::QuickReplyButton(b)) => reply(
+                view,
+                b.display_text.as_deref(),
+                "template",
+                b.id.as_deref(),
+                button.index,
+            ),
             Some(HydratedButton::UrlButton(b)) => {
-                action(view, b.display_text.as_deref(), b.url.as_deref())
+                action(view, b.display_text.as_deref(), "url", b.url.as_deref())
             }
-            Some(HydratedButton::CallButton(b)) => {
-                action(view, b.display_text.as_deref(), b.phone_number.as_deref())
-            }
+            Some(HydratedButton::CallButton(b)) => action(
+                view,
+                b.display_text.as_deref(),
+                "call",
+                b.phone_number.as_deref(),
+            ),
             _ => {}
         }
     }
@@ -132,20 +212,11 @@ fn interactive(view: &mut Message, t: &wa::message::InteractiveMessage) {
         &t.interactive_message
     {
         for button in &flow.buttons {
-            if let Some(params) = button
-                .button_params_json
-                .as_deref()
-                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-            {
-                action(
-                    view,
-                    params.get("display_text").and_then(|v| v.as_str()),
-                    params
-                        .get("url")
-                        .or_else(|| params.get("phone_number"))
-                        .and_then(|v| v.as_str()),
-                );
-            }
+            native_flow(
+                view,
+                button.name.as_deref().unwrap_or_default(),
+                button.button_params_json.as_deref().unwrap_or("{}"),
+            );
         }
     }
 }
@@ -291,13 +362,19 @@ pub fn project(view: &mut Message, message: &wa::Message) {
             view.title = text.clone();
         }
         for b in &t.buttons {
-            action(
-                view,
-                b.button_text
-                    .as_option()
-                    .and_then(|b| b.display_text.as_deref()),
-                None,
-            );
+            let label = b
+                .button_text
+                .as_option()
+                .and_then(|b| b.display_text.as_deref());
+            if let Some(flow) = b.native_flow_info.as_option() {
+                native_flow(
+                    view,
+                    flow.name.as_deref().unwrap_or_default(),
+                    flow.params_json.as_deref().unwrap_or("{}"),
+                );
+            } else {
+                reply(view, label, "buttons", b.button_id.as_deref(), None);
+            }
         }
     } else if let Some(t) = base.template_button_reply_message.as_option() {
         view.text = t.selected_display_text.clone().unwrap_or_default();
@@ -320,7 +397,17 @@ pub fn project(view: &mut Message, message: &wa::Message) {
         view.footer = t.footer_text.clone().unwrap_or_default();
         for section in &t.sections {
             for row in &section.rows {
-                action(view, row.title.as_deref(), row.description.as_deref());
+                let at = view.actions.len();
+                reply(
+                    view,
+                    row.title.as_deref(),
+                    "list",
+                    row.row_id.as_deref(),
+                    None,
+                );
+                if let Some(button) = view.actions.get_mut(at) {
+                    button.target = row.description.clone().filter(|d| !d.trim().is_empty());
+                }
             }
         }
     } else if let Some(t) = base.list_response_message.as_option() {

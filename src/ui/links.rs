@@ -123,6 +123,11 @@ pub(super) fn preview(s: &State, message: &Message) -> Option<El> {
         id: message.id.clone(),
     }
     .key();
+    let image = s.images.get(&key).filter(|image| image.error().is_none());
+    // A card with only the site name tells the reader nothing; the link above already shows it.
+    if image.is_none() && preview.title.trim().is_empty() && preview.description.trim().is_empty() {
+        return None;
+    }
     let mut card = col()
         .w_full()
         .max_w(320.0)
@@ -139,7 +144,7 @@ pub(super) fn preview(s: &State, message: &Message) -> Option<El> {
                 s.error = Some(error.to_string());
             }
         });
-    if let Some(image) = s.images.get(&key) {
+    if let Some(image) = image {
         card = card.child(
             el().w_full()
                 .h(140.0)

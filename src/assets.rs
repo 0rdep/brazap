@@ -350,6 +350,11 @@ impl Service {
                                 .await?
                             {
                                 crate::playback::poster(bytes).await?
+                            } else if let Some(bytes) = self
+                                .media_for_preview(chat, sender, id, proto.clone(), &base)
+                                .await
+                            {
+                                crate::playback::poster(bytes).await?
                             } else {
                                 return Ok(None);
                             }
@@ -384,6 +389,15 @@ impl Service {
                         });
                     if let Some(bytes) = thumbnail.filter(|b| !b.is_empty()) {
                         Some(resize(bytes, 360).await?)
+                    } else if let Some(bytes) = self
+                        .media_for_preview(chat, sender, id, proto.clone(), &base)
+                        .await
+                    {
+                        Some(if animated_webp(&bytes) {
+                            bytes
+                        } else {
+                            resize(bytes, 360).await?
+                        })
                     } else {
                         return Ok(None);
                     }
@@ -440,6 +454,48 @@ impl Service {
             mime: mime.into(),
             data: STANDARD.encode(bytes),
         }))
+    }
+}
+
+impl Service {
+    /// The sender included no preview image, so one has to come from the media itself. Fetches
+    /// it unless it is large; a preview is not worth a long download. `None` when unavailable.
+    async fn media_for_preview(
+        &self,
+        chat: &str,
+        sender: &str,
+        id: &str,
+        proto: whatsapp_rust::prelude::wa::Message,
+        base: &whatsapp_rust::prelude::wa::Message,
+    ) -> Option<Vec<u8>> {
+        let (kind, length) = if let Some(m) = base.image_message.as_option() {
+            ("image", m.file_length)
+        } else if let Some(m) = base.video_message.as_option() {
+            ("video", m.file_length)
+        } else if base.sticker_message.is_set() {
+            ("sticker", None)
+        } else {
+            return None;
+        };
+        let limit: u64 = if kind == "video" { 32 } else { 24 } * 1024 * 1024;
+        if length.is_some_and(|length| length > limit) {
+            return None;
+        }
+        let message = Message {
+            id: id.into(),
+            chat: chat.into(),
+            sender: sender.into(),
+            from_me: sender == "self",
+            kind: kind.into(),
+            ..Default::default()
+        };
+        match self.download_media(&message, proto).await {
+            Ok(bytes) => Some(bytes),
+            Err(error) => {
+                log::debug!("Could not fetch media for its preview: {error:#}");
+                None
+            }
+        }
     }
 }
 

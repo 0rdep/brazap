@@ -836,5 +836,9 @@
   "Database {size} · {free} can be released": "Base de datos {size} · se pueden liberar {free}",
   "@me": "@yo",
   "history": "Historial original",
-  "other": "Otros datos (búsqueda, índices)"
+  "other": "Otros datos (búsqueda, índices)",
+  "Download image": "Descargar imagen",
+  "Copy": "Copiar",
+  "Copy Pix code": "Copiar código Pix",
+  "This button cannot be used in Brazap yet. Open the message on your phone.": "Este botón aún no se puede usar en Brazap. Abre el mensaje en el teléfono."
 }

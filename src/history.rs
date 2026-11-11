@@ -207,7 +207,7 @@ impl Archive {
     /// whether the upgrade ran, so callers can refresh what is on screen.
     pub async fn rebuild_projections(&self) -> Result<bool> {
         if self
-            .preference("message_projection_v7".into())
+            .preference("message_projection_v8".into())
             .await?
             .is_some()
         {
@@ -265,7 +265,7 @@ impl Archive {
                 }).map_err(db_error)
             }).await?;
         }
-        self.set_preference("message_projection_v7".into(), "1".into())
+        self.set_preference("message_projection_v8".into(), "1".into())
             .await?;
         Ok(true)
     }

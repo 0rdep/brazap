@@ -8,7 +8,7 @@ use diesel::{
     sql_types::{BigInt, Text},
 };
 use whatsapp_rust::{
-    prelude::{MessageExt, wa},
+    prelude::{MessageExt, MessageField, wa},
     wacore_binary::JidExt,
 };
 
@@ -54,6 +54,92 @@ impl Service {
     ) -> Result<Message> {
         self.send_text_with_id(chat, text, Some(target), crate::outbox::new_id(), None)
             .await
+    }
+
+    /// Answer a business message's quick-reply button the way WhatsApp's own apps do: with a
+    /// response that quotes the message. The button is read from the archived original, so a
+    /// caller cannot make the account send anything the business did not offer.
+    pub async fn press_button(
+        &self,
+        chat: String,
+        target: MessageCursor,
+        button: usize,
+    ) -> Result<Message> {
+        let original = self
+            .archive
+            .raw_message(chat.clone(), target.sender.clone(), target.id.clone())
+            .await?;
+        let mut view = Message::default();
+        crate::content::project(&mut view, &original);
+        let action = view
+            .actions
+            .get(button)
+            .filter(|action| action.kind == "reply")
+            .context("This button cannot be answered from here")?
+            .clone();
+        let jid: whatsapp_rust::Jid = chat.parse()?;
+        let context = whatsapp_rust::wacore::proto_helpers::build_quote_context_with_info(
+            target.id.clone(),
+            &self.author(&target.sender).await?,
+            &jid,
+            &jid,
+            &original,
+        );
+        let id = action.id.clone().unwrap_or_default();
+        let mut message = wa::Message::default();
+        match action.flow.as_str() {
+            "template" => {
+                let mut reply = wa::message::TemplateButtonReplyMessage::default();
+                reply.selected_id = Some(id);
+                reply.selected_display_text = Some(action.label.clone());
+                reply.selected_index = Some(action.index);
+                reply.context_info = MessageField::some(context);
+                message.template_button_reply_message = MessageField::some(reply);
+            }
+            "list" => {
+                use wa::message::list_response_message::{ListType, SingleSelectReply};
+                let mut select = SingleSelectReply::default();
+                select.selected_row_id = Some(id);
+                let mut reply = wa::message::ListResponseMessage::default();
+                reply.title = Some(action.label.clone());
+                reply.description = action.target.clone();
+                reply.list_type = Some(ListType::SINGLE_SELECT);
+                reply.single_select_reply = MessageField::some(select);
+                reply.context_info = MessageField::some(context);
+                message.list_response_message = MessageField::some(reply);
+            }
+            "buttons" => {
+                use wa::message::buttons_response_message::{Response, Type};
+                let mut reply = wa::message::ButtonsResponseMessage::default();
+                reply.selected_button_id = Some(id);
+                reply.response = Some(Response::SelectedDisplayText(action.label.clone()));
+                reply.r#type = Some(Type::DISPLAY_TEXT);
+                reply.context_info = MessageField::some(context);
+                message.buttons_response_message = MessageField::some(reply);
+            }
+            _ => {
+                use wa::message::interactive_response_message::{Body, NativeFlowResponseMessage};
+                let mut body = Body::default();
+                body.text = Some(action.label.clone());
+                let mut flow = NativeFlowResponseMessage::default();
+                flow.name = Some("quick_reply".into());
+                flow.params_json =
+                    Some(serde_json::json!({"display_text": action.label, "id": id}).to_string());
+                flow.version = Some(3);
+                let mut reply = wa::message::InteractiveResponseMessage::default();
+                reply.body = MessageField::some(body);
+                reply.interactive_response_message = Some(
+                    wa::message::interactive_response_message::InteractiveResponseMessage::NativeFlowResponseMessage(Box::new(flow)),
+                );
+                reply.context_info = MessageField::some(context);
+                message.interactive_response_message = MessageField::some(reply);
+            }
+        }
+        if self.config.demo {
+            return self.demo_send(chat, message, None).await;
+        }
+        let client = self.connected().await?;
+        self.send_prepared(client, jid, message, None).await
     }
 
     pub async fn react(&self, chat: String, target: MessageCursor, emoji: String) -> Result<()> {

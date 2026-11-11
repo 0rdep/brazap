@@ -20,6 +20,7 @@ pub(super) const MUTE: Icon = Icon {
 
 pub(super) enum Target {
     Chat(Chat),
+    Profile { jid: String, name: String },
     Message(Message),
 }
 pub(super) struct Open {
@@ -32,6 +33,13 @@ impl State {
         self.media_menu = None;
         self.context_menu = Some(Open {
             target: Target::Chat(chat),
+            point: [p.x, p.y],
+        });
+    }
+    pub(super) fn profile_menu(&mut self, jid: String, name: String, p: rune::PointerPress) {
+        self.media_menu = None;
+        self.context_menu = Some(Open {
+            target: Target::Profile { jid, name },
             point: [p.x, p.y],
         });
     }
@@ -161,6 +169,51 @@ fn chat_items(s: &State, c: &Chat) -> El {
         }))
 }
 
+fn profile_items(jid: &str, name: &str) -> El {
+    let mut body = col().w(222.0).gap(2.0).padding(6.0);
+    let target = jid.to_owned();
+    body = body.child(item("Copy image", true, false, move |s, _| {
+        s.close_context_menu();
+        s.copy_generation = s.copy_generation.wrapping_add(1);
+        let _ =
+            s.tx.send(Command::CopyProfile(s.copy_generation, target.clone()));
+    }));
+    let (target, name) = (jid.to_owned(), name.to_owned());
+    body.child(item("Download image", true, false, move |s, tx| {
+        s.close_context_menu();
+        let (target, stem) = (target.clone(), name.clone());
+        let file: String = stem
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let options = rune::FileDialogOptions {
+            title: "Save profile picture".into(),
+            file_name: Some(format!(
+                "{}.png",
+                if file.trim_matches('_').is_empty() {
+                    "profile"
+                } else {
+                    &file
+                }
+            )),
+            ..Default::default()
+        };
+        tx.save_file(options, move |s: &mut State, result, _| match result {
+            Ok(Some(path)) => {
+                let _ = s.tx.send(Command::SaveProfile(target.clone(), path));
+            }
+            Ok(None) => {}
+            Err(error) => s.error = Some(error.to_string()),
+        });
+    }))
+}
+
 fn message_items(_s: &State, m: &Message) -> El {
     let mut body = col().w(222.0).gap(2.0).padding(6.0);
     if !m.text.is_empty() {
@@ -218,6 +271,7 @@ pub(super) fn menu(s: &State) -> Vec<El> {
         (
             match &open.target {
                 Target::Chat(c) => chat_items(s, c),
+                Target::Profile { jid, name } => profile_items(jid, name),
                 Target::Message(m) => message_items(s, m),
             },
             Some(open.point),
@@ -265,6 +319,32 @@ pub(super) fn confirmation(s: &State) -> Option<El> {
                     if s.attachments.is_some() || s.recording.is_some() {s.error=Some("Finish or discard attachments and recordings before deleting a chat.".into());return;}
                     s.delete_chat=None;s.manage_chat("delete_chat",json!({"chat":chat.jid}));
                 }))))))
+}
+
+/// The profile picture as PNG bytes: the cached 512-point copy the profile view shows.
+async fn profile_png(remote: &Remote, jid: String) -> anyhow::Result<Vec<u8>> {
+    use anyhow::Context;
+    remote
+        .asset(crate::assets::AssetRequest::Profile { jid })
+        .await?
+        .context("This profile has no picture")
+}
+
+pub(super) async fn copy_profile(remote: &Remote, jid: String) -> anyhow::Result<ClipboardContent> {
+    use anyhow::Context;
+    let png = profile_png(remote, jid).await?;
+    let image = ClipboardImage::from_png(png).context("Image is too large for the clipboard")?;
+    Ok(ClipboardContent::default().with_image(image))
+}
+
+pub(super) async fn save_profile(
+    remote: &Remote,
+    jid: String,
+    path: std::path::PathBuf,
+) -> anyhow::Result<()> {
+    let png = profile_png(remote, jid).await?;
+    tokio::fs::write(path, png).await?;
+    Ok(())
 }
 
 pub(super) async fn prepare_copy(
