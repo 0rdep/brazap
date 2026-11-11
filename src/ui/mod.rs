@@ -96,6 +96,7 @@ enum Command {
     Diagnostics,
     Select(String, u64),
     Viewing(Option<String>),
+    Focused(bool),
     Tool(&'static str, Value),
     Send(Message, Option<MessageCursor>),
     Forward(String, String, Vec<MessageCursor>),
@@ -421,6 +422,7 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         })
         .on_focus(|s, focused, _| {
             s.focused = focused;
+            let _ = s.tx.send(Command::Focused(focused));
             s.update_viewing();
         })
         .compositor(render::Renderer::default())
@@ -559,6 +561,7 @@ async fn worker(
     }
     let mut selected = None;
     let mut viewing = None;
+    let mut focused = true;
     let attachment_slots = Arc::new(tokio::sync::Semaphore::new(1));
     let avatar_slots = Arc::new(tokio::sync::Semaphore::new(2));
     let media_slots = Arc::new(tokio::sync::Semaphore::new(4));
@@ -783,6 +786,7 @@ async fn worker(
                         });continue;
                     }
                     Some(Command::Viewing(chat))=>{viewing=chat;}
+                    Some(Command::Focused(now))=>{focused=now;interval.reset_immediately();}
                     Some(Command::Select(chat,generation))=>{
                         selected=Some(chat.clone());
                         snapshot_retry_at=None;
@@ -894,7 +898,7 @@ async fn worker(
                 // Keep the worker available for chat selection and page loads
                 // while the complete sidebar snapshot is being assembled.
                 assets.spawn(async move {
-                    if let Ok(Ok(activation)) = tokio::time::timeout(Duration::from_secs(3), remote.request("brazap/desktop",json!({"pid":std::process::id(),"chat":viewing}))).await
+                    if let Ok(Ok(activation)) = tokio::time::timeout(Duration::from_secs(3), remote.request("brazap/desktop",json!({"pid":std::process::id(),"chat":viewing,"focused":focused}))).await
                         && activation["activate"].as_bool() == Some(true) {
                         emit(&events,&wake,Event::Activate(activation["chat"].as_str().map(str::to_owned)));
                     }

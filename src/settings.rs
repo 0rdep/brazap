@@ -158,31 +158,11 @@ impl Service {
     }
     pub async fn save_settings(&self, value: Settings) -> Result<u64> {
         value.validate()?;
-        let previous = self.settings.read().await.clone();
         self.archive
             .set_preference("app_settings".into(), serde_json::to_string(&value)?)
             .await?;
         *self.settings.write().await = value.clone();
-        if let Some(client) = self.client.read().await.clone() {
-            use whatsapp_rust::PresencePolicy;
-            client.set_presence_policy(if value.privacy.show_online {
-                PresencePolicy::Automatic
-            } else {
-                PresencePolicy::Manual
-            });
-            if previous.privacy.show_online != value.privacy.show_online
-                && self.connection.read().await.phase == crate::model::Phase::Connected
-            {
-                let result = if value.privacy.show_online {
-                    client.presence().set_available().await
-                } else {
-                    client.presence().set_unavailable().await
-                };
-                if let Err(error) = result {
-                    log::warn!("Could not update online presence: {error}");
-                }
-            }
-        }
+        // Presence follows the window focus and this setting on the next desktop poll.
         self.changed();
         Ok(self.revision())
     }

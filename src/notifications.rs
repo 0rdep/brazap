@@ -22,6 +22,8 @@ pub(crate) struct Desktop {
     pid: u32,
     chat: Option<String>,
     activation: Option<Option<String>>,
+    /// The connection (by its start time) and presence last announced to WhatsApp.
+    presence: Option<(u64, bool)>,
 }
 
 pub fn chat_from_link(link: &str) -> Result<String> {
@@ -61,6 +63,7 @@ impl Service {
         self: &std::sync::Arc<Self>,
         pid: u32,
         chat: Option<String>,
+        focused: bool,
     ) -> Value {
         let mut desktop = self.desktop.lock().await;
         desktop.seen = Some(Instant::now());
@@ -68,6 +71,9 @@ impl Service {
         desktop.chat = chat.clone();
         let activation = desktop.activation.take();
         drop(desktop);
+        #[cfg(all(target_os = "windows", feature = "desktop"))]
+        let focused = focused && crate::windows_integration::is_foreground(pid);
+        self.sync_presence(focused).await;
         if let Some(chat) = chat {
             if self.desktop_viewing(&chat).await
                 && self
@@ -84,6 +90,41 @@ impl Service {
         match activation {
             Some(chat) => json!({"activate":true,"chat":chat}),
             None => json!({"activate":false}),
+        }
+    }
+
+    /// WhatsApp treats an "available" device as the place you read, and does not notify your
+    /// phone while one is. So this device is announced as online only while its window has
+    /// focus, as WhatsApp Web does, and as offline when it is in the background or closed to
+    /// the tray. The server forgets presence when a connection ends, so each connection starts
+    /// unannounced.
+    async fn sync_presence(&self, active: bool) {
+        if self.config.demo {
+            return;
+        }
+        let online = active && self.settings.read().await.privacy.show_online;
+        let connection = self.connected_at.load(std::sync::atomic::Ordering::Acquire);
+        let sent = self.desktop.lock().await.presence;
+        if sent == Some((connection, online)) {
+            return;
+        }
+        // A new connection starts offline, so there is nothing to retract.
+        if !online && sent.is_none_or(|(at, _)| at != connection) {
+            self.desktop.lock().await.presence = Some((connection, false));
+            return;
+        }
+        let Ok(client) = self.connected().await else {
+            return;
+        };
+        let result = if online {
+            client.presence().set_available().await
+        } else {
+            client.presence().set_unavailable().await
+        };
+        match result {
+            Ok(()) => self.desktop.lock().await.presence = Some((connection, online)),
+            // The account name arrives shortly after connecting; the next poll tries again.
+            Err(error) => log::debug!("Presence not updated yet: {error}"),
         }
     }
 

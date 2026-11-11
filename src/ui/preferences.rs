@@ -530,7 +530,7 @@ pub(super) fn view(s: &State) -> El {
                 .child(toggle(
                     s,
                     "Announce online presence",
-                    "Report this device as online while connected.",
+                    "Report this device as online while the app window is in use.",
                     p.privacy.show_online,
                     |p| p.privacy.show_online = !p.privacy.show_online,
                 ))

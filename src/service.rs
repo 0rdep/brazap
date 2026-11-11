@@ -210,11 +210,8 @@ impl Service {
                 .with_history_sync_config(sync);
             let built = Bot::builder()
                 .with_device_props(props)
-                .with_presence_policy(if self.settings.read().await.privacy.show_online {
-                    whatsapp_rust::PresencePolicy::Automatic
-                } else {
-                    whatsapp_rust::PresencePolicy::Manual
-                })
+                // Presence follows the window's focus (see `sync_presence`), not the connection.
+                .with_presence_policy(whatsapp_rust::PresencePolicy::Manual)
                 .with_backend_arc(self.archive.backend.clone())
                 .with_inbound_durability_hook(hooks.clone())
                 .with_history_sync_durability_hook(hooks)

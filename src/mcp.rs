@@ -540,6 +540,7 @@ pub async fn handle(
             .poll_desktop(
                 params["pid"].as_u64().unwrap_or(0) as u32,
                 params["chat"].as_str().map(str::to_owned),
+                params["focused"].as_bool().unwrap_or(false),
             )
             .await),
         "brazap/settings" => service.settings_view().await,
