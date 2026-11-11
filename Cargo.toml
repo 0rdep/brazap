@@ -1,6 +1,6 @@
 [package]
 name = "brazap"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2024"
 rust-version = "1.99.1"
 description = "A native WhatsApp desktop client with a local MCP interface"
