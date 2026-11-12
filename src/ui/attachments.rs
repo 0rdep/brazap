@@ -172,7 +172,6 @@ impl State {
             && self.viewer.is_none()
             && self.forwarding.is_none()
             && !self.diagnostics.open
-            && !self.new_chat
     }
 
     fn can_drop_attachments(&self) -> bool {

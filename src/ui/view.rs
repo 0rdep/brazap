@@ -332,6 +332,21 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
             },
         );
     root = root.child(content);
+    if let Some((notice, _)) = s.notice.as_ref().filter(|_| s.error.is_none()) {
+        root = root.child(
+            row()
+                .key("notice-banner")
+                .pin(None, None, Some(24.0), Some(18.0))
+                .padding(12.0)
+                .px(16.0)
+                .gap(10.0)
+                .center_y()
+                .radius(14.0)
+                .fill(PANEL)
+                .border(1.0, BORDER)
+                .child(label(super::locale::tr(notice), 13.0, INK)),
+        );
+    }
     if let Some(error) = &s.error {
         root = root.child(
             row()
@@ -1100,14 +1115,14 @@ fn message_bubble(s: &State, message: &Message) -> El {
         line = line.child(el().grow(1.0));
     }
     if mine && s.forwarding.is_none() && message.actionable() {
-        line = line.child(actions::toolbar(message));
+        line = line.child(actions::toolbar(s, message));
     }
     if !mine && message.chat.ends_with("@g.us") {
         line = line.child(media::sender_avatar(s, message));
     }
     line = line.child(bubble);
     if !mine && s.forwarding.is_none() && message.actionable() {
-        line = line.child(actions::toolbar(message));
+        line = line.child(actions::toolbar(s, message));
     }
     if !mine {
         line = line.child(el().grow(1.0));

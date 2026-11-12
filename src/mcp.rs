@@ -267,6 +267,40 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
                 .await?;
             Ok(json!({"saved":true}))
         }
+        "favorite_sticker" => {
+            service
+                .set_sticker_favorite(
+                    text_arg(&args, "chat")?.into(),
+                    text_arg(&args, "sender")?.into(),
+                    text_arg(&args, "id")?.into(),
+                    args["favorite"].as_bool().unwrap_or(true),
+                )
+                .await?;
+            Ok(json!({"updated":true}))
+        }
+        #[cfg(feature = "desktop")]
+        "create_sticker" => {
+            service
+                .create_sticker(
+                    text_arg(&args, "chat")?.into(),
+                    text_arg(&args, "sender")?.into(),
+                    text_arg(&args, "id")?.into(),
+                )
+                .await?;
+            Ok(json!({"created":true}))
+        }
+        #[cfg(feature = "desktop")]
+        "save_gif" => {
+            service
+                .save_gif(
+                    text_arg(&args, "chat")?.into(),
+                    text_arg(&args, "sender")?.into(),
+                    text_arg(&args, "id")?.into(),
+                    text_arg(&args, "path")?.into(),
+                )
+                .await?;
+            Ok(json!({"saved":true}))
+        }
         "pair_phone" => {
             service.pair_phone(text_arg(&args, "phone")?.into()).await?;
             Ok(json!({"requested":true}))
@@ -282,26 +316,8 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
             Ok(json!({"updated":true}))
         }
         "open_chat" => {
-            let address = text_arg(&args, "address")?.trim();
-            let address = if address.contains('@') {
-                address.to_owned()
-            } else {
-                let number = address
-                    .trim_start_matches('+')
-                    .replace([' ', '-', '(', ')'], "");
-                anyhow::ensure!(
-                    !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()),
-                    "Enter a phone number with country code or a chat JID"
-                );
-                format!("{number}@s.whatsapp.net")
-            };
-            let jid: whatsapp_rust::Jid = address.parse()?;
-            let address = service.archive.canonical_chat(&jid.to_string()).await?;
-            service
-                .archive
-                .name_chat(address.clone(), String::new(), 0, crate::model::now())
-                .await?;
-            Ok(json!({"chat":address}))
+            let (chat, text) = service.open_address(text_arg(&args, "address")?).await?;
+            Ok(json!({"chat":chat,"text":text}))
         }
         _ => bail!("Unknown tool: {name}"),
     }
@@ -314,6 +330,13 @@ pub(crate) fn tools() -> Value {
             "Delete a chat and its local messages and sync the action to linked devices.",
             json!({"chat":{"type":"string"}}),
             vec!["chat"],
+            false,
+        ),
+        (
+            "open_chat",
+            "Open a chat by phone number, WhatsApp link (wa.me, api.whatsapp.com/send, whatsapp://send) or JID, even without a saved contact. Numbers without a country code use the account's own country. Numbers are checked with WhatsApp first; returns the chat JID and any message text the link carries.",
+            json!({"address":{"type":"string"}}),
+            vec!["address"],
             false,
         ),
         (
@@ -487,6 +510,27 @@ pub(crate) fn tools() -> Value {
         (
             "save_attachment",
             "Save a message attachment from SQLite or WhatsApp to a local path.",
+            json!({"chat":{"type":"string"},"sender":{"type":"string"},"id":{"type":"string"},"path":{"type":"string"}}),
+            vec!["chat", "sender", "id", "path"],
+            false,
+        ),
+        (
+            "favorite_sticker",
+            "Add the sticker in a message to My stickers (favorite: true, the default) or remove it (favorite: false). Syncs to the phone and linked devices.",
+            json!({"chat":{"type":"string"},"sender":{"type":"string"},"id":{"type":"string"},"favorite":{"type":"boolean"}}),
+            vec!["chat", "sender", "id"],
+            false,
+        ),
+        (
+            "create_sticker",
+            "Make a sticker from the photo, video or GIF in a message (videos become animated stickers of up to 8 seconds) and add it to My stickers.",
+            json!({"chat":{"type":"string"},"sender":{"type":"string"},"id":{"type":"string"}}),
+            vec!["chat", "sender", "id"],
+            false,
+        ),
+        (
+            "save_gif",
+            "Save the GIF or animated sticker in a message to a local path as a .gif file.",
             json!({"chat":{"type":"string"},"sender":{"type":"string"},"id":{"type":"string"},"path":{"type":"string"}}),
             vec!["chat", "sender", "id", "path"],
             false,

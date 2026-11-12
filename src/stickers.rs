@@ -274,3 +274,232 @@ impl Service {
             .await
     }
 }
+
+/// The sticker in an archived message, with the hash WhatsApp identifies it by.
+fn message_sticker(proto: &wa::Message) -> Result<(String, wa::message::StickerMessage)> {
+    let base = crate::content::media_message(proto);
+    let sticker = base
+        .sticker_message
+        .as_option()
+        .context("This message is not a sticker")?
+        .clone();
+    let hash = sticker
+        .file_sha256
+        .as_ref()
+        .map(|hash| STANDARD.encode(hash))
+        .context("This sticker cannot be saved")?;
+    Ok((hash, sticker))
+}
+
+impl Service {
+    /// Adds a sticker from a message to My stickers, or removes it, on every linked device.
+    pub async fn set_sticker_favorite(
+        &self,
+        chat: String,
+        sender: String,
+        id: String,
+        favorite: bool,
+    ) -> Result<()> {
+        self.archive.allow_chat(&chat).await?;
+        let proto = self
+            .archive
+            .raw_message(chat.clone(), sender.clone(), id.clone())
+            .await?;
+        let (hash, sticker) = message_sticker(&proto)?;
+        if !self.config.demo {
+            self.sync_favorite(&hash, &sticker, favorite).await?;
+        }
+        let mut stored = wa::Message::default();
+        stored.sticker_message = MessageField::some(sticker);
+        self.store_favorite(
+            hash,
+            stored.encode_to_vec(),
+            None,
+            favorite,
+            (chat, sender, id),
+        )
+        .await?;
+        self.changed();
+        Ok(())
+    }
+
+    async fn sync_favorite(
+        &self,
+        hash: &str,
+        sticker: &wa::message::StickerMessage,
+        favorite: bool,
+    ) -> Result<()> {
+        ensure!(
+            sticker
+                .media_key
+                .as_ref()
+                .is_some_and(|key| !key.is_empty())
+                && (sticker.direct_path.is_some() || sticker.url.is_some()),
+            "This sticker can no longer be downloaded, so it cannot be saved"
+        );
+        let mut action = wa::sync_action_value::StickerAction::default();
+        action.url = sticker.url.clone();
+        action.file_enc_sha256 = sticker.file_enc_sha256.clone();
+        action.media_key = sticker.media_key.clone();
+        action.mimetype = sticker.mimetype.clone();
+        action.height = sticker.height;
+        action.width = sticker.width;
+        action.direct_path = sticker.direct_path.clone();
+        action.file_length = sticker.file_length;
+        action.is_favorite = Some(favorite);
+        let mut value = wa::SyncActionValue::default();
+        value.sticker_action = MessageField::some(action);
+        value.timestamp = Some(crate::model::now() * 1000);
+        self.connected()
+            .await?
+            .send_app_state_action(&whatsapp_rust::schemas::FAVORITE_STICKER, &[hash], &value)
+            .await?;
+        Ok(())
+    }
+
+    async fn store_favorite(
+        &self,
+        hash: String,
+        encoded: Vec<u8>,
+        data: Option<Vec<u8>>,
+        favorite: bool,
+        (chat, sender, id): (String, String, String),
+    ) -> Result<()> {
+        let account = self.archive.account as i64;
+        let now = crate::model::now();
+        self.archive.backend.shared().run(move |conn| {
+            diesel::sql_query("INSERT INTO brazap_stickers(account,hash,encoded,favorite,updated_at,chat,sender,id,data) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(account,hash) DO UPDATE SET favorite=excluded.favorite,updated_at=MAX(brazap_stickers.updated_at,excluded.updated_at),data=COALESCE(excluded.data,brazap_stickers.data),chat=CASE WHEN brazap_stickers.chat='' THEN excluded.chat ELSE brazap_stickers.chat END,sender=CASE WHEN brazap_stickers.chat='' THEN excluded.sender ELSE brazap_stickers.sender END,id=CASE WHEN brazap_stickers.chat='' THEN excluded.id ELSE brazap_stickers.id END")
+                .bind::<BigInt,_>(account).bind::<Text,_>(hash).bind::<Binary,_>(encoded).bind::<BigInt,_>(i64::from(favorite)).bind::<BigInt,_>(now)
+                .bind::<Text,_>(chat).bind::<Text,_>(sender).bind::<Text,_>(id).bind::<Nullable<Binary>,_>(data)
+                .execute(conn).map_err(db_error)?;
+            Ok(())
+        }).await?;
+        Ok(())
+    }
+
+    /// The hashes of the stickers in My stickers.
+    pub async fn favorite_sticker_hashes(&self) -> Result<Vec<String>> {
+        let account = self.archive.account as i64;
+        #[derive(QueryableByName)]
+        struct Row {
+            #[diesel(sql_type=Text)]
+            hash: String,
+        }
+        let rows: Vec<Row> = self
+            .archive
+            .backend
+            .shared()
+            .read(move |conn| {
+                diesel::sql_query("SELECT hash FROM brazap_stickers WHERE account=? AND favorite=1")
+                    .bind::<BigInt, _>(account)
+                    .load(conn)
+                    .map_err(db_error)
+            })
+            .await?;
+        Ok(rows.into_iter().map(|row| row.hash).collect())
+    }
+
+    /// The media bytes of an archived message, downloading them when needed.
+    async fn message_media(
+        &self,
+        chat: &str,
+        sender: &str,
+        id: &str,
+    ) -> Result<(Message, wa::Message, Vec<u8>)> {
+        self.archive.allow_chat(chat).await?;
+        let proto = self
+            .archive
+            .raw_message(chat.into(), sender.into(), id.into())
+            .await?;
+        let view = crate::storage::project_message(
+            chat.into(),
+            sender.into(),
+            id.into(),
+            false,
+            0,
+            &proto,
+            String::new(),
+            "{}".into(),
+        )
+        .view;
+        let bytes = self.download_media(&view, proto.clone()).await?;
+        Ok((view, proto, bytes))
+    }
+
+    /// Makes a sticker from a photo, video or GIF and adds it to My stickers.
+    #[cfg(feature = "desktop")]
+    pub async fn create_sticker(&self, chat: String, sender: String, id: String) -> Result<()> {
+        let (view, _, bytes) = self.message_media(&chat, &sender, &id).await?;
+        let kind = view.kind.clone();
+        let webp = tokio::task::spawn_blocking(move || match kind.as_str() {
+            "image" => crate::media_convert::image_sticker(&bytes),
+            "video" => crate::media_convert::video_sticker(&bytes),
+            _ => anyhow::bail!("Stickers can be made from photos, videos and GIFs"),
+        })
+        .await??;
+        let animated = crate::media_convert::animated_webp(&webp);
+        let mut sticker = wa::message::StickerMessage::default();
+        sticker.mimetype = Some("image/webp".into());
+        sticker.width = Some(crate::media_convert::STICKER_SIDE);
+        sticker.height = Some(crate::media_convert::STICKER_SIDE);
+        sticker.is_animated = Some(animated);
+        if self.config.demo {
+            use sha2::Digest;
+            sticker.file_sha256 = Some(sha2::Sha256::digest(&webp).to_vec());
+            sticker.file_length = Some(webp.len() as u64);
+        } else {
+            let client = self.connected().await?;
+            let uploaded = client
+                .upload(
+                    webp.clone(),
+                    whatsapp_rust::download::MediaType::Sticker,
+                    Default::default(),
+                )
+                .await?;
+            sticker.url = Some(uploaded.url);
+            sticker.direct_path = Some(uploaded.direct_path);
+            sticker.media_key = Some(uploaded.media_key.to_vec());
+            sticker.file_sha256 = Some(uploaded.file_sha256.to_vec());
+            sticker.file_enc_sha256 = Some(uploaded.file_enc_sha256.to_vec());
+            sticker.file_length = Some(uploaded.file_length);
+        }
+        let hash = STANDARD.encode(sticker.file_sha256.as_deref().unwrap_or_default());
+        if !self.config.demo {
+            self.sync_favorite(&hash, &sticker, true).await?;
+        }
+        let mut stored = wa::Message::default();
+        stored.sticker_message = MessageField::some(sticker);
+        self.store_favorite(
+            hash,
+            stored.encode_to_vec(),
+            Some(webp),
+            true,
+            Default::default(),
+        )
+        .await?;
+        self.changed();
+        Ok(())
+    }
+
+    /// Writes an animated sticker or a WhatsApp GIF to `path` as a GIF file.
+    #[cfg(feature = "desktop")]
+    pub async fn save_gif(
+        &self,
+        chat: String,
+        sender: String,
+        id: String,
+        path: String,
+    ) -> Result<()> {
+        let (view, _, bytes) = self.message_media(&chat, &sender, &id).await?;
+        let gif = tokio::task::spawn_blocking(move || match view.kind.as_str() {
+            "sticker" if crate::media_convert::animated_webp(&bytes) => {
+                crate::media_convert::webp_to_gif(&bytes)
+            }
+            "video" => crate::media_convert::video_to_gif(&bytes),
+            _ => anyhow::bail!("Only GIFs and animated stickers can be copied as GIFs"),
+        })
+        .await??;
+        tokio::fs::write(path, gif).await?;
+        Ok(())
+    }
+}

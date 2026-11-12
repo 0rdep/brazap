@@ -3,7 +3,7 @@ use crate::{
     service::Service,
     storage::{Archive, db_error},
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use diesel::{
     prelude::*,
     sql_types::{BigInt, Text},
@@ -107,6 +107,68 @@ impl Service {
         self.archive.delete_chat_through(&chat, through).await?;
         self.changed();
         Ok(())
+    }
+
+    /// The region of the account's own number, used for numbers typed without a country code.
+    pub async fn account_region(&self) -> Option<String> {
+        if let Some(region) = self.region.lock().ok().and_then(|region| region.clone()) {
+            return Some(region);
+        }
+        let own = self.archive.own_jids().await.ok()?;
+        let digits = own
+            .iter()
+            .find_map(|jid| jid.strip_suffix("@s.whatsapp.net"))?;
+        let region = crate::phone_links::region_of(digits)?;
+        if let Ok(mut cached) = self.region.lock() {
+            *cached = Some(region.clone());
+        }
+        Some(region)
+    }
+
+    /// Opens a chat from a JID, a phone number or a WhatsApp link (`wa.me`,
+    /// `whatsapp://send`). Numbers are checked with WhatsApp first, which also returns the
+    /// address the account is registered under. Returns the chat and any message the link
+    /// asks to start with.
+    pub async fn open_address(&self, address: &str) -> Result<(String, Option<String>)> {
+        let address = address.trim();
+        let (jid, text) = if address.contains('@') && !address.contains('/') {
+            (address.parse::<whatsapp_rust::Jid>()?, None)
+        } else {
+            let region = self.account_region().await;
+            let target = crate::phone_links::parse(address, region.as_deref()).context(
+                if region.is_some() {
+                    "Enter a phone number or a WhatsApp link"
+                } else {
+                    "Enter a phone number with its country code, or a WhatsApp link"
+                },
+            )?;
+            (self.registered_jid(&target.digits).await?, target.text)
+        };
+        let chat = self.archive.canonical_chat(&jid.to_string()).await?;
+        self.archive
+            .name_chat(chat.clone(), String::new(), 0, now())
+            .await?;
+        self.changed();
+        Ok((chat, text))
+    }
+
+    async fn registered_jid(&self, digits: &str) -> Result<whatsapp_rust::Jid> {
+        let jid = whatsapp_rust::Jid::pn(digits);
+        // The demo has no WhatsApp connection to ask; every number opens.
+        if self.config.demo {
+            return Ok(jid);
+        }
+        let client = self.connected().await?;
+        let results = client.contacts().is_on_whatsapp(&[jid]).await?;
+        let found = results
+            .into_iter()
+            .find(|result| result.is_registered)
+            .context("This number isn't on WhatsApp")?;
+        // A LID answer still names the phone number it belongs to.
+        Ok(found
+            .pn_jid
+            .filter(|_| found.jid.server.is_lid_family())
+            .unwrap_or(found.jid))
     }
 
     pub async fn mark_chat_unread(&self, chat: String) -> Result<()> {

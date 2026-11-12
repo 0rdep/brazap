@@ -24,18 +24,27 @@ pub(crate) struct Status {
 #[cfg(target_os = "windows")]
 pub(crate) use windows::Player;
 
+/// A poster frame for a video WhatsApp sent without a thumbnail, as PNG bytes.
 pub(crate) async fn poster(bytes: Vec<u8>) -> anyhow::Result<Option<Vec<u8>>> {
-    #[cfg(target_os = "windows")]
-    {
-        static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-        let _permit = SLOTS.acquire().await?;
-        tokio::task::spawn_blocking(move || windows::poster(bytes).map(Some)).await?
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = bytes;
-        Ok(None)
-    }
+    static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    let _permit = SLOTS.acquire().await?;
+    tokio::task::spawn_blocking(move || {
+        // Windows decodes every format it supports; the bundled H.264 decoder covers the
+        // other platforms, and any video Windows cannot open.
+        #[cfg(target_os = "windows")]
+        match windows::poster(bytes.clone()) {
+            Ok(png) => return Ok(Some(png)),
+            Err(error) => log::debug!("Windows could not decode a video poster: {error:#}"),
+        }
+        match crate::media_convert::first_frame_png(&bytes, 360) {
+            Ok(png) => Ok(Some(png)),
+            Err(error) => {
+                log::debug!("Could not decode a video poster: {error:#}");
+                Ok(None)
+            }
+        }
+    })
+    .await?
 }
 
 #[cfg(not(target_os = "windows"))]

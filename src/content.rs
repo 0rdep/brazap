@@ -449,6 +449,7 @@ pub fn project(view: &mut Message, message: &wa::Message) {
         view.kind = "video".into();
         view.mime = m.mimetype.clone();
         view.duration_seconds = m.seconds;
+        view.gif = m.gif_playback == Some(true);
     } else if let Some(m) = media.audio_message.as_option() {
         view.kind = "audio".into();
         view.mime = m.mimetype.clone();
@@ -457,6 +458,10 @@ pub fn project(view: &mut Message, message: &wa::Message) {
     } else if let Some(m) = media.sticker_message.as_option() {
         view.kind = "sticker".into();
         view.mime = m.mimetype.clone();
+        view.sticker_hash = m.file_sha256.as_ref().map(|hash| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(hash)
+        });
     } else if let Some(m) = media.document_message.as_option() {
         view.kind = "file".into();
         view.mime = m.mimetype.clone();

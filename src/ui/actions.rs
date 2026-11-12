@@ -19,6 +19,11 @@ const FORWARD: Icon = Icon {
     view: 24.0,
     body: r#"<path d="m14 5 7 6-7 6v-4c-6 0-9 2-11 6 1-9 4-10 11-10Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>"#,
 };
+const ADD_STICKER: Icon = Icon {
+    name: "add-sticker",
+    view: 24.0,
+    body: r#"<path d="M13 3H8a5 5 0 0 0-5 5v8a5 5 0 0 0 5 5h5l8-8v-2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M13 21v-3a5 5 0 0 1 5-5h3M18 2v6M15 5h6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
 const CHECK: Icon = Icon {
     name: "selected-message",
     view: 24.0,
@@ -126,10 +131,16 @@ fn action(
         .child(icon(glyph, 16.0).color(MUTED))
 }
 
-pub(super) fn toolbar(message: &Message) -> El {
+pub(super) fn toolbar(s: &State, message: &Message) -> El {
     let react = message.clone();
     let reply = message.clone();
     let forward = message.clone();
+    let save = message.clone();
+    // Stickers not yet in My stickers can be saved straight from the conversation.
+    let unsaved = message
+        .sticker_hash
+        .as_ref()
+        .is_some_and(|hash| !s.snapshot.favorite_stickers.contains(hash));
     row()
         .key(format!("message-actions-{}-{}", message.sender, message.id))
         .gap(4.0)
@@ -147,6 +158,11 @@ pub(super) fn toolbar(message: &Message) -> El {
         .child(action(&FORWARD, "Forward message", move |s, _| {
             s.picker.open = false;
             s.begin_forward(forward.clone())
+        }))
+        .children(unsaved.then(|| {
+            action(&ADD_STICKER, "Add to My stickers", move |s, _| {
+                s.favorite_sticker(&save, true)
+            })
         }))
 }
 

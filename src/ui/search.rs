@@ -145,6 +145,23 @@ pub(super) fn poll(s: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
     changed
 }
 
+/// The phone number or WhatsApp link typed in the sidebar search, when it is one.
+pub(super) fn phone_target(s: &State) -> Option<crate::phone_links::PhoneTarget> {
+    if s.section != super::Section::Messages {
+        return None;
+    }
+    crate::phone_links::parse(&s.search.edit.text, s.snapshot.region.as_deref())
+}
+
+/// A chat already open with the number in the search, so the number row is not needed.
+pub(super) fn chat_for_number<'a>(
+    s: &'a State,
+    target: &crate::phone_links::PhoneTarget,
+) -> Option<&'a Chat> {
+    let jid = format!("{}@s.whatsapp.net", target.digits);
+    s.snapshot.chats.iter().find(|chat| chat.matches_jid(&jid))
+}
+
 pub(super) fn matching_chats(s: &State) -> Vec<&Chat> {
     let query = s.search.edit.text.trim().to_lowercase();
     let digits: String = query.chars().filter(char::is_ascii_digit).collect();
@@ -164,6 +181,19 @@ pub(super) fn matching_chats(s: &State) -> Vec<&Chat> {
 }
 
 impl State {
+    /// Opens the chat for the number or link in the sidebar search, after WhatsApp
+    /// confirms the number has an account.
+    pub(super) fn open_number(&mut self) {
+        if self.busy || phone_target(self).is_none() {
+            return;
+        }
+        self.busy = true;
+        self.error = None;
+        let _ = self
+            .tx
+            .send(Command::Open(self.search.edit.text.trim().to_owned()));
+    }
+
     pub(super) fn open_chat_search(&mut self, tx: &mut Tx) {
         if self.selected.is_none() {
             return;

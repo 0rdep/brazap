@@ -50,6 +50,8 @@ pub struct Service {
     pub(crate) history_lock: Mutex<()>,
     pub(crate) desktop: Mutex<crate::notifications::Desktop>,
     media_jobs: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The region of the account's own number, once known.
+    pub(crate) region: std::sync::Mutex<Option<String>>,
 }
 
 impl Service {
@@ -130,6 +132,7 @@ impl Service {
             history_lock: Mutex::new(()),
             desktop: Mutex::new(crate::notifications::Desktop::default()),
             media_jobs: std::sync::Mutex::new(std::collections::HashSet::new()),
+            region: std::sync::Mutex::new(None),
         }))
     }
 
@@ -1080,6 +1083,8 @@ impl Service {
             live_call: self.live_call().await,
             current_chat,
             settings: self.settings.read().await.clone(),
+            region: self.account_region().await,
+            favorite_stickers: self.favorite_sticker_hashes().await.unwrap_or_default(),
         })
     }
 

@@ -18,11 +18,14 @@ pub mod ipc;
 pub(crate) mod links;
 pub mod logging;
 pub mod mcp;
+#[cfg(feature = "desktop")]
+pub mod media_convert;
 pub(crate) mod media_recovery;
 pub mod message_actions;
 pub mod model;
 pub mod notifications;
 pub(crate) mod outbox;
+pub mod phone_links;
 #[cfg(feature = "desktop")]
 pub(crate) mod playback;
 pub(crate) mod read_state;

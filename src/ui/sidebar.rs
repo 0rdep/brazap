@@ -232,7 +232,18 @@ fn search_input(s: &State) -> El {
         }))
         .width(None)
         .height(super::locale::scale(38.0))
-        .on_edit(|s: &mut State| &mut s.search.edit);
+        .on_edit(|s: &mut State| &mut s.search.edit)
+        .on_key(|s: &mut State, event, _| {
+            // Enter opens a typed number when no existing chat already matches it.
+            if event.key == rune::Key::Enter
+                && let Some(target) = super::search::phone_target(s)
+                && super::search::chat_for_number(s, &target).is_none()
+            {
+                s.open_number();
+                return true;
+            }
+            false
+        });
     if !s.search.edit.text.is_empty() {
         input = input.trailing(
             el().key("clear-search")
@@ -357,14 +368,25 @@ fn expanded(s: &State) -> El {
 #[derive(Clone)]
 enum SearchRow {
     Heading(&'static str),
+    Number(crate::phone_links::PhoneTarget),
     Chat(Chat),
     Message(usize),
 }
 
 fn search_results(s: &State) -> El {
-    let chats = super::search::matching_chats(s);
-    let empty = chats.is_empty() && s.search.results.messages.is_empty();
+    let mut chats = super::search::matching_chats(s);
     let mut rows = Vec::new();
+    if let Some(target) = super::search::phone_target(s) {
+        match super::search::chat_for_number(s, &target) {
+            Some(chat) => {
+                if !chats.iter().any(|c| c.jid == chat.jid) {
+                    chats.insert(0, chat);
+                }
+            }
+            None => rows.push(SearchRow::Number(target)),
+        }
+    }
+    let empty = rows.is_empty() && chats.is_empty() && s.search.results.messages.is_empty();
     if !chats.is_empty() {
         rows.push(SearchRow::Heading("Chats"));
         rows.extend(chats.into_iter().cloned().map(SearchRow::Chat));
@@ -384,6 +406,7 @@ fn search_results(s: &State) -> El {
             78.0,
             move |s: &State, i| match &keys[i] {
                 SearchRow::Heading(name) => format!("search-heading-{name}").into(),
+                SearchRow::Number(target) => format!("search-number-{}", target.digits).into(),
                 SearchRow::Chat(chat) => format!("search-chat-{}", chat.jid).into(),
                 SearchRow::Message(index) => {
                     let m = &s.search.results.messages[*index].message;
@@ -394,6 +417,7 @@ fn search_results(s: &State) -> El {
                 SearchRow::Heading(name) => {
                     label(super::locale::tr(name), 11.0, MINT).padding(10.0)
                 }
+                SearchRow::Number(target) => number_row(s, target),
                 SearchRow::Chat(chat) => chat_row(s, chat),
                 SearchRow::Message(index) => search_message_row(s, *index),
             },
@@ -439,6 +463,62 @@ fn search_results(s: &State) -> El {
             })
             .child(list),
     )
+}
+
+/// Starts a chat with a number that has no chat yet, typed or pasted as a WhatsApp link.
+fn number_row(s: &State, target: &crate::phone_links::PhoneTarget) -> El {
+    let checking = s.busy;
+    let available = s.snapshot.connection.phase == crate::model::Phase::Connected || s.config.demo;
+    let detail = if checking {
+        "Checking WhatsApp…"
+    } else if !available {
+        "Connect to WhatsApp to message this number"
+    } else {
+        "Message this number"
+    };
+    let mut row = row()
+        .key(format!("number-row-{}", target.digits))
+        .w_full()
+        .h(super::locale::scale(76.0))
+        .min_h(super::locale::scale(76.0))
+        .max_h(super::locale::scale(76.0))
+        .px(10.0)
+        .gap(10.0)
+        .center_y()
+        .radius(13.0)
+        .role("button")
+        .label(super::locale::format(
+            "Message {number}",
+            &[("number", target.display.clone())],
+        ))
+        .child(
+            el().size(38.0, 38.0)
+                .radius(19.0)
+                .center()
+                .fill(MINT.alpha(0.14))
+                .child(icon(&CHAT, 18.0).color(MINT)),
+        )
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(7.0)
+                .child(title(&target.display, 13.0).truncate())
+                .child(
+                    label(
+                        super::locale::tr(detail),
+                        11.0,
+                        if available { MINT } else { MUTED },
+                    )
+                    .truncate(),
+                ),
+        );
+    if available && !checking {
+        row = row
+            .hover(Color::WHITE.alpha(0.035))
+            .on_press(|s: &mut State| s.open_number());
+    }
+    row
 }
 
 fn search_message_row(s: &State, index: usize) -> El {

@@ -107,7 +107,7 @@ fn run() -> Result<()> {
             .iter()
             .position(|arg| arg == "--open-chat")
             .map(|index| {
-                brazap::notifications::chat_from_link(
+                brazap::notifications::activation_target(
                     args.get(index + 1)
                         .context("--open-chat needs a chat link")?,
                 )

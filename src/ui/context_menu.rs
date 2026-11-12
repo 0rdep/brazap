@@ -214,7 +214,61 @@ fn profile_items(jid: &str, name: &str) -> El {
     }))
 }
 
-fn message_items(_s: &State, m: &Message) -> El {
+impl State {
+    /// Adds a message's sticker to My stickers, or removes it.
+    pub(super) fn favorite_sticker(&mut self, m: &Message, favorite: bool) {
+        let Some(hash) = m.sticker_hash.clone() else {
+            return;
+        };
+        // Shown at once; the next snapshot carries what WhatsApp accepted.
+        self.snapshot
+            .favorite_stickers
+            .retain(|saved| *saved != hash);
+        if favorite {
+            self.snapshot.favorite_stickers.push(hash);
+        }
+        self.run_sticker_job(
+            "favorite_sticker",
+            json!({"chat":m.chat,"sender":m.sender,"id":m.id,"favorite":favorite}),
+            if favorite {
+                "Sticker added to My stickers"
+            } else {
+                "Sticker removed from My stickers"
+            },
+            None,
+        );
+    }
+
+    /// Makes a sticker from a photo, video or GIF and adds it to My stickers.
+    pub(super) fn create_sticker(&mut self, m: &Message) {
+        self.run_sticker_job(
+            "create_sticker",
+            json!({"chat":m.chat,"sender":m.sender,"id":m.id}),
+            "Sticker added to My stickers",
+            Some("Creating sticker…"),
+        );
+    }
+
+    fn run_sticker_job(
+        &mut self,
+        tool: &'static str,
+        args: serde_json::Value,
+        done: &'static str,
+        working: Option<&str>,
+    ) {
+        self.error = None;
+        if self.tx.send(Command::Sticker(tool, args, done)).is_err() {
+            self.error = Some("The local service stopped".into());
+            return;
+        }
+        self.sticker_jobs += 1;
+        if let Some(working) = working {
+            self.notice = Some((working.into(), None));
+        }
+    }
+}
+
+fn message_items(s: &State, m: &Message) -> El {
     let mut body = col().w(222.0).gap(2.0).padding(6.0);
     if !m.text.is_empty() {
         let text = m.text.clone();
@@ -228,7 +282,9 @@ fn message_items(_s: &State, m: &Message) -> El {
         let target = m.clone();
         body = body.child(item(
             match m.kind.as_str() {
-                "image" | "sticker" => "Copy image",
+                "image" => "Copy image",
+                "sticker" => "Copy sticker",
+                "video" if m.gif => "Copy GIF",
                 "video" => "Copy video",
                 "audio" => "Copy audio",
                 _ => "Copy file",
@@ -242,6 +298,37 @@ fn message_items(_s: &State, m: &Message) -> El {
             s.close_context_menu();
             save_file(s, tx, target.clone());
         }));
+    }
+    if m.kind == "sticker"
+        && let Some(hash) = &m.sticker_hash
+    {
+        let saved = s.snapshot.favorite_stickers.contains(hash);
+        let target = m.clone();
+        body = body.child(item(
+            if saved {
+                "Remove from My stickers"
+            } else {
+                "Add to My stickers"
+            },
+            true,
+            false,
+            move |s, _| {
+                s.close_context_menu();
+                s.favorite_sticker(&target, !saved);
+            },
+        ));
+    }
+    if matches!(m.kind.as_str(), "image" | "video") {
+        let target = m.clone();
+        body = body.child(item(
+            "Create sticker",
+            s.sticker_jobs == 0,
+            false,
+            move |s, _| {
+                s.close_context_menu();
+                s.create_sticker(&target);
+            },
+        ));
     }
     let reply = m.clone();
     body = body.child(item(
@@ -347,12 +434,29 @@ pub(super) async fn save_profile(
     Ok(())
 }
 
+/// A new file for the clipboard. Files must outlive the copy, so they go in the cache.
+async fn clipboard_file(config: &Config, extension: &str) -> anyhow::Result<std::path::PathBuf> {
+    let dir = config.cache_dir().join("clipboard");
+    tokio::fs::create_dir_all(&dir).await?;
+    Ok(dir.join(format!("{}.{extension}", uuid::Uuid::new_v4())))
+}
+
 pub(super) async fn prepare_copy(
     remote: &Remote,
     config: &Config,
     message: Message,
 ) -> anyhow::Result<ClipboardContent> {
     use anyhow::Context;
+    // GIFs and animated stickers are copied as GIF files, which keep their animation when
+    // pasted; a still image loses it.
+    if message.kind == "video" && message.gif {
+        let file = clipboard_file(config, "gif").await?;
+        if let Err(error) = remote.call("save_gif",json!({"chat":message.chat,"sender":message.sender,"id":message.id,"path":file.to_string_lossy()})).await {
+            let _ = tokio::fs::remove_file(&file).await;
+            return Err(error);
+        }
+        return Ok(ClipboardContent::default().with_files([file]));
+    }
     if matches!(message.kind.as_str(), "image" | "sticker") {
         let file = tempfile::Builder::new()
             .prefix("brazap-copy-")
@@ -360,6 +464,14 @@ pub(super) async fn prepare_copy(
             .into_temp_path();
         remote.call("save_attachment",json!({"chat":message.chat,"sender":message.sender,"id":message.id,"path":file.to_string_lossy()})).await?;
         let bytes = tokio::fs::read(&file).await?;
+        if message.kind == "sticker" && crate::media_convert::animated_webp(&bytes) {
+            let gif =
+                tokio::task::spawn_blocking(move || crate::media_convert::webp_to_gif(&bytes))
+                    .await??;
+            let file = clipboard_file(config, "gif").await?;
+            tokio::fs::write(&file, gif).await?;
+            return Ok(ClipboardContent::default().with_files([file]));
+        }
         tokio::task::spawn_blocking(move || {
             let image = image::load_from_memory(&bytes)?;
             let mut png = std::io::Cursor::new(Vec::new());

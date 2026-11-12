@@ -26,6 +26,22 @@ pub(crate) struct Desktop {
     presence: Option<(u64, bool)>,
 }
 
+/// What a desktop activation opens: a chat from a notification link, or a WhatsApp
+/// `whatsapp://send?phone=…` link, which is passed on whole to be checked and opened.
+pub fn activation_target(link: &str) -> Result<String> {
+    if link
+        .get(..11)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("whatsapp://"))
+    {
+        ensure!(
+            link.len() <= 8192 && crate::phone_links::parse(link, None).is_some(),
+            "This WhatsApp link does not name a phone number"
+        );
+        return Ok(format!("whatsapp://{}", &link[11..]));
+    }
+    chat_from_link(link)
+}
+
 pub fn chat_from_link(link: &str) -> Result<String> {
     let chat = link
         .strip_prefix("brazap://chat/")
@@ -48,7 +64,7 @@ pub fn chat_from_link(link: &str) -> Result<String> {
 
 impl Service {
     pub async fn activate_desktop(&self, chat: Option<String>) -> Result<Value> {
-        let chat = chat.map(|chat| chat_from_link(&chat)).transpose()?;
+        let chat = chat.map(|chat| activation_target(&chat)).transpose()?;
         let mut desktop = self.desktop.lock().await;
         let available = desktop
             .seen

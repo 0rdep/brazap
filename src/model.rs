@@ -153,6 +153,12 @@ pub struct Message {
     /// display fields are filled from current contacts when a message is loaded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mentions: Vec<Mention>,
+    /// A video WhatsApp plays as a looping, silent GIF.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gif: bool,
+    /// The sticker's file hash, which identifies it in My stickers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticker_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -373,6 +379,13 @@ pub struct Snapshot {
     pub live_call: Option<crate::calling::LiveCall>,
     #[serde(default)]
     pub current_chat: Option<Chat>,
+    /// The region of the account's own number (such as `BR`), for numbers typed without a
+    /// country code.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// File hashes of the stickers in My stickers.
+    #[serde(default)]
+    pub favorite_stickers: Vec<String>,
 }
 
 pub fn now() -> i64 {

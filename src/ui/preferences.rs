@@ -105,7 +105,6 @@ impl State {
         self.reply = None;
         self.details = false;
         self.contact = None;
-        self.new_chat = false;
         self.diagnostics.open = false;
         self.picker.open = false;
         self.chat_search.clear();

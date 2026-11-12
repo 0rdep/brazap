@@ -71,6 +71,8 @@ enum Command {
     Deselect,
     ManageChat(&'static str, Value),
     CopyMedia(u64, Message),
+    /// Sticker work that takes seconds: the tool, its arguments and what to say when done.
+    Sticker(&'static str, Value, &'static str),
     CopyProfile(u64, String),
     SaveProfile(String, std::path::PathBuf),
     ReplyStatus(String, String, String, String),
@@ -106,6 +108,7 @@ enum Command {
 }
 enum Event {
     MediaCopied(u64, Result<rune::ClipboardContent, String>),
+    StickerDone(Result<&'static str, String>),
     StatusReplied(String, Result<Message, String>),
     NextAudio(u64, Result<Option<Message>, String>),
     Activate(Option<String>),
@@ -138,7 +141,7 @@ enum Event {
     Done(Result<Value, String>),
     Sent(String, Result<Message, String>),
     Forward(Result<crate::model::ForwardResult, String>),
-    Opened(Result<String, String>),
+    Opened(Result<(String, Option<String>), String>),
     Older(String, u64, Result<MessagePage, String>),
     Newer(String, u64, Result<MessagePage, String>),
 }
@@ -220,11 +223,9 @@ pub(super) struct State {
     draft: TextEdit,
     phone: TextEdit,
     phone_country: phone::Picker,
-    address: TextEdit,
     drafts: HashMap<String, String>,
     pending_sends: HashMap<String, (Message, Option<MessageCursor>)>,
     phone_mode: bool,
-    new_chat: bool,
     details: bool,
     gallery: Vec<Message>,
     gallery_kind: String,
@@ -234,6 +235,11 @@ pub(super) struct State {
     detached: bool,
     show_archived: bool,
     badge: Option<u32>,
+    /// A WhatsApp link opened from outside, waiting for the connection.
+    pending_link: Option<String>,
+    /// A short confirmation shown at the bottom, and when it disappears.
+    notice: Option<(String, Option<f64>)>,
+    sticker_jobs: usize,
     visible_media: Vec<(String, String)>,
     prefetched: HashSet<String>,
     scroll_height: std::rc::Rc<std::cell::Cell<f32>>,
@@ -365,11 +371,9 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         draft: TextEdit::new(""),
         phone: TextEdit::new(""),
         phone_country: phone::Picker::default(),
-        address: TextEdit::new(""),
         drafts: HashMap::new(),
         pending_sends: HashMap::new(),
         phone_mode: false,
-        new_chat: false,
         details: false,
         gallery: Vec::new(),
         gallery_kind: "media".into(),
@@ -379,6 +383,9 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         detached: false,
         show_archived: false,
         badge: None,
+        pending_link: None,
+        notice: None,
+        sticker_jobs: 0,
         visible_media: Vec::new(),
         prefetched: HashSet::new(),
         scroll_height: std::rc::Rc::new(std::cell::Cell::new(1.0)),
@@ -615,6 +622,13 @@ async fn worker(
                             emit(&events,&wake,Event::MediaCopied(generation,result));
                         });continue;
                     }
+                    Some(Command::Sticker(name,args,done))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=remote.call(name,args).await.map(|_|done).map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::StickerDone(result));
+                        });continue;
+                    }
                     Some(Command::CopyProfile(generation,jid))=>{
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
                         assets.spawn(async move {
@@ -830,8 +844,11 @@ async fn worker(
                         emit(&events,&wake,Event::Forward(result));
                     }
                     Some(Command::Open(address))=>{
-                        let result=remote.call("open_chat",json!({"address":address})).await.and_then(|value|value["chat"].as_str().map(str::to_owned).ok_or_else(||anyhow::anyhow!("Missing chat address"))).map_err(|e|format!("{e:#}"));
-                        if let Ok(chat)=&result {selected=Some(chat.clone());}
+                        let result=remote.call("open_chat",json!({"address":address})).await.and_then(|value|{
+                            let chat=value["chat"].as_str().map(str::to_owned).ok_or_else(||anyhow::anyhow!("Missing chat address"))?;
+                            Ok((chat,value["text"].as_str().map(str::to_owned)))
+                        }).map_err(|e|format!("{e:#}"));
+                        if let Ok((chat,_))=&result {selected=Some(chat.clone());}
                         emit(&events,&wake,Event::Opened(result));
                     }
                     Some(Command::Newer(chat,cursor,generation))=>{
@@ -930,6 +947,19 @@ async fn worker(
 
 fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
     locale::configure(&state.preferences.value.appearance);
+    // Notices stay for a few seconds once shown; "Creating sticker…" stays until it is done.
+    if state.sticker_jobs == 0
+        && let Some((_, expiry)) = &mut state.notice
+    {
+        match *expiry {
+            None => {
+                *expiry = Some(elapsed + 3.0);
+                tx.wake_after(Duration::from_secs(3));
+            }
+            Some(at) if elapsed >= at => state.notice = None,
+            Some(_) => {}
+        }
+    }
     state
         .background
         .localize(&state.preferences.value.appearance.language);
@@ -985,6 +1015,17 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
                     changed = true;
                 }
             }
+            Event::StickerDone(result) => {
+                state.sticker_jobs = state.sticker_jobs.saturating_sub(1);
+                match result {
+                    Ok(done) => state.notice = Some((done.into(), None)),
+                    Err(error) => {
+                        state.notice = None;
+                        state.error = Some(error);
+                    }
+                }
+                changed = true;
+            }
             Event::StatusReplied(id, result) => {
                 state.receive_status_reply(id, result);
                 changed = true;
@@ -1025,8 +1066,14 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
                 changed |= state.receive_call_frame(id, local, width, height, rgba, pending);
             }
             Event::Activate(chat) => {
-                if let Some(chat) = chat {
-                    state.select(chat);
+                match chat {
+                    // A WhatsApp link opened from the browser or another app.
+                    Some(link) if link.starts_with("whatsapp:") => {
+                        state.pending_link = Some(link);
+                        state.open_pending_link();
+                    }
+                    Some(chat) => state.select(chat),
+                    None => {}
                 }
                 if let Ok(window) = state.window.lock()
                     && let Some(window) = window.as_ref()
@@ -1329,10 +1376,18 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
             Event::Opened(result) => {
                 state.busy = false;
                 match result {
-                    Ok(chat) => {
-                        state.select(chat);
-                        state.new_chat = false;
-                        state.address.clear();
+                    Ok((chat, text)) => {
+                        state.search.clear();
+                        state.select(chat.clone());
+                        // A link's message becomes the draft, without replacing one already typed.
+                        if let Some(text) = text
+                            && state.is_current_chat(&chat)
+                            && state.draft.text.trim().is_empty()
+                        {
+                            state.draft = TextEdit::new(text);
+                            state.draft.focus = state.draft.text.len();
+                            state.draft.anchor = state.draft.focus;
+                        }
                     }
                     Err(e) => state.error = Some(e),
                 }
@@ -1665,6 +1720,7 @@ fn receive_snapshot(state: &mut State, mut snapshot: Snapshot, tx: &mut Tx) -> b
         let refreshed = state.snapshot.revision != snapshot.revision;
         state.snapshot = snapshot;
         state.update_badge();
+        state.open_pending_link();
         if state.section == Section::Status {
             state.request_status_avatars();
         }
@@ -1834,6 +1890,21 @@ impl State {
         }
     }
 
+    /// Opens a WhatsApp link from outside once connected; the number check needs WhatsApp.
+    fn open_pending_link(&mut self) {
+        let ready = self.config.demo
+            || (self.authenticated
+                && self.snapshot.connection.phase == crate::model::Phase::Connected);
+        if !ready || self.busy {
+            return;
+        }
+        if let Some(link) = self.pending_link.take() {
+            self.busy = true;
+            self.error = None;
+            let _ = self.tx.send(Command::Open(link));
+        }
+    }
+
     fn update_viewing(&mut self) {
         let chat = if self.focused
             && self.authenticated
@@ -1843,7 +1914,6 @@ impl State {
             && self.contact.is_none()
             && self.viewer.is_none()
             && self.story.is_none()
-            && !self.new_chat
             && !self.diagnostics.open
             && self.attachments.is_none()
             && self

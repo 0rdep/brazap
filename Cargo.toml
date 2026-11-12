@@ -1,6 +1,6 @@
 [package]
 name = "brazap"
-version = "0.1.19"
+version = "0.1.20"
 edition = "2024"
 rust-version = "1.99.1"
 description = "A native WhatsApp desktop client with a local MCP interface"
@@ -9,7 +9,7 @@ license = "MIT"
 [features]
 default = ["desktop"]
 memory-profiling = []
-desktop = ["dep:rune", "dep:rune-kit", "dep:qrcode", "dep:tempfile", "dep:windows", "dep:windows-core", "dep:symphonia", "dep:opuscule", "dep:phonenumber", "dep:cpal", "dep:opus", "dep:ogg", "dep:nokhwa", "dep:openh264", "dep:ringbuf"]
+desktop = ["dep:rune", "dep:rune-kit", "dep:qrcode", "dep:tempfile", "dep:windows", "dep:windows-core", "dep:symphonia", "dep:opuscule", "dep:cpal", "dep:opus", "dep:ogg", "dep:nokhwa", "dep:openh264", "dep:mp4", "dep:webp-animation", "dep:ringbuf"]
 
 [dependencies]
 anyhow = "1"
@@ -26,9 +26,9 @@ flate2 = "1"
 log = "0.4"
 procwatch = { git = "https://github.com/anomalyco/rune", rev = "1213159f9ec300c7a309c67a89176f61a0b47753", features = ["release-gauges"] }
 libsqlite3-sys = "0.38.2"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 mime_guess = "2"
-phonenumber = { version = "0.3.10", optional = true }
+phonenumber = "0.3.10"
 qrcode = { version = "0.14", default-features = false, optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -41,6 +41,8 @@ opuscule = { version = "0.2.2", optional = true }
 opus = { version = "0.4.0", optional = true }
 ogg = { version = "0.9.2", optional = true }
 openh264 = { version = "0.9.9", optional = true }
+mp4 = { version = "0.14", optional = true }
+webp-animation = { version = "0.9", optional = true }
 nokhwa = { version = "0.10.11", features = ["input-native"], optional = true }
 ringbuf = { version = "0.6", optional = true }
 uuid = { version = "1", features = ["v4"] }

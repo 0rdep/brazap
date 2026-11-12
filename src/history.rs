@@ -206,11 +206,19 @@ impl Archive {
     /// Re-derive every stored message view from its raw protobuf. Returns
     /// whether the upgrade ran, so callers can refresh what is on screen.
     pub async fn rebuild_projections(&self) -> Result<bool> {
-        if self
-            .preference("message_projection_v8".into())
-            .await?
-            .is_some()
-        {
+        let all = self.reproject("message_projection_v8", "").await?;
+        // GIF playback and sticker hashes were added later; only those rows need them.
+        let media = self
+            .reproject(
+                "message_media_flags_v1",
+                " AND json_extract(payload,'$.kind') IN ('video','sticker')",
+            )
+            .await?;
+        Ok(all || media)
+    }
+
+    async fn reproject(&self, marker: &'static str, only: &'static str) -> Result<bool> {
+        if self.preference(marker.into()).await?.is_some() {
             return Ok(false);
         }
         let identities = self.identities().await?;
@@ -218,7 +226,7 @@ impl Archive {
         loop {
             let account = self.account as i64;
             let rows:Vec<RawRow>=self.backend.shared().read(move |conn| {
-                diesel::sql_query("SELECT rowid AS cursor,payload,encoded,metadata FROM brazap_messages WHERE account=? AND rowid>? ORDER BY rowid LIMIT 256").bind::<BigInt,_>(account).bind::<BigInt,_>(cursor).load(conn).map_err(db_error)
+                diesel::sql_query(format!("SELECT rowid AS cursor,payload,encoded,metadata FROM brazap_messages WHERE account=? AND rowid>?{only} ORDER BY rowid LIMIT 256")).bind::<BigInt,_>(account).bind::<BigInt,_>(cursor).load(conn).map_err(db_error)
             }).await?;
             if rows.is_empty() {
                 break;
@@ -265,8 +273,7 @@ impl Archive {
                 }).map_err(db_error)
             }).await?;
         }
-        self.set_preference("message_projection_v8".into(), "1".into())
-            .await?;
+        self.set_preference(marker.into(), "1".into()).await?;
         Ok(true)
     }
 

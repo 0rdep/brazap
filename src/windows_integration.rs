@@ -322,6 +322,12 @@ fn register(config: &crate::config::Config) -> Result<()> {
             config.data_dir.display()
         ),
     )?;
+    // Demo profiles never claim WhatsApp links; they belong to the real profile.
+    if !config.demo
+        && let Err(error) = register_whatsapp_links(&exe, config)
+    {
+        log::warn!("Could not register WhatsApp links: {error:#}");
+    }
     let programs = std::env::var_os("APPDATA").context("Missing Windows APPDATA directory")?;
     let shortcut = Path::new(&programs).join(if config.demo {
         "Microsoft/Windows/Start Menu/Programs/Brazap Demo.lnk"
@@ -353,6 +359,40 @@ fn register(config: &crate::config::Config) -> Result<()> {
         result?;
     }
     Ok(())
+}
+
+/// Handles `whatsapp://send?phone=…` links, which `wa.me` pages also open. The scheme key
+/// makes Brazap the handler when no app was chosen, and the capabilities list Brazap in
+/// Settings → Apps → Default apps, where Windows keeps the user's own choice of app.
+fn register_whatsapp_links(exe: &Path, config: &crate::config::Config) -> Result<()> {
+    let command = format!(
+        "\"{}\" --open-chat \"%1\" --data-dir \"{}\"",
+        exe.display(),
+        config.data_dir.display()
+    );
+    let icon = format!("\"{}\",0", exe.display());
+    for class in [
+        "Software\\Classes\\whatsapp",
+        "Software\\Classes\\Brazap.WhatsAppLink",
+    ] {
+        registry_value(class, "", "URL:WhatsApp")?;
+        registry_value(class, "URL Protocol", "")?;
+        registry_value(&format!("{class}\\DefaultIcon"), "", &icon)?;
+        registry_value(&format!("{class}\\shell\\open\\command"), "", &command)?;
+    }
+    let capabilities = "Software\\Brazap\\Capabilities";
+    registry_value(capabilities, "ApplicationName", "Brazap")?;
+    registry_value(
+        capabilities,
+        "ApplicationDescription",
+        "Desktop client for WhatsApp",
+    )?;
+    registry_value(
+        &format!("{capabilities}\\URLAssociations"),
+        "whatsapp",
+        "Brazap.WhatsAppLink",
+    )?;
+    registry_value("Software\\RegisteredApplications", "Brazap", capabilities)
 }
 
 fn xml(value: &str) -> String {
