@@ -194,7 +194,7 @@ fn badge_icon(count: u32) -> Option<HICON> {
     }
 }
 
-/// Shows `count` unread messages over the taskbar icon, or clears it at zero.
+/// Shows `count` unread chats over the taskbar icon, or clears it at zero.
 /// Returns whether Windows accepted it; it refuses while the window has no taskbar button.
 pub fn set_unread_badge(window: &rune::WindowHandle, count: u32, description: &str) -> bool {
     window

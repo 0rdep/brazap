@@ -841,6 +841,6 @@
   "Copy": "Copiar",
   "Copy Pix code": "Copiar código Pix",
   "This button cannot be used in Brazap yet. Open the message on your phone.": "Este botón aún no se puede usar en Brazap. Abre el mensaje en el teléfono.",
-  "1 unread message": "1 mensaje sin leer",
-  "{count} unread messages": "{count} mensajes sin leer"
+  "1 unread chat": "1 chat sin leer",
+  "{count} unread chats": "{count} chats sin leer"
 }

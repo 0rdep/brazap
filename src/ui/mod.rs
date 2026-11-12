@@ -1781,15 +1781,13 @@ impl State {
             .sort_by(|a, b| (a.timestamp, &a.id, &a.sender).cmp(&(b.timestamp, &b.id, &b.sender)));
     }
 
-    /// Unread messages in chats that are neither muted nor archived, as WhatsApp counts them.
+    /// Chats with unread messages, leaving out muted and archived ones.
     fn unread_total(&self) -> u32 {
         self.snapshot
             .chats
             .iter()
-            .filter(|chat| !chat.muted && !chat.archived)
-            .map(|chat| chat.unread.max(0))
-            .sum::<i64>()
-            .min(i64::from(u32::MAX)) as u32
+            .filter(|chat| !chat.muted && !chat.archived && chat.unread > 0)
+            .count() as u32
     }
 
     /// Mirrors the unread count onto the taskbar icon and the tray tooltip.
@@ -1809,8 +1807,8 @@ impl State {
         };
         let description = match count {
             0 => String::new(),
-            1 => locale::tr("1 unread message"),
-            _ => locale::format("{count} unread messages", &[("count", count.to_string())]),
+            1 => locale::tr("1 unread chat"),
+            _ => locale::format("{count} unread chats", &[("count", count.to_string())]),
         };
         if let Some(tray) = &self.background.tray {
             tray.set_tooltip(if description.is_empty() {
