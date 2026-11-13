@@ -450,5 +450,5 @@ fn result_row(s: &State, index: usize) -> El {
                     MUTED,
                 )),
         )
-        .child(label(&hit.excerpt, 12.0, INK).wrap().max_lines(2))
+        .child(label(&hit.excerpt, 12.0, INK).wrap_anywhere().max_lines(2))
 }

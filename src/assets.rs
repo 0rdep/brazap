@@ -56,7 +56,8 @@ impl AssetRequest {
             Self::Profile { jid } => format!("profile:{jid}"),
             Self::Thumbnail { chat, sender, id } => format!("thumb:{chat}:{sender}:{id}"),
             Self::Image { chat, sender, id } => format!("image:{chat}:{sender}:{id}"),
-            Self::LinkPreview { chat, sender, id } => format!("link:{chat}:{sender}:{id}"),
+            // v2: earlier versions cached "no image" for previews with an uploaded image.
+            Self::LinkPreview { chat, sender, id } => format!("link-v2:{chat}:{sender}:{id}"),
         }
     }
 }
@@ -210,6 +211,8 @@ impl Service {
                 data: STANDARD.encode(bytes),
             }));
         }
+        // Set when the result can still improve, so it must not be cached.
+        let mut retry = false;
         let data = match &request {
             AssetRequest::LinkPreview { chat, sender, id } => {
                 use whatsapp_rust::prelude::MessageExt;
@@ -217,15 +220,32 @@ impl Service {
                     .archive
                     .raw_message(chat.clone(), sender.clone(), id.clone())
                     .await?;
-                match raw
-                    .get_base_message()
-                    .extended_text_message
-                    .as_option()
+                let link = raw.get_base_message().extended_text_message.as_option();
+                let embedded = link
                     .and_then(|m| m.jpeg_thumbnail.clone())
-                    .filter(|b| !b.is_empty())
-                {
-                    Some(bytes) => Some(resize(bytes, 480).await?),
+                    .filter(|b| !b.is_empty());
+                // Current WhatsApp clients upload the page image separately and often send no
+                // embedded JPEG at all, so the uploaded image is the only picture available.
+                let uploaded = match link.and_then(LinkThumbnail::new) {
+                    Some(thumbnail) => match self.link_thumbnail(&thumbnail).await {
+                        Ok(bytes) => resize(bytes, 480).await.ok(),
+                        Err(LinkThumbnailError::Expired) => None,
+                        Err(LinkThumbnailError::Unavailable) => {
+                            // Offline or a passing failure: show what is embedded without
+                            // caching it, so the full image can replace it later.
+                            retry = true;
+                            None
+                        }
+                    },
                     None => None,
+                };
+                match uploaded {
+                    Some(bytes) => Some(bytes),
+                    None => match embedded {
+                        Some(bytes) => Some(resize(bytes, 480).await?),
+                        None if retry => return Ok(None),
+                        None => None,
+                    },
                 }
             }
             AssetRequest::Sticker { hash } => {
@@ -445,7 +465,7 @@ impl Service {
         };
         // Original animated bytes already live in the media/sticker archive.
         // Do not duplicate the entire animation in the thumbnail cache.
-        if mime != "image/webp" {
+        if mime != "image/webp" && !retry {
             self.archive
                 .cache_asset(key, mime.into(), data.clone(), ttl)
                 .await?;
@@ -496,6 +516,79 @@ impl Service {
                 None
             }
         }
+    }
+}
+
+/// The page image a sender uploads beside a link preview (`thumbnail-link` media).
+struct LinkThumbnail {
+    path: String,
+    key: Vec<u8>,
+    sha256: Vec<u8>,
+    enc_sha256: Vec<u8>,
+}
+
+impl LinkThumbnail {
+    fn new(link: &whatsapp_rust::prelude::wa::message::ExtendedTextMessage) -> Option<Self> {
+        let field = |value: &Option<Vec<u8>>| value.clone().filter(|b| b.len() == 32);
+        Some(Self {
+            path: link
+                .thumbnail_direct_path
+                .clone()
+                .filter(|p| !p.is_empty())?,
+            key: field(&link.media_key)?,
+            sha256: field(&link.thumbnail_sha256)?,
+            enc_sha256: field(&link.thumbnail_enc_sha256)?,
+        })
+    }
+}
+
+impl whatsapp_rust::download::Downloadable for LinkThumbnail {
+    fn direct_path(&self) -> Option<&str> {
+        Some(&self.path)
+    }
+    fn media_key(&self) -> Option<&[u8]> {
+        Some(&self.key)
+    }
+    fn file_enc_sha256(&self) -> Option<&[u8]> {
+        Some(&self.enc_sha256)
+    }
+    fn file_sha256(&self) -> Option<&[u8]> {
+        Some(&self.sha256)
+    }
+    fn file_length(&self) -> Option<u64> {
+        None
+    }
+    fn app_info(&self) -> whatsapp_rust::download::MediaType {
+        whatsapp_rust::download::MediaType::LinkThumbnail
+    }
+}
+
+enum LinkThumbnailError {
+    /// WhatsApp no longer serves this upload; only the embedded image remains.
+    Expired,
+    /// Not connected, or the download failed for a reason that may pass.
+    Unavailable,
+}
+
+impl Service {
+    async fn link_thumbnail(
+        &self,
+        thumbnail: &LinkThumbnail,
+    ) -> Result<Vec<u8>, LinkThumbnailError> {
+        use whatsapp_rust::download::{ClientDownloadError, DownloadLimits};
+        let client = self
+            .connected()
+            .await
+            .map_err(|_| LinkThumbnailError::Unavailable)?;
+        // Page images are small JPEGs; anything larger is not a preview.
+        let limits = DownloadLimits::new(4 * 1024 * 1024, 4 * 1024 * 1024);
+        client.download(thumbnail, limits).await.map_err(|error| {
+            log::debug!("Link preview image unavailable: {error}");
+            match error {
+                ClientDownloadError::ReferenceRejected(_) => LinkThumbnailError::Expired,
+                _ => LinkThumbnailError::Unavailable,
+            }
+        })
     }
 }
 

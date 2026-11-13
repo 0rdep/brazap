@@ -979,7 +979,7 @@ fn message_bubble(s: &State, message: &Message) -> El {
         );
     }
     if !message.title.is_empty() {
-        bubble = bubble.child(title(&message.title, 14.0).wrap());
+        bubble = bubble.child(title(&message.title, 14.0).wrap_anywhere());
     }
     if message.is_call() {
         let mut detail = row().gap(6.0).center_y().child(label(
@@ -1085,7 +1085,7 @@ fn message_bubble(s: &State, message: &Message) -> El {
         );
     }
     if !message.footer.is_empty() && !message.is_call() {
-        bubble = bubble.child(label(&message.footer, 11.0, MUTED).wrap());
+        bubble = bubble.child(label(&message.footer, 11.0, MUTED).wrap_anywhere());
     }
     if let Some(preview) = super::links::preview(s, message) {
         bubble = bubble.child(preview);
@@ -1143,6 +1143,7 @@ fn composer(s: &State, layer: &mut Vec<El>) -> El {
     let edit = rune::text_input(&s.draft, super::locale::style(13.0, 450.0))
         .key("composer-edit")
         .w_full()
+        .wrap_anywhere()
         .color(INK)
         .placeholder(super::locale::tr("Write a message…"), MUTED)
         .caret(INK, kit().selection());
