@@ -7,7 +7,8 @@ Release binaries and update metadata live in the public
 
 1. Update `[package].version` in `Cargo.toml` and refresh `Cargo.lock` with
    `./scripts/cargo check`, then verify the locked build.
-2. Write user-facing release notes in `docs/releases/v<version>.md`.
+2. Write user-facing release notes in `docs/releases/v<version>.md`, starting from
+   `docs/releases/unreleased.md`, and reset that file afterwards.
 3. Complete formatting, compilation and manual checks. Commit and push to `main`.
 4. Tag that commit with the exact package version:
 

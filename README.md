@@ -35,7 +35,7 @@
 | **Make it yours** | Right-click chats to pin, mute, archive, mark read/unread or delete, with changes synced to WhatsApp. Pinned and muted chats have sidebar indicators. Choose fonts, text size and English, Brazilian Portuguese or Spanish. |
 | **Local archive** | SQLite stores session state, messages, contacts and original attachment bytes. Browse saved conversations offline. |
 | **Storage control** | Keep downloaded photos, videos, stickers, audio and files for as long as you choose (Settings → Storage). Messages and their original data are always kept, and removed media is downloaded again when opened. The database is compacted losslessly and trimmed automatically. |
-| **Your AI tools** | Let local MCP clients search conversations, read messages, send replies, react, forward and share attachments through the same app session. |
+| **Your AI tools** | Optionally let local MCP clients search conversations, read messages, send replies, react, forward and share attachments through the same app session. Off by default. |
 | **Privacy controls** | Control read receipts, typing indicators, notifications and supported WhatsApp privacy settings. Optionally retain content when a sender deletes a message. |
 | **Windows integration** | Native notifications with message previews and sound. Clicking a notification opens the conversation. |
 | **Updates** | Checks GitHub Releases automatically every five minutes, verifies downloads, and shows **Restart and update** above Settings. A pending update also installs on the next full app launch. |
@@ -52,8 +52,8 @@ messages, reply, react, forward, search and change settings. No WhatsApp connect
 is created. For a clean development fixture, use
 `brazap --demo --data-dir /path/to/empty/demo-profile`.
 
-The same demo profile works with `--headless` and `--mcp`, making it suitable for
-manual checks and future UI/E2E automation. Pairing and account operations still
+The same demo profile works with `--headless` and `--mcp` (after enabling MCP, see
+below), making it suitable for manual checks and future UI/E2E automation. Pairing and account operations still
 need a real account to verify.
 
 ## A closer look
@@ -86,7 +86,14 @@ This is an early desktop release. Binaries are currently unsigned; macOS downloa
 
 ## Connect your AI agent
 
-Open **Settings → MCP** for a copyable configuration and the current tool catalog. Keep Brazap running, then add it to any MCP client that supports stdio:
+The MCP server is **off by default**, including for existing installations. Nothing MCP-related runs until you enable it:
+
+- In the app, open **Settings → MCP** and turn on **Enable MCP server**. The change applies immediately, without a restart, and is saved in the profile.
+- Without a window, start the service with `BRAZAP_MCP=1 brazap --headless`. `BRAZAP_MCP=1` (or `true`/`on`) and `BRAZAP_MCP=0` (or `false`/`off`) override the saved setting for the process that runs the app or headless service; unset follows the setting.
+
+While it is off, `brazap --mcp` exits with an explanation and the service refuses MCP requests (`initialize`, `tools/list`, `tools/call`), so no tools are offered.
+
+Once enabled, **Settings → MCP** shows a copyable configuration and the current tool catalog. Keep Brazap running, then add it to any MCP client that supports stdio:
 
 ```json
 {
@@ -99,7 +106,7 @@ Open **Settings → MCP** for a copyable configuration and the current tool cata
 }
 ```
 
-On Linux or macOS, replace `command` with the absolute path to the downloaded executable. For a service without a window, run `brazap --headless` after linking your account.
+On Linux or macOS, replace `command` with the absolute path to the downloaded executable. For a service without a window, run `BRAZAP_MCP=1 brazap --headless` after linking your account.
 
 | Read and discover | Send and act |
 | --- | --- |
@@ -109,7 +116,7 @@ On Linux or macOS, replace `command` with the absolute path to the downloaded ex
 | `list_statuses`, `next_audio` | `view_status`, `reply_status` |
 | | `send_sticker`, `save_attachment` |
 
-The MCP adapter connects to the existing service over authenticated loopback. It uses the same SQLite archive and WhatsApp session as the UI. Use chat identifiers returned by `list_chats`; sending tools deliver real WhatsApp messages.
+The MCP adapter connects to the existing service over authenticated loopback. It uses the same SQLite archive and WhatsApp session as the UI. That loopback channel is also how the desktop window talks to the service, so it stays open when MCP is off; it only serves the app's own requests, authenticated by a token in the profile directory. Use chat identifiers returned by `list_chats`; sending tools deliver real WhatsApp messages.
 
 ## Your data stays on this desktop
 

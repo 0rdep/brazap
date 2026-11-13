@@ -9,6 +9,20 @@ use crate::service::Service;
 pub struct Session {
     negotiated: bool,
     initialized: bool,
+    /// Set for connections forwarded by `brazap --mcp`. While MCP is disabled,
+    /// these connections cannot use any method, including internal ones.
+    pub(crate) bridge: bool,
+}
+
+/// JSON-RPC server error returned while the MCP server is disabled.
+pub const DISABLED_CODE: i32 = -32003;
+pub const DISABLED_MESSAGE: &str = "Brazap's MCP server is disabled. Turn it on in Settings → MCP, or start the Brazap service with BRAZAP_MCP=1.";
+
+/// MCP protocol methods (initialize, tools/*, notifications/*, …), as opposed
+/// to the internal `brazap/*` methods the desktop window uses over the same
+/// authenticated loopback channel.
+fn is_mcp_method(method: &str) -> bool {
+    method != "ping" && !method.starts_with("brazap/")
 }
 
 fn text_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -554,6 +568,12 @@ pub async fn handle(
     if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0") || method.is_empty() {
         return Some(error(-32600, "Invalid JSON-RPC request".into()));
     }
+    if (session.bridge || is_mcp_method(method)) && !service.mcp_enabled().await {
+        session.negotiated = false;
+        session.initialized = false;
+        id.as_ref()?;
+        return Some(error(DISABLED_CODE, DISABLED_MESSAGE.into()));
+    }
     if method == "notifications/initialized" {
         session.initialized = session.negotiated;
         return None;
@@ -570,6 +590,7 @@ pub async fn handle(
             )
         }
         "ping" => Ok(json!({})),
+        "brazap/mcp/status" => Ok(service.mcp_status().await),
         "brazap/activate" => {
             service
                 .activate_desktop(
@@ -699,4 +720,175 @@ pub async fn handle(
         Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
         Err(e) => error(-32602, format!("{e:#}")),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    async fn demo_service(dir: &std::path::Path, mcp: Option<bool>) -> Arc<Service> {
+        let config = Config {
+            data_dir: dir.to_owned(),
+            demo: true,
+            mcp,
+        };
+        Service::open(&config).await.unwrap()
+    }
+
+    fn request(id: u64, method: &str, params: Value) -> Value {
+        json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+    }
+
+    async fn initialize(service: &Arc<Service>, session: &mut Session) -> Value {
+        let response = handle(service, request(1, "initialize", json!({})), session)
+            .await
+            .unwrap();
+        let notification = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+        assert!(handle(service, notification, session).await.is_none());
+        response
+    }
+
+    fn disabled(response: &Value) -> bool {
+        response["error"]["code"].as_i64() == Some(DISABLED_CODE as i64)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mcp_is_disabled_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = demo_service(dir.path(), None).await;
+        assert!(!service.mcp_enabled().await);
+        let mut session = Session::default();
+
+        assert!(disabled(&initialize(&service, &mut session).await));
+        for (method, params) in [
+            ("tools/list", json!({})),
+            ("tools/call", json!({"name":"get_status","arguments":{}})),
+            ("resources/list", json!({})),
+        ] {
+            let response = handle(&service, request(2, method, params), &mut session)
+                .await
+                .unwrap();
+            assert!(disabled(&response), "{method} must be refused: {response}");
+        }
+
+        // The desktop window's internal methods keep working on the same channel.
+        let mut desktop = Session::default();
+        let settings = handle(
+            &service,
+            request(3, "brazap/settings", json!({})),
+            &mut desktop,
+        )
+        .await
+        .unwrap();
+        assert_eq!(settings["result"]["mcp"]["enabled"], json!(false));
+        let status = handle(
+            &service,
+            request(4, "brazap/mcp/status", json!({})),
+            &mut desktop,
+        )
+        .await
+        .unwrap();
+        assert_eq!(status["result"], json!({"enabled":false,"override":null}));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disabled_mcp_bridge_cannot_use_internal_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = demo_service(dir.path(), None).await;
+        let mut bridge = Session {
+            bridge: true,
+            ..Default::default()
+        };
+        for method in ["ping", "brazap/snapshot", "brazap/call"] {
+            let response = handle(&service, request(1, method, json!({})), &mut bridge)
+                .await
+                .unwrap();
+            assert!(disabled(&response), "{method} must be refused: {response}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enabling_mcp_exposes_tools_without_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = demo_service(dir.path(), None).await;
+        let mut settings = service.settings.read().await.clone();
+        settings.mcp.enabled = true;
+        service.save_settings(settings.clone()).await.unwrap();
+
+        let mut session = Session {
+            bridge: true,
+            ..Default::default()
+        };
+        let response = initialize(&service, &mut session).await;
+        assert!(
+            response["result"]["capabilities"]["tools"].is_object(),
+            "{response}"
+        );
+        let list = handle(&service, request(2, "tools/list", json!({})), &mut session)
+            .await
+            .unwrap();
+        assert_eq!(list["result"]["tools"], tools());
+        let call = handle(
+            &service,
+            request(3, "tools/call", json!({"name":"get_status","arguments":{}})),
+            &mut session,
+        )
+        .await
+        .unwrap();
+        assert_eq!(call["result"]["isError"], json!(false), "{call}");
+
+        // Turning it off applies to sessions that are already connected.
+        settings.mcp.enabled = false;
+        service.save_settings(settings).await.unwrap();
+        let list = handle(&service, request(4, "tools/list", json!({})), &mut session)
+            .await
+            .unwrap();
+        assert!(disabled(&list), "{list}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saved_mcp_choice_persists_and_old_settings_stay_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = demo_service(dir.path(), None).await;
+        // Settings saved by a version without the MCP option.
+        service
+            .archive
+            .set_preference(
+                "app_settings".into(),
+                r#"{"appearance":{"language":"pt-BR"}}"#.into(),
+            )
+            .await
+            .unwrap();
+        drop(service);
+        let service = demo_service(dir.path(), None).await;
+        assert!(!service.mcp_enabled().await);
+        assert_eq!(service.settings.read().await.appearance.language, "pt-BR");
+
+        let mut settings = service.settings.read().await.clone();
+        settings.mcp.enabled = true;
+        service.save_settings(settings).await.unwrap();
+        drop(service);
+        let service = demo_service(dir.path(), None).await;
+        assert!(service.mcp_enabled().await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn environment_override_wins_over_saved_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = demo_service(dir.path(), Some(true)).await;
+        assert!(!service.settings.read().await.mcp.enabled);
+        let mut session = Session::default();
+        let response = initialize(&service, &mut session).await;
+        assert!(response.get("result").is_some(), "{response}");
+        let mut settings = service.settings.read().await.clone();
+        settings.mcp.enabled = true;
+        service.save_settings(settings).await.unwrap();
+        drop(service);
+
+        let service = demo_service(dir.path(), Some(false)).await;
+        assert!(!service.mcp_enabled().await);
+        let mut session = Session::default();
+        assert!(disabled(&initialize(&service, &mut session).await));
+    }
 }

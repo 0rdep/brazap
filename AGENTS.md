@@ -5,7 +5,8 @@ Brazap is an alternative WhatsApp client written in Rust. It uses
 [whatsapp-rust](https://github.com/oxidezap/whatsapp-rust) for WhatsApp integration.
 
 It must also expose a local Model Context Protocol (MCP) server so local agents
-can interact with WhatsApp, including reading and sending messages.
+can interact with WhatsApp, including reading and sending messages. The MCP
+server is opt-in: disabled by default (Settings → MCP or `BRAZAP_MCP=1`).
 
 ## Architecture direction
 
@@ -25,7 +26,8 @@ can interact with WhatsApp, including reading and sending messages.
 - Prefer `brazap --demo --data-dir <empty-directory>` for UI checks and screenshot
   fixtures. Demo mode uses a separate SQLite profile and must never initialize a
   WhatsApp client, modify a real profile, or send real messages. Its data is also
-  available through MCP for future explicitly requested E2E tests.
+  available through MCP for future explicitly requested E2E tests; MCP is off by
+  default, so enable it with `BRAZAP_MCP=1` or Settings → MCP in that profile.
 - In an isolated demo profile, `BRAZAP_DEMO_STARTUP=loading|qr|connecting|syncing|restoring`
   previews startup states without a real account. Omit it for the normal connected demo.
 - `BRAZAP_DEMO_UPDATE=ready|downloading|error` previews sidebar update states.
