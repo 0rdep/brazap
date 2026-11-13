@@ -864,5 +864,9 @@
   "Stickers can be made from photos, videos and GIFs": "Los stickers se pueden crear a partir de fotos, videos y GIF",
   "This video is too detailed to fit in a sticker": "Este video tiene demasiado detalle para caber en un sticker",
   "This image is too detailed to fit in a sticker": "Esta imagen tiene demasiado detalle para caber en un sticker",
-  "Only H.264 videos can be converted": "Solo se pueden convertir videos H.264"
+  "Only H.264 videos can be converted": "Solo se pueden convertir videos H.264",
+  "Enable MCP server": "Activar servidor MCP",
+  "Let local AI agents read and send WhatsApp messages through Brazap. Off by default.": "Permite que los agentes de IA locales lean y envíen mensajes de WhatsApp a través de Brazap. Desactivado de forma predeterminada.",
+  "The BRAZAP_MCP environment variable overrides this setting until Brazap restarts without it.": "La variable de entorno BRAZAP_MCP reemplaza esta configuración hasta que Brazap se reinicie sin ella.",
+  "The MCP server is off. Agents cannot connect and no tools are offered until you turn it on.": "El servidor MCP está desactivado. Los agentes no pueden conectarse y no se ofrece ninguna herramienta hasta que lo actives."
 }

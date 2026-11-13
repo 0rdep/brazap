@@ -127,6 +127,13 @@ impl Remote {
     }
 
     pub async fn stdio(&self) -> Result<()> {
+        // Do not start an MCP server unless the running service allows it.
+        let status = self.request("brazap/mcp/status", json!({})).await?;
+        ensure!(
+            status["enabled"].as_bool() == Some(true),
+            "{}",
+            mcp::DISABLED_MESSAGE
+        );
         let mut stream = BufReader::new(TcpStream::connect(self.address).await?);
         let mut input = BufReader::new(tokio::io::stdin());
         let mut output = tokio::io::stdout();
@@ -143,7 +150,7 @@ impl Remote {
             let needs_reply = message.get("id").is_some();
             write_message(
                 stream.get_mut(),
-                &json!({"token":self.token,"message":message}),
+                &json!({"token":self.token,"mcp":true,"message":message}),
             )
             .await?;
             if needs_reply {
@@ -229,6 +236,9 @@ async fn connection(stream: TcpStream, service: Arc<Service>, token: String) -> 
             envelope.get("token").and_then(Value::as_str) == Some(token.as_str()),
             "Local client authentication failed"
         );
+        if envelope.get("mcp").and_then(Value::as_bool) == Some(true) {
+            session.bridge = true;
+        }
         let request = envelope
             .get("message")
             .cloned()

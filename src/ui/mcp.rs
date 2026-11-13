@@ -3,6 +3,40 @@ use rune::{ClipboardContent, Color, El, col, row};
 use serde_json::json;
 
 pub(super) fn view(s: &State, mut body: El) -> El {
+    let saved = s.preferences.value.mcp.enabled;
+    let enabled = s
+        .preferences
+        .value
+        .mcp
+        .effective(s.preferences.mcp_override);
+    body = body
+        .child(title(super::locale::tr("MCP · AI agents"), 22.0))
+        .child(
+            label(
+                super::locale::tr(
+                    "Connect an MCP-compatible agent to your WhatsApp account through Brazap.",
+                ),
+                12.0,
+                MUTED,
+            )
+            .wrap(),
+        )
+        .child(super::preferences::toggle(
+            s,
+            "Enable MCP server",
+            "Let local AI agents read and send WhatsApp messages through Brazap. Off by default.",
+            saved,
+            |p| p.mcp.enabled = !p.mcp.enabled,
+        ));
+    if s.preferences
+        .mcp_override
+        .is_some_and(|value| value != saved)
+    {
+        body = body.child(label(super::locale::tr("The BRAZAP_MCP environment variable overrides this setting until Brazap restarts without it."), 11.0, MUTED).wrap());
+    }
+    if !enabled {
+        return body.child(label(super::locale::tr("The MCP server is off. Agents cannot connect and no tools are offered until you turn it on."), 12.0, MUTED).wrap());
+    }
     let executable = std::env::current_exe().unwrap_or_else(|_| "brazap".into());
     let config = serde_json::to_string_pretty(&json!({
         "mcpServers": { "brazap": {
@@ -13,8 +47,6 @@ pub(super) fn view(s: &State, mut body: El) -> El {
     .unwrap_or_default();
     let copy = config.clone();
     body = body
-        .child(title(super::locale::tr("MCP · AI agents"), 22.0))
-        .child(label(super::locale::tr("Connect an MCP-compatible agent to your WhatsApp account through Brazap."), 12.0, MUTED).wrap())
         .child(col().w_full().padding(18.0).gap(12.0).radius(14.0).fill(Color::WHITE.alpha(0.025)).border(1.0, BORDER)
             .child(title(super::locale::tr("Connect your agent"), 15.0))
             .child(label(super::locale::tr("1. Keep Brazap open and connected to WhatsApp.\n2. Add this configuration to your agent’s MCP settings.\n3. Restart or reconnect the agent’s MCP client."), 12.0, MUTED).wrap())

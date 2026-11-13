@@ -12,6 +12,7 @@ pub struct Settings {
     pub privacy: PrivacySettings,
     pub appearance: AppearanceSettings,
     pub storage: StorageSettings,
+    pub mcp: McpSettings,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -20,7 +21,21 @@ impl Default for Settings {
             privacy: Default::default(),
             appearance: Default::default(),
             storage: Default::default(),
+            mcp: Default::default(),
         }
+    }
+}
+/// The local MCP server is opt-in. Settings saved before this option existed
+/// have no `mcp` section and therefore keep it disabled.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpSettings {
+    pub enabled: bool,
+}
+impl McpSettings {
+    /// A `BRAZAP_MCP` override wins over the saved choice.
+    pub fn effective(&self, override_value: Option<bool>) -> bool {
+        override_value.unwrap_or(self.enabled)
     }
 }
 /// Retention choices in days; `0` keeps downloaded media forever.
@@ -153,8 +168,16 @@ impl Archive {
 impl Service {
     pub async fn settings_view(&self) -> Result<Value> {
         Ok(
-            json!({"settings": self.settings.read().await.clone(), "revision": self.revision(), "storage": self.archive.storage_usage(&self.config).await?, "updates": self.updates.read().await.clone()}),
+            json!({"settings": self.settings.read().await.clone(), "revision": self.revision(), "storage": self.archive.storage_usage(&self.config).await?, "updates": self.updates.read().await.clone(), "mcp": self.mcp_status().await}),
         )
+    }
+    /// Whether MCP clients may use this service, checked on every request so
+    /// toggling the setting applies without a restart.
+    pub async fn mcp_enabled(&self) -> bool {
+        self.settings.read().await.mcp.effective(self.config.mcp)
+    }
+    pub async fn mcp_status(&self) -> Value {
+        json!({"enabled": self.mcp_enabled().await, "override": self.config.mcp})
     }
     pub async fn save_settings(&self, value: Settings) -> Result<u64> {
         value.validate()?;
@@ -272,5 +295,43 @@ impl Service {
             .await
             .context("The connection stopped during logout")?
             .map_err(anyhow::Error::msg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_is_disabled_by_default() {
+        assert!(!Settings::default().mcp.enabled);
+        assert!(!Settings::default().mcp.effective(None));
+    }
+
+    #[test]
+    fn settings_saved_before_mcp_option_keep_it_disabled() {
+        let saved = r#"{"notifications":{"enabled":false},"appearance":{"language":"pt-BR"}}"#;
+        let settings: Settings = serde_json::from_str(saved).unwrap();
+        assert!(!settings.mcp.enabled);
+        assert!(!settings.notifications.enabled);
+        assert_eq!(settings.appearance.language, "pt-BR");
+    }
+
+    #[test]
+    fn mcp_setting_round_trips_when_enabled() {
+        let mut settings = Settings::default();
+        settings.mcp.enabled = true;
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(restored.mcp.enabled);
+        assert!(restored.mcp.effective(None));
+    }
+
+    #[test]
+    fn mcp_environment_override_wins() {
+        let enabled = McpSettings { enabled: true };
+        let disabled = McpSettings::default();
+        assert!(!enabled.effective(Some(false)));
+        assert!(disabled.effective(Some(true)));
     }
 }

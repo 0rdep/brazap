@@ -22,7 +22,7 @@ fn run() -> Result<()> {
     }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "Brazap — native WhatsApp client\n\nUsage:\n  brazap             Open the desktop app\n  brazap --headless  Run the shared WhatsApp service without a window\n  brazap --mcp       Serve MCP over stdin/stdout using the running app/service\n  brazap --diagnostics  Report memory/cache diagnostics from the running app\n\n  brazap --demo      Explore fictional data without a WhatsApp account\n  brazap --version   Print the installed version\n\nSet BRAZAP_DATA_DIR to select a different SQLite data directory."
+            "Brazap — native WhatsApp client\n\nUsage:\n  brazap             Open the desktop app\n  brazap --headless  Run the shared WhatsApp service without a window\n  brazap --mcp       Serve MCP over stdin/stdout using the running app/service (MCP must be enabled)\n  brazap --diagnostics  Report memory/cache diagnostics from the running app\n\n  brazap --demo      Explore fictional data without a WhatsApp account\n  brazap --version   Print the installed version\n\nSet BRAZAP_DATA_DIR to select a different SQLite data directory.\nThe MCP server is off by default. Turn it on in Settings → MCP, or set BRAZAP_MCP=1\n(BRAZAP_MCP=0 forces it off) for the process that runs the app or --headless service."
         );
         return Ok(());
     }
@@ -91,7 +91,17 @@ fn run() -> Result<()> {
             .build()?;
         return runtime.block_on(async {
             let instance = brazap::ipc::start_or_connect(config).await?;
-            eprintln!("Brazap service ready. Connect an MCP client with brazap --mcp.");
+            let mcp = instance
+                .remote
+                .request("brazap/mcp/status", serde_json::json!({}))
+                .await?;
+            if mcp["enabled"].as_bool() == Some(true) {
+                eprintln!("Brazap service ready. Connect an MCP client with brazap --mcp.");
+            } else {
+                eprintln!(
+                    "Brazap service ready. The MCP server is off; restart with BRAZAP_MCP=1 or turn it on in Settings → MCP to connect an MCP client."
+                );
+            }
             tokio::signal::ctrl_c()
                 .await
                 .context("Could not listen for shutdown")?;

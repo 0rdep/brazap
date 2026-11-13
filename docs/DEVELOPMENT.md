@@ -60,7 +60,15 @@ brazap --demo --data-dir /path/to/empty/demo-profile
 ```
 
 `BRAZAP_DATA_DIR` also selects the profile. Use the same profile for the UI,
-headless service and MCP client. Each profile has one service owner and one
+headless service and MCP client.
+
+MCP is off by default. Enable it in **Settings → MCP** (saved as `mcp.enabled` in
+the profile's `app_settings`) or with `BRAZAP_MCP=1` for the process that owns the
+service, for example `BRAZAP_MCP=1 brazap --demo --data-dir /path/to/demo --headless`.
+`BRAZAP_MCP=0` forces it off. The service checks the setting on every request: while
+disabled it refuses MCP protocol methods and every request forwarded by
+`brazap --mcp`, and `brazap --mcp` exits before serving stdio. Internal `brazap/*`
+requests from the desktop window keep using the same loopback channel. Each profile has one service owner and one
 active desktop window; a second launch activates the existing window.
 
 Keep database files, logs, cached media, session keys and upstream checkouts out
@@ -70,7 +78,7 @@ of Git. `.local`, `.references`, `.build-deps`, `target` and `dist` are ignored.
 
 - `src/service.rs`: WhatsApp lifecycle, shared operations and durable ingestion.
 - `src/storage.rs`, `migrations/`, `queries/`: application archive and SQLite views.
-- `src/ipc.rs`, `src/mcp.rs`: authenticated local service coordination and stdio MCP.
+- `src/ipc.rs`, `src/mcp.rs`: authenticated local service coordination and the opt-in stdio MCP server.
 - `src/ui/`: Rune layout, interactions, playback and settings.
 - `src/updates.rs`: release discovery, checksum validation and replacement.
 - `locales/`: English, Brazilian Portuguese and Spanish UI strings.

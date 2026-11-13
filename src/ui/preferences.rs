@@ -62,6 +62,8 @@ pub(super) struct Panel {
     pub logout: bool,
     pub logging_out: bool,
     pub confirm_cache: bool,
+    /// `BRAZAP_MCP` override reported by the running service.
+    pub mcp_override: Option<bool>,
 }
 impl State {
     pub(super) fn open_preferences(&mut self) {
@@ -207,6 +209,7 @@ impl State {
             Ok(value) => match action {
                 "get" => {
                     self.preferences.report = value["storage"].clone();
+                    self.preferences.mcp_override = value["mcp"]["override"].as_bool();
                     if !self.preferences.saving
                         && value["revision"].as_u64().unwrap_or(0)
                             >= self.preferences.settings_revision
@@ -299,7 +302,7 @@ fn card(body: El) -> El {
         .fill(Color::WHITE.alpha(0.025))
         .border(1.0, BORDER)
 }
-fn toggle(
+pub(super) fn toggle(
     _s: &State,
     name: &str,
     description: &str,
