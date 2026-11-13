@@ -405,6 +405,67 @@ pub(crate) async fn seed(archive: &Archive) -> Result<()> {
             false,
         )
         .await?;
+    // Long, unbroken links and long previews must stay inside their bubbles.
+    let weekend = "120363000000002@g.us";
+    let long_url = "https://www.mercadolivre.com.br/dailus-233-bolo-de-chocolate-esmalte-cremoso-8ml-blz/p/MLB28000507?pdp_filters=item_id%3AMLB5478140251&from=gshop&matt_tool=51266944&matt_word=&matt_source=google&matt_campaign_id=22090354289&matt_ad_group_id=173513864716&matt_match_type=&matt_network=g&matt_device=c&matt_creative=727882725437&matt_keyword=&matt_ad_position=&matt_ad_type=pla&matt_merchant_id=735128188&matt_product_id=MLB28000507-product&matt_product_partition_id=2389869716255&matt_target_id=pla-2389869716255&cq_src=google_ads&cq_cmp=22090354289&cq_net=g&cq_plt=gp&cq_med=pla&gad_source=1&gclid=Cj0KCQiA0MD4BhD7ARIsAKX8YlDemoTrackingValue";
+    // WhatsApp falls back to the URL as the title when it cannot read the page.
+    let mut bare = wa::message::ExtendedTextMessage::default();
+    bare.text = Some(long_url.into());
+    bare.matched_text = Some(long_url.into());
+    bare.title = Some(long_url.into());
+    let mut detailed = wa::message::ExtendedTextMessage::default();
+    detailed.text = Some(format!("Found the one we talked about: {long_url}"));
+    detailed.matched_text = Some(long_url.into());
+    detailed.title = Some(
+        "Dailus 233 Bolo de Chocolate Esmalte Cremoso 8ml — Coleção Confeitaria, acabamento cremoso de longa duração, secagem rápida e cobertura uniforme".into(),
+    );
+    detailed.description = Some(
+        "Frete grátis acima de R$ 19. Compre Dailus 233 Bolo de Chocolate Esmalte Cremoso 8ml no Mercado Livre. Encontre mais produtos de Beleza e Cuidado Pessoal, Manicure e Pedicure, Esmaltes. Devolução grátis em 30 dias.".into(),
+    );
+    detailed.jpeg_thumbnail = Some(picture()?);
+    // A page WhatsApp described without an image.
+    let mut described = wa::message::ExtendedTextMessage::default();
+    let market = "https://www.example.org/events/saturday-farmers-market-and-flower-stalls?utm_source=whatsapp&utm_medium=share";
+    described.text = Some(format!("Opening hours are here {market}"));
+    described.matched_text = Some(market.into());
+    described.title = Some("Saturday Farmers Market — opening hours, stalls and how to get there by bus, bike or on foot".into());
+    described.description = Some("Fresh produce, flowers and local bakers every Saturday from 8 am to 1 pm. Check the map for the new stall layout and accessible entrances before you go.".into());
+    let long_text = "Planning notes for Saturday, so nobody has to scroll back through the chat: we meet at the bakery at nine, then walk to the market before it gets crowded. Bring cash for the flower stall, a reusable bag, and sunscreen because the forecast says it will be sunny all day.\n\nIf anyone is running late, send a message here and we will save you a seat. After lunch we can decide between the museum and the park depending on the weather.";
+    let mut rows = Vec::new();
+    for (offset, id, sender, proto) in [
+        (0, "demo-long-link", LUCAS, {
+            let mut proto = wa::Message::default();
+            proto.extended_text_message = MessageField::some(bare);
+            proto
+        }),
+        (60, "demo-long-preview", ANA, {
+            let mut proto = wa::Message::default();
+            proto.extended_text_message = MessageField::some(detailed);
+            proto
+        }),
+        (90, "demo-described-link", LUCAS, {
+            let mut proto = wa::Message::default();
+            proto.extended_text_message = MessageField::some(described);
+            proto
+        }),
+        (120, "demo-long-text", "self", wa::Message::text(long_text)),
+    ] {
+        let mut row = project_message(
+            weekend.into(),
+            sender.into(),
+            id.into(),
+            sender == "self",
+            base - 90000 + offset,
+            &proto,
+            String::new(),
+            "{}".into(),
+        );
+        if sender == "self" {
+            row.view.status = "read".into();
+        }
+        rows.push(row);
+    }
+    archive.store_messages(rows, false).await?;
     for index in 0..2 {
         let mut audio = wa::message::AudioMessage::default();
         audio.mimetype = Some("audio/wav".into());

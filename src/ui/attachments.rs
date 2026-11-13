@@ -678,6 +678,7 @@ pub(super) fn modal(s: &State) -> Option<(El, Vec<El>)> {
             let edit = rune::text_input(&item.caption, locale::style(13.0, 450.0))
                 .key(format!("attachment-caption-{id}"))
                 .w_full()
+                .wrap_anywhere()
                 .color(INK)
                 .placeholder(locale::tr("Add a caption…"), MUTED)
                 .caret(INK, kit().selection());

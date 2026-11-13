@@ -76,7 +76,7 @@ impl Archive {
                     .bind::<BigInt,_>(account).bind::<Text,_>(&aliases).execute(conn)?;
                 let aliases:Vec<String>=serde_json::from_str(&aliases).unwrap_or_default();
                 for alias in aliases {
-                    for prefix in ["thumb:","image:","link:"] {
+                    for prefix in ["thumb:","image:","link:","link-v2:"] {
                         let prefix=format!("{prefix}{alias}:");
                         diesel::sql_query("DELETE FROM brazap_assets WHERE account=? AND substr(key,1,?)=?")
                             .bind::<BigInt,_>(account).bind::<BigInt,_>(prefix.len() as i64).bind::<Text,_>(prefix).execute(conn)?;
