@@ -106,8 +106,91 @@ const CLOCK: Icon = Icon {
     body: r#"<circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 7v5l3 2" fill="none" stroke="currentColor" stroke-width="1.7"/>"#,
 };
 
+/// WhatsApp's view-once mark: a "1" inside an open circle.
+pub(super) const VIEW_ONCE: Icon = Icon {
+    name: "view-once",
+    view: 24.0,
+    body: r#"<path d="M12 3.5A8.5 8.5 0 1 1 5.99 5.99" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M10.2 9.3 12.6 7.6v8.8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
+/// The round "1" switch beside Send that makes photos, videos or a voice
+/// message view once. It lights up in mint while on.
+pub(super) fn view_once_toggle(
+    on: bool,
+    enabled: bool,
+    size: f32,
+    unavailable: &str,
+    action: fn(&mut State),
+) -> El {
+    el().size(size, size)
+        .radius(size / 2.0)
+        .center()
+        .fill(if on { MINT } else { Color::WHITE.alpha(0.035) })
+        .border(1.0, if on { MINT } else { CONTROL_BORDER })
+        .hover(if on {
+            MINT.alpha(0.85)
+        } else {
+            MINT.alpha(0.12)
+        })
+        .opacity(if enabled { 1.0 } else { 0.4 })
+        .role("checkbox")
+        .label(super::locale::tr(if on {
+            "View once is on"
+        } else {
+            "View once is off"
+        }))
+        .help(super::locale::tr(if enabled {
+            "View once"
+        } else {
+            unavailable
+        }))
+        .motion(motion::SNAPPY)
+        .on_press(move |s: &mut State| {
+            if enabled {
+                action(s);
+            }
+        })
+        .child(icon(&VIEW_ONCE, size * 0.52).color(if on { Color::BLACK } else { MUTED }))
+}
+
+/// A view-once message in the conversation: its type, never its media. Received
+/// ones open only on the phone; WhatsApp does not deliver them to linked devices.
+fn view_once_content(message: &Message, mine: bool) -> El {
+    let name = match message.view_once.as_str() {
+        "image" => "View once photo",
+        "video" => "View once video",
+        "audio" => "View once voice message",
+        _ => "View once message",
+    };
+    let mut text = col()
+        .gap(4.0)
+        .min_w(0.0)
+        .child(label(super::locale::tr(name), 13.0, INK));
+    if !mine {
+        text = text.child(label(
+            super::locale::tr("Open it on your phone"),
+            11.0,
+            MUTED,
+        ));
+    }
+    row()
+        .gap(11.0)
+        .center_y()
+        .min_w(200.0)
+        .child(
+            el().size(36.0, 36.0)
+                .radius(18.0)
+                .center()
+                .fill(MINT.alpha(0.12))
+                .border(1.0, MINT.alpha(0.28))
+                .child(icon(&VIEW_ONCE, 19.0).color(MINT)),
+        )
+        .child(text)
+}
+
 pub(super) fn kind_icon(kind: &str) -> Option<&'static Icon> {
     match kind {
+        "view_once" => Some(&VIEW_ONCE),
         "file" => Some(&FILE),
         "image" => Some(&MEDIA),
         "video" => Some(&VIDEO),
@@ -688,6 +771,7 @@ pub(super) fn conversation(s: &State, jid: &str, layer: &mut Vec<El>) -> El {
                         .map(|m| (m.sender.clone(), m.id.clone()))
                         .collect();
                     s.request_chat_media();
+                    s.request_transcripts(Vec::new(), false);
                     if s.detached
                         && !s.loading_chat
                         && !s.loading_older
@@ -876,7 +960,7 @@ fn timeline_row(s: &State, index: usize) -> El {
     row.child(message_bubble(s, message))
 }
 
-fn row_day(timestamp: i64) -> El {
+pub(super) fn row_day(timestamp: i64) -> El {
     row().w_full().center().py(8.0).child(
         label(super::times::day_label(timestamp), 10.0, MUTED)
             .px(12.0)
@@ -898,7 +982,6 @@ fn message_bubble(s: &State, message: &Message) -> El {
     };
     let width = (s.chat_bounds[2] - 48.0 - actions - avatar).clamp(120.0, 480.0);
     let mut bubble = col()
-        .on_secondary_press(move |s: &mut State, p, _| s.message_menu(context.clone(), p))
         .key(format!("message-{}-{}", message.sender, message.id))
         .max_w(width)
         .padding(13.0)
@@ -920,6 +1003,10 @@ fn message_bubble(s: &State, message: &Message) -> El {
             },
         )
         .instant_changes();
+    if !message.id.starts_with(crate::calls::CALL_LOG_PREFIX) {
+        bubble = bubble
+            .on_secondary_press(move |s: &mut State, p, _| s.message_menu(context.clone(), p));
+    }
     if message.kind == "sticker" && message.text.is_empty() && message.title.is_empty() {
         bubble = bubble
             .fill(Color::TRANSPARENT)
@@ -935,8 +1022,15 @@ fn message_bubble(s: &State, message: &Message) -> El {
         .0;
         bubble = bubble.child(label(sender, 10.0, MINT));
     }
-    if message.deleted_at.is_some() {
-        bubble = bubble.child(label(super::locale::tr("Deleted on WhatsApp"), 10.0, MUTED));
+    if let Some(at) = message.deleted_at {
+        bubble = bubble.child(
+            label(
+                super::times::deleted_label(message.timestamp, at),
+                10.0,
+                MUTED,
+            )
+            .help(super::times::day_label(at)),
+        );
     }
     if message.forwarded {
         bubble = bubble.child(label(super::locale::tr("↪ Forwarded"), 10.0, MUTED));
@@ -982,25 +1076,34 @@ fn message_bubble(s: &State, message: &Message) -> El {
         bubble = bubble.child(title(&message.title, 14.0).wrap_anywhere());
     }
     if message.is_call() {
-        let mut detail = row().gap(6.0).center_y().child(label(
-            super::locale::tr(if mine { "Outgoing" } else { "Incoming" }),
-            11.0,
-            MUTED,
-        ));
-        if !message.footer.is_empty() {
-            detail = detail.child(label("·", 11.0, MUTED)).child(label(
-                super::locale::tr(&message.footer),
-                11.0,
-                MUTED,
-            ));
-        }
-        if let Some(seconds) = message.duration_seconds.filter(|s| *s > 0) {
-            detail = detail.child(label("·", 11.0, MUTED)).child(label(
-                format!("{}:{:02}", seconds / 60, seconds % 60),
-                11.0,
-                MUTED,
-            ));
-        }
+        // The bubble's side already says who called. A completed call shows
+        // only its length, in words, so it cannot be read as a clock time.
+        let duration = message
+            .duration_seconds
+            .filter(|s| *s > 0)
+            .map(call_duration);
+        let summary = match (message.footer.as_str(), duration) {
+            ("completed", Some(duration)) => duration,
+            ("", Some(duration)) => duration,
+            ("", None) => super::locale::tr(if mine {
+                "Outgoing"
+            } else if message.sender.is_empty() {
+                "Call"
+            } else {
+                "Incoming"
+            }),
+            (footer, Some(duration)) => format!("{} · {duration}", super::locale::tr(footer)),
+            (footer, None) => super::locale::tr(footer),
+        };
+        let detail = row()
+            .w_full()
+            .gap(12.0)
+            .center_y()
+            .child(label(summary, 11.0, MUTED).grow(1.0).truncate())
+            .child(
+                label(clock(message.timestamp), 9.0, MUTED)
+                    .help(super::times::day_label(message.timestamp)),
+            );
         bubble = bubble.child(
             row()
                 .gap(12.0)
@@ -1025,16 +1128,20 @@ fn message_bubble(s: &State, message: &Message) -> El {
                 )
                 .child(
                     col()
+                        .grow(1.0)
+                        .min_w(0.0)
                         .gap(7.0)
                         .child(title(super::locale::tr(&message.text), 14.0))
                         .child(detail),
                 ),
         );
     }
-    if matches!(message.kind.as_str(), "image" | "video" | "sticker") {
+    if message.kind == "view_once" {
+        bubble = bubble.child(view_once_content(message, mine));
+    } else if matches!(message.kind.as_str(), "image" | "video" | "sticker") {
         bubble = bubble.child(media::thumbnail(s, message));
     } else if message.kind == "audio" {
-        bubble = bubble.child(super::audio::view(s, message));
+        bubble = bubble.child(super::audio::view(s, message, width - 26.0));
     } else if message.attachment() {
         let m = message.clone();
         bubble = bubble.child(
@@ -1093,7 +1200,18 @@ fn message_bubble(s: &State, message: &Message) -> El {
     for (index, action) in message.actions.iter().enumerate() {
         bubble = bubble.child(action_button(s, message, index, action));
     }
-    let mut metadata = row().gap(6.0).center_y().child(el().grow(1.0)).child(
+    let mut metadata = row().gap(6.0).center_y().child(el().grow(1.0));
+    if message.edited {
+        let edited = label(super::locale::tr("Edited"), 9.0, MUTED);
+        metadata = metadata.child(match message.edited_at {
+            Some(at) => edited.help(super::locale::format(
+                "Edited at {time}",
+                &[("time", clock(at))],
+            )),
+            None => edited,
+        });
+    }
+    metadata = metadata.child(
         label(clock(message.timestamp), 9.0, MUTED)
             .help(super::times::day_label(message.timestamp)),
     );
@@ -1106,7 +1224,10 @@ fn message_bubble(s: &State, message: &Message) -> El {
             s.retry_text(retry.clone())
         }));
     }
-    bubble = bubble.child(metadata);
+    // A call shows its time beside the summary instead.
+    if !message.is_call() {
+        bubble = bubble.child(metadata);
+    }
     if let Some(reactions) = actions::reactions(message) {
         bubble = bubble.child(reactions);
     }
@@ -1171,6 +1292,8 @@ fn composer(s: &State, layer: &mut Vec<El>) -> El {
         )
         .grow(1.0)
         .min_w(0.0);
+    let editing = s.editing.is_some();
+    let send_label = if editing { "Save edit" } else { "Send message" };
     let send = el()
         .size(42.0, 42.0)
         .radius(13.0)
@@ -1178,10 +1301,14 @@ fn composer(s: &State, layer: &mut Vec<El>) -> El {
         .fill(if enabled { MINT } else { MINT.alpha(0.3) })
         .border(1.0, MINT.alpha(if enabled { 0.7 } else { 0.2 }))
         .role("button")
-        .label(super::locale::tr("Send message"))
-        .help(super::locale::tr("Send message"))
+        .label(super::locale::tr(send_label))
+        .help(super::locale::tr(send_label))
         .on_press(|s: &mut State| s.send())
-        .child(icon(&SEND, 21.0).color(Color::BLACK));
+        .child(if editing {
+            icon(&rune_kit::glyphs::CHECK, 21.0).color(Color::BLACK)
+        } else {
+            icon(&SEND, 21.0).color(Color::BLACK)
+        });
     let trigger = icon_button(&PLUS, "Add an attachment", |s, _| {
         if s.recording.is_none() {
             s.attachments_open = !s.attachments_open;
@@ -1243,29 +1370,29 @@ fn composer(s: &State, layer: &mut Vec<El>) -> El {
         .fill(Color::WHITE.alpha(0.018))
         .border(1.0, CONTROL_BORDER)
         .instant_changes();
-    if let Some(reply) = actions::reply_banner(s) {
+    if let Some(edit) = actions::edit_banner(s) {
+        content = content.child(edit);
+    } else if let Some(reply) = actions::reply_banner(s) {
         content = content.child(reply);
     }
-    let controls = row()
-        .key("composer-controls")
-        .gap(10.0)
-        .center_y()
-        .child(super::picker::trigger(s, layer))
-        .child(attach);
+    let mut controls = row().key("composer-controls").gap(10.0).center_y();
+    // An edit changes only the text, so attachments, stickers and voice wait.
+    if !editing {
+        controls = controls
+            .child(super::picker::trigger(s, layer))
+            .child(attach);
+    }
+    controls = controls.child(field).child(send);
+    if !editing {
+        controls = controls.child(super::recording::button(s, layer));
+    }
     col()
         .key("composer-dock")
         .w_full()
         .px(14.0)
         .pt(8.0)
         .pb(14.0)
-        .child(
-            content.child(
-                controls
-                    .child(field)
-                    .child(send)
-                    .child(super::recording::button(s, layer)),
-            ),
-        )
+        .child(content.child(controls))
 }
 
 pub(super) fn pick_file(s: &mut State, tx: &mut Tx, kind: &'static str) {
@@ -1447,6 +1574,16 @@ pub(super) fn empty_chat() -> El {
             14.0,
             MUTED,
         ))
+}
+
+/// "45 s", "31 min", "1 h 5 min": a call's length, unlike a time of day.
+fn call_duration(seconds: u32) -> String {
+    match seconds {
+        0..60 => format!("{seconds} s"),
+        60..3600 => format!("{} min", seconds / 60),
+        _ if seconds % 3600 < 60 => format!("{} h", seconds / 3600),
+        _ => format!("{} h {} min", seconds / 3600, seconds % 3600 / 60),
+    }
 }
 
 pub(super) fn clock(timestamp: i64) -> String {

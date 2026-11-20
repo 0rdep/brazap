@@ -42,7 +42,7 @@ impl Archive {
         let mut cursor = 0;
         loop {
             let account = self.account as i64;
-            let rows:Vec<EventRow>=self.backend.shared().read(move |conn| {
+            let rows:Vec<EventRow>=self.sql().read(move |conn| {
                 diesel::sql_query("SELECT rowid AS cursor,payload FROM brazap_events WHERE account=? AND rowid>? AND kind IN ('ContactUpdate','ContactRemoved') ORDER BY rowid LIMIT 256")
                     .bind::<BigInt,_>(account).bind::<BigInt,_>(cursor).load(conn).map_err(db_error)
             }).await?;
@@ -73,8 +73,7 @@ impl Archive {
                 {
                     let account = self.account as i64;
                     let jid = jid.to_owned();
-                    self.backend
-                        .shared()
+                    self.sql()
                         .run(move |conn| {
                             diesel::sql_query(
                                 "DELETE FROM brazap_saved_contacts WHERE account=? AND jid=?",
@@ -116,8 +115,7 @@ impl Archive {
                 ""
             }
         );
-        self.backend
-            .shared()
+        self.sql()
             .run(move |conn| {
                 for jid in aliases {
                     diesel::sql_query(&sql)
@@ -156,7 +154,7 @@ impl Archive {
             id: String::new(),
             sender: String::new(),
         });
-        let rows:Vec<MessageRow>=self.backend.shared().read(move |conn|{
+        let rows:Vec<MessageRow>=self.sql().read(move |conn|{
             let mut rows=Vec::new();
             for source in sources {
             rows.extend(diesel::sql_query(format!("{MESSAGE_SELECT} WHERE m.account=? AND {scope} AND CASE ? WHEN 'media' THEN json_extract(m.payload,'$.kind') IN ('image','video','sticker') WHEN 'files' THEN json_extract(m.payload,'$.kind')='file' ELSE json_extract(m.payload,'$.kind')='audio' END AND (m.timestamp,m.id,m.sender)<(?,?,?) ORDER BY m.timestamp DESC,m.id DESC,m.sender DESC LIMIT 37"))
@@ -185,7 +183,7 @@ impl Archive {
         let mut cursor = 0;
         loop {
             let account = self.account as i64;
-            let rows:Vec<EventRow>=self.backend.shared().read(move |conn|{
+            let rows:Vec<EventRow>=self.sql().read(move |conn|{
                 diesel::sql_query("SELECT rowid AS cursor,payload FROM brazap_events WHERE account=? AND rowid>? AND kind IN ('MuteUpdate','PinUpdate','ArchiveUpdate','LockChatUpdate') ORDER BY rowid LIMIT 128")
                     .bind::<BigInt,_>(account).bind::<BigInt,_>(cursor).load(conn).map_err(db_error)
             }).await?;
@@ -244,8 +242,8 @@ impl Archive {
         let mut cursor = 0;
         loop {
             let account = self.account as i64;
-            let row:Option<HistoryRow>=self.backend.shared().read(move |conn|{
-                diesel::sql_query("SELECT rowid AS cursor,data FROM brazap_history WHERE account=? AND stage=1 AND rowid>? ORDER BY rowid LIMIT 1")
+            let row:Option<HistoryRow>=self.sql().read(move |conn|{
+                diesel::sql_query("SELECT rowid AS cursor,data FROM brazap_history WHERE +account=? AND stage=1 AND rowid>? ORDER BY rowid LIMIT 1")
                     .bind::<BigInt,_>(account).bind::<BigInt,_>(cursor).get_result(conn).optional().map_err(db_error)
             }).await?;
             let Some(row) = row else {

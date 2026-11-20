@@ -91,6 +91,17 @@ enum Command {
     Asset(String, AssetRequest),
     Video(u64, Message),
     Audio(u64, Message),
+    /// Voice messages on screen to transcribe: generation (shared, so a newer
+    /// request stops older polling), chat, messages, messages to retry and
+    /// whether those are transcribed again even when finished.
+    Transcribe(
+        Arc<std::sync::atomic::AtomicU64>,
+        u64,
+        String,
+        Vec<(String, String)>,
+        Vec<(String, String)>,
+        bool,
+    ),
     SendVoice(u64, crate::model::VoiceUpload),
     PrepareAttachment(u64, u64, attachments::Source),
     SendAttachments(u64, String, Vec<attachments::Upload>),
@@ -101,6 +112,8 @@ enum Command {
     Focused(bool),
     Tool(&'static str, Value),
     Send(Message, Option<MessageCursor>),
+    /// Edit one of your messages: the message as shown before and its new text.
+    Edit(Message, String),
     Forward(String, String, Vec<MessageCursor>),
     Open(String),
     Older(String, MessageCursor, u64),
@@ -132,6 +145,7 @@ enum Event {
     Asset(String, Result<Option<Vec<u8>>, String>),
     Video(u64, Result<tempfile::TempPath, String>),
     Audio(u64, Result<tempfile::TempPath, String>),
+    Transcripts(String, Vec<crate::transcription::Item>),
     VoiceSent(u64, Result<Message, String>),
     AttachmentPrepared(u64, u64, Result<attachments::Prepared, String>),
     AttachmentSent(u64, u64, Result<Message, String>),
@@ -140,6 +154,7 @@ enum Event {
     Diagnostics(Result<Value, String>),
     Done(Result<Value, String>),
     Sent(String, Result<Message, String>),
+    Edited(Message, Result<Message, String>),
     Forward(Result<crate::model::ForwardResult, String>),
     Opened(Result<(String, Option<String>), String>),
     Older(String, u64, Result<MessagePage, String>),
@@ -174,6 +189,8 @@ pub(super) struct State {
     typing_sent_at: i64,
     window: Arc<std::sync::Mutex<Option<rune::WindowHandle>>>,
     reply: Option<Message>,
+    /// The message being edited in the composer, and the draft it replaced.
+    editing: Option<(Message, String)>,
     reaction_menu: Option<Message>,
     reaction_text: TextEdit,
     forwarding: Option<actions::Forwarding>,
@@ -201,6 +218,7 @@ pub(super) struct State {
     history_notice: Option<String>,
     attachments_open: bool,
     viewer: Option<Message>,
+    viewer_zoom: media::Zoom,
     chat_bounds: [f32; 4],
     viewer_generation: u64,
     video: Option<video::Player>,
@@ -242,6 +260,13 @@ pub(super) struct State {
     sticker_jobs: usize,
     visible_media: Vec<(String, String)>,
     prefetched: HashSet<String>,
+    /// Latest known transcripts, by `transcript_key`, overriding loaded messages.
+    transcripts: HashMap<String, crate::transcription::Transcript>,
+    /// Transcripts shown in full instead of their beginning.
+    transcripts_open: HashSet<String>,
+    /// The on-screen voice messages last sent for transcription.
+    transcript_request: Vec<(String, String)>,
+    transcript_generation: Arc<std::sync::atomic::AtomicU64>,
     scroll_height: std::rc::Rc<std::cell::Cell<f32>>,
     scroll_thumb: rune::Live<[f32; 4]>,
     scroll_metrics: rune::Live<[f32; 2]>,
@@ -321,6 +346,7 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         typing_sent_at: 0,
         window,
         reply: None,
+        editing: None,
         reaction_menu: None,
         reaction_text: TextEdit::new(""),
         forwarding: None,
@@ -349,6 +375,7 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         history_notice: None,
         attachments_open: false,
         viewer: None,
+        viewer_zoom: media::Zoom::default(),
         chat_bounds: [333.0, 16.0, 831.0, 768.0],
         viewer_generation: 0,
         video: None,
@@ -388,6 +415,10 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         sticker_jobs: 0,
         visible_media: Vec::new(),
         prefetched: HashSet::new(),
+        transcripts: HashMap::new(),
+        transcripts_open: HashSet::new(),
+        transcript_request: Vec::new(),
+        transcript_generation: Default::default(),
         scroll_height: std::rc::Rc::new(std::cell::Cell::new(1.0)),
         scroll_thumb: rune::Live::new([0.0; 4]),
         scroll_metrics: rune::Live::new([0.0; 2]),
@@ -433,6 +464,7 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
             s.focused = focused;
             let _ = s.tx.send(Command::Focused(focused));
             s.update_viewing();
+            s.sync_floating();
             // Windows drops the overlay when the taskbar button is recreated after a hide.
             s.badge = None;
             s.update_badge();
@@ -441,7 +473,10 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         .on_window(move |handle| {
             #[cfg(target_os = "windows")]
             crate::windows_integration::set_window_icon(handle);
-            if let Ok(mut window) = window_created.lock() {
+            // The call window is created through this app too; keep the main one.
+            if handle.key() != "floating-call"
+                && let Ok(mut window) = window_created.lock()
+            {
                 *window = Some(handle.clone());
             }
         })
@@ -466,6 +501,10 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
     // close only hides the window; its state and service stay alive.
     let _ = worker.join();
     Ok(())
+}
+
+fn transcript_key(chat: &str, sender: &str, id: &str) -> String {
+    format!("{chat}\u{1f}{sender}\u{1f}{id}")
 }
 
 fn unreachable_state() -> State {
@@ -596,10 +635,13 @@ async fn worker(
     let mut call_tick = tokio::time::interval(Duration::from_millis(100));
     let mut preview_call: Option<crate::calling::LiveCall> = None;
     let mut preview_id = String::new();
-    let mut sequences = [0u64; 2];
+    let sequences = Arc::new(std::sync::Mutex::new([0u64; 2]));
     // At most one unconsumed preview per direction, including minimized windows.
     let frame_pending: [Arc<std::sync::atomic::AtomicBool>; 2] =
         std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    // Previews are fetched off this loop, so a slow service never delays chat
+    // selection, sends or call controls behind a video frame.
+    let frames_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
     loop {
         tokio::select! {
             command=commands.recv()=>{
@@ -694,6 +736,32 @@ async fn worker(
                             emit(&events,&wake,Event::Gallery(chat,kind,result));
                         });continue;
                     }
+                    Some(Command::Transcribe(current,generation,chat,items,retry,redo))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            use std::sync::atomic::Ordering::Relaxed;
+                            let mut pending=items;
+                            let mut retry=retry;
+                            // Poll until every message is finished or a newer view replaces this one.
+                            while current.load(Relaxed)==generation && !pending.is_empty() {
+                                match remote.call("transcribe",json!({"chat":chat,"items":pending,"visible":true,"retry":retry,"redo":redo && !retry.is_empty()})).await
+                                    .and_then(|v|Ok(serde_json::from_value::<Vec<crate::transcription::Item>>(v["items"].clone())?)) {
+                                    Ok(results)=>{
+                                        pending=results.iter().filter(|item|item.transcript.as_ref().is_some_and(|t|!t.finished())).map(|item|(item.sender.clone(),item.id.clone())).collect();
+                                        if current.load(Relaxed)==generation {
+                                            emit(&events,&wake,Event::Transcripts(chat.clone(),results));
+                                        }
+                                    }
+                                    Err(error)=>{
+                                        log::debug!("Could not request transcripts: {error:#}");
+                                        break;
+                                    }
+                                }
+                                retry=Vec::new();
+                                tokio::time::sleep(Duration::from_millis(1200)).await;
+                            }
+                        });continue;
+                    }
                     Some(Command::Prefetch(chat,items))=>{
                         let remote=remote.clone();
                         assets.spawn(async move {if let Err(error)=remote.call("prepare_media",json!({"chat":chat,"items":items})).await{log::debug!("Could not prepare media: {error}");}});
@@ -766,7 +834,7 @@ async fn worker(
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
                         assets.spawn(async move {
                             for upload in uploads {
-                                let result=remote.call("send_attachment",json!({"chat":chat,"path":upload.path,"kind":upload.kind,"caption":upload.caption})).await
+                                let result=remote.call("send_attachment",json!({"chat":chat,"path":upload.path,"kind":upload.kind,"caption":upload.caption,"view_once":upload.view_once})).await
                                     .and_then(|value|Ok(serde_json::from_value(value["message"].clone())?))
                                     .map_err(|e|format!("{e:#}"));
                                 let failed=result.is_err();
@@ -796,7 +864,7 @@ async fn worker(
                         }
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
                         assets.spawn(async move {
-                            let method=match action {"get"=>"brazap/settings","save"=>"brazap/settings/save","privacy"=>"brazap/privacy","privacy_set"=>"brazap/privacy/set","clear"=>"brazap/cache/clear","logout"=>"brazap/logout","typing"=>"brazap/typing",_=>"brazap/updates"};
+                            let method=match action {"get"=>"brazap/settings","save"=>"brazap/settings/save","privacy"=>"brazap/privacy","privacy_set"=>"brazap/privacy/set","clear"=>"brazap/cache/clear","logout"=>"brazap/logout","typing"=>"brazap/typing","speech_model"=>"brazap/call",_=>"brazap/updates"};
                             let mut result=remote.request(method,args).await.map_err(|e|format!("{e:#}"));
                             if action=="privacy_set" && result.is_ok(){result=remote.request("brazap/privacy",json!({})).await.map_err(|e|format!("{e:#}"));}
                             if action!="typing" {emit(&events,&wake,Event::Preferences(action,result));}
@@ -837,6 +905,14 @@ async fn worker(
                             let result=remote.call("send_message",json!({"chat":message.chat,"text":message.text,"reply_to":reply,"message_id":message.id,"timestamp":message.timestamp})).await
                                 .and_then(|v|Ok(serde_json::from_value(v["message"].clone())?)).map_err(|e|format!("{e:#}"));
                             emit(&events,&wake,Event::Sent(message.id,result));
+                        });
+                    }
+                    Some(Command::Edit(message,text))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=remote.call("edit_message",json!({"chat":message.chat,"id":message.id,"text":text})).await
+                                .and_then(|v|Ok(serde_json::from_value(v["message"].clone())?)).map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Edited(message,result));
                         });
                     }
                     Some(Command::Forward(source,destination,targets))=>{
@@ -897,25 +973,39 @@ async fn worker(
                 }
             },
             _=call_tick.tick(), if preview_call.as_ref().is_some_and(|c| !c.ended() && (c.camera || c.peer_camera))=>{
-                if let Some(call)=&preview_call {
-                    if preview_id != call.id { preview_id=call.id.clone();sequences=[0,0]; }
-                    for (index,local) in [false,true].into_iter().enumerate() {
-                        if frame_pending[index].load(std::sync::atomic::Ordering::Acquire) { continue; }
-                        if let Ok(value)=remote.request("brazap/call/frame",json!({"id":call.id,"local":local,"after":sequences[index]})).await {
-                            if let Ok(Some(frame))=serde_json::from_value::<Option<crate::calling::PreviewFrame>>(value["frame"].clone()) {
-                                use base64::Engine;
-                                sequences[index]=frame.sequence;
-                                if let Ok(bytes)=base64::engine::general_purpose::STANDARD.decode(frame.jpeg) {
-                                    if let Ok(image)=image::load_from_memory(&bytes) {
-                                        let image=image.to_rgba8();
-                                        frame_pending[index].store(true,std::sync::atomic::Ordering::Release);
-                                        emit(&events,&wake,Event::CallFrame(call.id.clone(),local,image.width(),image.height(),image.into_raw(),frame_pending[index].clone()));
-                                    }
-                                }
-                            }
-                        }
-                    }
+                use std::sync::atomic::Ordering;
+                let Some(call)=preview_call.clone() else { continue };
+                if preview_id != call.id {
+                    preview_id=call.id.clone();
+                    *sequences.lock().unwrap_or_else(|e|e.into_inner())=[0,0];
                 }
+                if frames_in_flight.swap(true,Ordering::AcqRel) { continue; }
+                let (remote,events,wake,sequences,frame_pending,in_flight)=(remote.clone(),events.clone(),wake.clone(),sequences.clone(),frame_pending.clone(),frames_in_flight.clone());
+                assets.spawn(async move {
+                    for (index,local) in [false,true].into_iter().enumerate() {
+                        if frame_pending[index].load(Ordering::Acquire) { continue; }
+                        let after=sequences.lock().unwrap_or_else(|e|e.into_inner())[index];
+                        let Ok(value)=remote.request("brazap/call/frame",json!({"id":call.id,"local":local,"after":after})).await else { continue };
+                        let Ok(Some(frame))=serde_json::from_value::<Option<crate::calling::PreviewFrame>>(value["frame"].clone()) else { continue };
+                        // Sequences are process-wide, so a reply that outlives its call is harmless.
+                        sequences.lock().unwrap_or_else(|e|e.into_inner())[index]=frame.sequence;
+                        use base64::Engine;
+                        let Ok(bytes)=base64::engine::general_purpose::STANDARD.decode(frame.jpeg) else { continue };
+                        let Ok(image)=image::load_from_memory(&bytes) else { continue };
+                        let mut image=image.to_rgba8();
+                        if !local {
+                            image=match calling::remote_rotation() {
+                                1=>image::imageops::rotate90(&image),
+                                2=>image::imageops::rotate180(&image),
+                                3=>image::imageops::rotate270(&image),
+                                _=>image,
+                            };
+                        }
+                        frame_pending[index].store(true,Ordering::Release);
+                        emit(&events,&wake,Event::CallFrame(call.id.clone(),local,image.width(),image.height(),image.into_raw(),frame_pending[index].clone()));
+                    }
+                    in_flight.store(false,Ordering::Release);
+                });
             },
             _=interval.tick()=>{
                 if snapshot_pending || snapshot_retry_at.is_some_and(|at| tokio::time::Instant::now() < at) { continue; }
@@ -1028,6 +1118,16 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
             }
             Event::StatusReplied(id, result) => {
                 state.receive_status_reply(id, result);
+                changed = true;
+            }
+            Event::Transcripts(chat, items) => {
+                for item in items {
+                    if let Some(transcript) = item.transcript {
+                        state
+                            .transcripts
+                            .insert(transcript_key(&chat, &item.sender, &item.id), transcript);
+                    }
+                }
                 changed = true;
             }
             Event::NextAudio(generation, result) => {
@@ -1318,6 +1418,19 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
                 state.error = result.err();
                 changed = true;
             }
+            Event::Edited(original, result) => {
+                let message = match result {
+                    Ok(message) => message,
+                    Err(error) => {
+                        state.error = Some(error);
+                        original
+                    }
+                };
+                if state.selected.as_deref() == Some(&message.chat) {
+                    state.merge_messages(vec![message]);
+                }
+                changed = true;
+            }
             Event::Sent(id, result) => {
                 match result {
                     Ok(message) => {
@@ -1530,6 +1643,7 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
         if state.preferences.value.privacy.send_typing
             && second - state.typing_sent_at >= 4
             && state.authenticated
+            && state.editing.is_none()
         {
             if let Some(chat) = state.selected.clone() {
                 let _ = state.tx.send(Command::Preferences(
@@ -1813,11 +1927,12 @@ impl State {
             if let Some(existing) = self.timeline.iter_mut().find(|m| {
                 m.chat == message.chat
                     && m.id == message.id
-                    && if m.chat.ends_with("@g.us") {
-                        m.sender == message.sender
-                    } else {
-                        m.from_me == message.from_me
-                    }
+                    && (message.id.starts_with(crate::calls::CALL_LOG_PREFIX)
+                        || if m.chat.ends_with("@g.us") {
+                            m.sender == message.sender
+                        } else {
+                            m.from_me == message.from_me
+                        })
             }) {
                 // A stale snapshot must not turn an acknowledged send back
                 // into a clock, or hide a retry while its RPC is in flight.
@@ -1983,6 +2098,10 @@ impl State {
         self.contact = None;
         self.stop_voice();
         self.reply = None;
+        // Keep the draft the edit replaced, not the unsaved edit.
+        if let Some((_, draft)) = self.editing.take() {
+            self.draft = TextEdit::new(draft);
+        }
         self.chat_search.clear();
         self.chat_search.open = false;
         self.reaction_menu = None;
@@ -2017,6 +2136,11 @@ impl State {
         self.media_menu = None;
         self.visible_media.clear();
         self.prefetched.clear();
+        self.transcript_request.clear();
+        self.transcript_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Keep finished results; work in progress is asked for again on return.
+        self.transcripts.retain(|_, t| t.finished());
         self.detached = false;
         self.history_focus = false;
         self.highlighted = None;
@@ -2052,7 +2176,65 @@ impl State {
             self.error = Some("The local service stopped".into());
         }
     }
+    /// Put the composer into edit mode for one of your messages.
+    fn begin_edit(&mut self, message: Message, tx: &mut Tx) {
+        if self.recording.is_some() || self.attachments.is_some() {
+            return;
+        }
+        let draft = match self.editing.take() {
+            Some((_, draft)) => draft,
+            None => self.draft.text.clone(),
+        };
+        self.reply = None;
+        self.attachments_open = false;
+        self.draft = TextEdit::new(message.text.clone());
+        self.editing = Some((message, draft));
+        self.defer_composer_focus(tx);
+    }
+    fn cancel_edit(&mut self) -> bool {
+        let Some((_, draft)) = self.editing.take() else {
+            return false;
+        };
+        self.draft = TextEdit::new(draft);
+        self.focus_composer();
+        true
+    }
+    fn save_edit(&mut self) {
+        let Some((original, _)) = &self.editing else {
+            return;
+        };
+        let text = self.draft.text.clone();
+        if text.trim().is_empty() {
+            return;
+        }
+        let original = original.clone();
+        self.cancel_edit();
+        if text == original.text {
+            return;
+        }
+        if let Some(reason) = original.edit_blocker(crate::model::now()) {
+            self.error = Some(reason.into());
+            return;
+        }
+        // Shown at once; the service's answer replaces it, or restores the original.
+        let mut edited = original.clone();
+        edited.text = text.clone();
+        edited.mentions.clear();
+        edited.link_preview = None;
+        edited.edited = true;
+        edited.edited_at = Some(crate::model::now());
+        self.merge_messages(vec![edited]);
+        self.error = None;
+        if self.tx.send(Command::Edit(original.clone(), text)).is_err() {
+            self.merge_messages(vec![original]);
+            self.error = Some("The local service stopped".into());
+        }
+    }
     fn send(&mut self) {
+        if self.editing.is_some() {
+            self.save_edit();
+            return;
+        }
         if self.busy
             || self.recording.is_some()
             || self.attachments.is_some()
@@ -2249,6 +2431,9 @@ fn on_key(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
             s.close_chat_search();
             return true;
         }
+        if s.cancel_edit() {
+            return true;
+        }
         if s.reply.take().is_some() {
             return true;
         }
@@ -2433,6 +2618,73 @@ impl State {
         );
     }
 
+    /// Transcribes the voice messages on screen, newest first. Messages in
+    /// `retry` forget a failure, or with `redo` replace a finished transcript.
+    fn request_transcripts(&mut self, retry: Vec<(String, String)>, redo: bool) {
+        let Some(chat) = self.selected.clone() else {
+            return;
+        };
+        if !self.snapshot.settings.transcription.enabled
+            || self.snapshot.transcription.status == "unsupported"
+        {
+            return;
+        }
+        let items: Vec<(String, String)> = self
+            .timeline
+            .iter()
+            .rev()
+            .filter(|m| {
+                m.kind == "audio"
+                    && self
+                        .visible_media
+                        .iter()
+                        .any(|(sender, id)| *sender == m.sender && *id == m.id)
+                    && (retry
+                        .iter()
+                        .any(|(sender, id)| *sender == m.sender && *id == m.id)
+                        || !self.transcript(m).is_some_and(|t| t.finished()))
+            })
+            .map(|m| (m.sender.clone(), m.id.clone()))
+            .collect();
+        if items.is_empty() || (retry.is_empty() && items == self.transcript_request) {
+            return;
+        }
+        for (sender, id) in &retry {
+            // Shows "Transcribing…" until the first poll answers.
+            self.transcripts.insert(
+                transcript_key(&chat, sender, id),
+                crate::transcription::Transcript {
+                    status: "queued".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        self.transcript_request = items.clone();
+        let generation = self
+            .transcript_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let _ = self.tx.send(Command::Transcribe(
+            self.transcript_generation.clone(),
+            generation,
+            chat,
+            items,
+            retry,
+            redo,
+        ));
+    }
+
+    /// The newest transcript of a voice message: polled results first, then
+    /// what the message carried when it was loaded.
+    fn transcript<'a>(
+        &'a self,
+        message: &'a Message,
+    ) -> Option<&'a crate::transcription::Transcript> {
+        self.transcripts
+            .get(&transcript_key(&message.chat, &message.sender, &message.id))
+            .or(message.transcript.as_ref())
+    }
+
     fn request_chat_media(&mut self) {
         if let Some(chat) = self.snapshot.current_chat.clone() {
             self.request_avatar(&chat.jid, chat.photo_version);
@@ -2597,6 +2849,7 @@ impl State {
     fn close_viewer(&mut self) {
         self.viewer_generation = self.viewer_generation.wrapping_add(1);
         self.viewer = None;
+        self.viewer_zoom = media::Zoom::default();
         self.video = None;
         self.video_status = None;
         *VIDEO_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = None;

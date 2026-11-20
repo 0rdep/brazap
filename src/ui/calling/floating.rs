@@ -1,6 +1,8 @@
-//! A retained native call window. Media and controls stay owned by the main
+//! A retained native call window, shown while the main window is minimized or
+//! hidden so the call stays on screen. Media and controls stay owned by the main
 //! window's service; Pixels are shared instead of decoding a second video feed.
-use super::{HANGUP, MIC, VIDEO, status};
+//! It shows only the peer: your own camera appears beside them in the full view.
+use super::{HANGUP, MIC, ROTATE, VIDEO, status};
 use crate::ui::{State, locale, view::*};
 use crate::{calling::LiveCall, settings::AppearanceSettings};
 use rune::{
@@ -39,7 +41,6 @@ struct WindowState {
     pending: bool,
     error: Option<String>,
     avatar: Option<Image>,
-    local: Pixels,
     remote: Pixels,
     second: i64,
 }
@@ -76,7 +77,6 @@ impl Floating {
                     pending: false,
                     error: None,
                     avatar: None,
-                    local: Pixels::new(),
                     remote: Pixels::new(),
                     second: 0,
                 })
@@ -85,7 +85,7 @@ impl Floating {
                     transparent: false,
                     borderless: true,
                     always_on_top: true,
-                    resizable: false,
+                    resizable: true,
                     min_size: Some((320.0, 200.0)),
                     ..Default::default()
                 })
@@ -104,26 +104,24 @@ impl Floating {
             last: None,
         }
     }
-    pub(in crate::ui) fn focus(&self) {
-        self.window.open();
-    }
     fn hide(&mut self) {
         if !self.shown {
             return;
         }
+        log::debug!("Hiding the call window");
         self.shown = false;
         self.last = None;
         self.window.hide();
         self.app.update(|s, _| {
             s.call = None;
             s.avatar = None;
-            s.local = Pixels::new();
             s.remote = Pixels::new();
         });
     }
 }
 impl State {
     pub(in crate::ui) fn sync_floating(&mut self) {
+        let hidden = self.main_window_hidden();
         let Some(floating) = &mut self.floating else {
             return;
         };
@@ -131,7 +129,7 @@ impl State {
             .snapshot
             .live_call
             .as_ref()
-            .filter(|c| !c.ended() && self.call.minimized)
+            .filter(|c| !c.ended() && hidden)
         else {
             floating.hide();
             return;
@@ -152,26 +150,26 @@ impl State {
         if !floating.shown || video != floating.video {
             floating.video = video;
             floating.window.resize_instant(if video {
-                (400.0, 420.0)
+                (360.0, 600.0)
             } else {
                 (380.0, 250.0)
             });
         }
         if floating.last.as_ref() != Some(&published) {
             floating.last = Some(published.clone());
-            let (local, remote) = (self.call.local.clone(), self.call.remote.clone());
+            let remote = self.call.remote.clone();
             floating.app.update(move |s, tx| {
                 s.call = Some(published.call);
                 s.appearance = published.appearance;
                 s.pending = published.pending;
                 s.error = published.error;
                 s.avatar = avatar;
-                s.local = local;
                 s.remote = remote;
                 tx.wake_after(Duration::from_secs(1));
             });
         }
         if !floating.shown {
+            log::debug!("Showing the call window while Brazap is minimized or hidden");
             floating.shown = true;
             if !floating.placed {
                 floating.placed = true;
@@ -190,18 +188,36 @@ impl State {
     }
     pub(in crate::ui) fn restore_call(&mut self) {
         self.call.minimized = false;
-        self.sync_floating();
         if let Ok(window) = self.window.lock()
             && let Some(window) = window.as_ref()
         {
             window.open();
+            window.focus();
         }
     }
-    pub(in crate::ui) fn show_floating_call(&mut self) {
-        self.call.minimized = true;
-        self.sync_floating();
-        if let Some(floating) = &self.floating {
-            floating.focus();
+    /// Minimized or closed to the tray: the call needs its own window. On
+    /// macOS and Linux, where minimizing is not observable here, losing focus
+    /// stands in for it.
+    fn main_window_hidden(&self) -> bool {
+        let app = self.wake.lock().ok().and_then(|wake| wake.app.clone());
+        if app.is_some_and(|app| !app.is_visible()) {
+            return true;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            self.window
+                .lock()
+                .ok()
+                .and_then(|window| {
+                    window
+                        .as_ref()
+                        .map(crate::windows_integration::is_minimized)
+                })
+                .unwrap_or(false)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            !self.focused
         }
     }
 }
@@ -218,6 +234,9 @@ fn poll(s: &mut WindowState, _: f64, tx: &mut Tx) -> bool {
         return false;
     }
     tx.wake_after(Duration::from_secs(1));
+    // A restored main window may not poll until it repaints; recheck from here
+    // so this window steps aside as soon as Brazap is back on screen.
+    s.parent.update(|s, _| s.sync_floating());
     let second = crate::model::now();
     if second == s.second {
         false
@@ -315,7 +334,21 @@ fn view(s: &WindowState, _: &mut Cx<WindowState>) -> El {
             .fill(Color::BLACK)
             .center();
         if call.peer_camera && s.remote.size().0 > 0 {
-            canvas = canvas.pixels_fit(&s.remote, rune::SurfaceFit::Fit);
+            canvas = canvas.pixels_fit(&s.remote, rune::SurfaceFit::Fit).child(
+                el().pin(Some(8.0), Some(8.0), None, None)
+                    .size(30.0, 30.0)
+                    .radius(15.0)
+                    .center()
+                    .fill(Color::BLACK.alpha(0.45))
+                    .role("button")
+                    .label(locale::tr("Rotate video"))
+                    .help(locale::tr("Rotate video"))
+                    .hover(Color::BLACK.alpha(0.6))
+                    .on_press_tx(|s: &mut WindowState, _| {
+                        s.parent.update(|s, _| s.rotate_remote_video())
+                    })
+                    .child(icon(&ROTATE, 15.0).color(Color::WHITE)),
+            );
         } else {
             canvas = canvas.child(label(
                 locale::tr(if call.peer_camera {
@@ -326,16 +359,6 @@ fn view(s: &WindowState, _: &mut Cx<WindowState>) -> El {
                 12.0,
                 MUTED,
             ));
-        }
-        if call.camera && s.local.size().0 > 0 {
-            canvas = canvas.child(
-                el().pin(None, None, Some(8.0), Some(8.0))
-                    .size(105.0, 70.0)
-                    .radius(9.0)
-                    .clip_rounded(9.0)
-                    .border(1.0, Color::WHITE.alpha(0.16))
-                    .pixels_fit(&s.local, rune::SurfaceFit::Fit),
-            );
         }
         body = body.child(canvas);
     } else {

@@ -297,10 +297,12 @@ pub(super) fn viewer(s: &State) -> Option<El> {
                 )),
         );
     let display = el().grow(1.0).min_h(0.0).w_full().center();
-    content = content.child(if let Some(pixels) = s.animations.pixels(&key) {
-        display.pixels_fit(pixels, SurfaceFit::Fit)
-    } else if let Some(image) = image {
-        display.pixels_fit(image.pixels(), SurfaceFit::Fit)
+    let pixels = s
+        .animations
+        .pixels(&key)
+        .or_else(|| image.map(|image| image.pixels()));
+    content = content.child(if let Some(pixels) = pixels {
+        zoomable(s, pixels, display)
     } else {
         display.child(label(super::locale::tr("Loading image…"), 14.0, MUTED))
     });
@@ -337,6 +339,103 @@ pub(super) fn viewer(s: &State) -> Option<El> {
             .or_else(|| image.and_then(|i| i.size())),
         80.0 + extra,
     ))
+}
+
+/// The image viewer's zoom: the wheel or a pinch zooms about the pointer, a drag pans
+/// while zoomed and a double click toggles between fitting and 2×.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Zoom {
+    scale: f32,
+    pan: [f32; 2],
+    size: [f32; 2],
+    /// The pan when the current drag began.
+    grab: [f32; 2],
+}
+
+impl Default for Zoom {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            pan: [0.0; 2],
+            size: [0.0; 2],
+            grab: [0.0; 2],
+        }
+    }
+}
+
+const MAX_ZOOM: f32 = 8.0;
+/// A notched wheel reports 40 points per step; each step zooms by 20%.
+const WHEEL_ZOOM: f32 = 0.004_558;
+
+impl Zoom {
+    /// Scale by `factor`, keeping the image point under (`x`, `y`) where it is.
+    fn zoom_at(&mut self, factor: f32, x: f32, y: f32) {
+        let scale = (self.scale * factor).clamp(1.0, MAX_ZOOM);
+        let ratio = scale / self.scale;
+        let [cx, cy] = [self.size[0] / 2.0, self.size[1] / 2.0];
+        self.pan = [
+            x - cx - ratio * (x - cx - self.pan[0]),
+            y - cy - ratio * (y - cy - self.pan[1]),
+        ];
+        self.scale = scale;
+        self.clamp();
+    }
+    fn clamp(&mut self) {
+        for axis in 0..2 {
+            let limit = (self.scale - 1.0) * self.size[axis] / 2.0;
+            self.pan[axis] = self.pan[axis].clamp(-limit, limit);
+        }
+    }
+}
+
+fn zoomable(s: &State, pixels: &rune::Pixels, display: El) -> El {
+    let zoom = s.viewer_zoom;
+    let zoomed = zoom.scale > 1.001;
+    let mut display = display
+        .clip_rounded(8.0)
+        .on_layout(|s: &mut State, [_, _, w, h]| {
+            s.viewer_zoom.size = [w, h];
+            s.viewer_zoom.clamp();
+        })
+        .on_wheel(|s: &mut State, e, _| {
+            if e.dy != 0.0 {
+                s.viewer_zoom.zoom_at((e.dy * WHEEL_ZOOM).exp(), e.x, e.y);
+            }
+            true
+        })
+        .on_magnify(|s: &mut State, e, _| {
+            s.viewer_zoom.zoom_at(1.0 + e.delta, e.x, e.y);
+            true
+        })
+        .on_double_press_tx(|s: &mut State, _| {
+            let [w, h] = s.viewer_zoom.size;
+            if s.viewer_zoom.scale > 1.001 {
+                s.viewer_zoom.zoom_at(0.0, w / 2.0, h / 2.0);
+            } else {
+                s.viewer_zoom.zoom_at(2.0, w / 2.0, h / 2.0);
+            }
+        })
+        .help(super::locale::tr("Scroll to zoom · Double-click to reset"));
+    if zoomed {
+        display = display
+            .cursor(rune::Cursor::Grab)
+            .on_drag(|s: &mut State, d, _| {
+                let zoom = &mut s.viewer_zoom;
+                if d.phase == rune::Phase::Down {
+                    zoom.grab = zoom.pan;
+                }
+                zoom.pan = [zoom.grab[0] + d.dx, zoom.grab[1] + d.dy];
+                zoom.clamp();
+            });
+    }
+    display.child(
+        el().w_full()
+            .h_full()
+            .pixels_fit(pixels, SurfaceFit::Fit)
+            .scale(zoom.scale)
+            .offset(zoom.pan[0], zoom.pan[1])
+            .motion(rune::tok::motion::SNAPPY),
+    )
 }
 
 fn video_viewer(s: &State, message: &Message) -> El {

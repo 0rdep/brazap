@@ -5,6 +5,12 @@ SELECT m.payload,m.status,
        COALESCE((SELECT json_group_array(json_object('sender',r.reactor,'emoji',r.emoji))
                  FROM brazap_reactions r WHERE r.account=m.account AND r.chat=m.chat
                  AND r.target_sender=m.sender AND r.target_id=m.id AND r.emoji!=''),'[]') AS reactions,
+       (SELECT json_object('status',t.status,'text',t.text,'language',t.language,'error',t.error,
+                           'partial',json(CASE t.partial WHEN 0 THEN 'false' ELSE 'true' END))
+        FROM brazap_transcripts t WHERE t.account=m.account AND t.chat=m.chat
+        AND t.sender=m.sender AND t.id=m.id) AS transcript,
+       (SELECT json_object('at',e.edited_at,'content',json(e.content)) FROM brazap_edits e
+        WHERE e.account=m.account AND e.chat=m.chat AND e.sender=m.sender AND e.id=m.id) AS edit,
        EXISTS(SELECT 1 FROM brazap_media b
               WHERE b.account=m.account AND b.chat=m.chat AND b.sender=m.sender AND b.id=m.id) AS has_media,
        COALESCE(CASE WHEN lower(trim(sn.name)) NOT IN ('unknown contact','unknown','unnamed group','contato desconhecido','contacto desconocido') THEN NULLIF(sn.name,'') END,CASE WHEN lower(trim(sp.name)) NOT IN ('unknown contact','unknown','unnamed group','contato desconhecido','contacto desconocido') THEN NULLIF(sp.name,'') END,CASE WHEN lower(trim(sa.name)) NOT IN ('unknown contact','unknown','unnamed group','contato desconhecido','contacto desconocido') THEN NULLIF(sa.name,'') END,CASE WHEN lower(trim(n.name)) NOT IN ('unknown contact','unknown','unnamed group','contato desconhecido','contacto desconocido') THEN NULLIF(n.name,'') END,CASE WHEN lower(trim(p.name)) NOT IN ('unknown contact','unknown','unnamed group','contato desconhecido','contacto desconocido') THEN NULLIF(p.name,'') END,CASE WHEN lower(trim(a.name)) NOT IN ('unknown contact','unknown','unnamed group','contato desconhecido','contacto desconocido') THEN NULLIF(a.name,'') END,CASE WHEN lower(trim(c.name)) NOT IN ('unknown contact','unknown','unnamed group','contato desconhecido','contacto desconocido') THEN NULLIF(c.name,'') END,

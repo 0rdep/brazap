@@ -154,6 +154,37 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
                 service.archive.message_page(chat, limit, cursor).await?,
             )?)
         }
+        "transcribe" => {
+            let items: Vec<(String, String)> = serde_json::from_value(args["items"].clone())?;
+            Ok(json!({"items": service
+                .transcribe(
+                    text_arg(&args, "chat")?.into(),
+                    items,
+                    args["visible"].as_bool().unwrap_or(false),
+                    &serde_json::from_value::<Vec<(String, String)>>(args["retry"].clone())
+                        .unwrap_or_default(),
+                    args["redo"].as_bool().unwrap_or(false),
+                )
+                .await?}))
+        }
+        "speech_model" => {
+            service
+                .speech_model(text_arg(&args, "id")?, text_arg(&args, "action")?)
+                .await?;
+            Ok(json!({"ok": true}))
+        }
+        "transcribe_audio" => {
+            let wait = args["wait_seconds"].as_u64().unwrap_or(120).min(600);
+            Ok(json!({"transcript": service
+                .transcript_of(
+                    text_arg(&args, "chat")?.into(),
+                    text_arg(&args, "sender")?.into(),
+                    text_arg(&args, "id")?.into(),
+                    std::time::Duration::from_secs(wait),
+                    args["retranscribe"].as_bool().unwrap_or(false),
+                )
+                .await?}))
+        }
         "prepare_media" => {
             service.prepare_media(
                 text_arg(&args, "chat")?.into(),
@@ -238,6 +269,13 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
             args.get("message_id").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(crate::outbox::new_id),
             args.get("timestamp").and_then(Value::as_i64),
         ).await?})),
+        "edit_message" => Ok(json!({"message":service
+            .edit_message(
+                text_arg(&args, "chat")?.into(),
+                text_arg(&args, "id")?.into(),
+                text_arg(&args, "text")?.into(),
+            )
+            .await?})),
         "press_message_button" => Ok(json!({"message":service
             .press_button(
                 text_arg(&args, "chat")?.into(),
@@ -268,7 +306,7 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
             Ok(json!({"message":service.send_voice(serde_json::from_value(args)?).await?}))
         }
         "send_attachment" => Ok(
-            json!({"message":service.send_attachment(text_arg(&args,"chat")?.into(),text_arg(&args,"path")?.into(),text_arg(&args,"kind")?.into(),args.get("caption").and_then(Value::as_str).unwrap_or("").into()).await?}),
+            json!({"message":service.send_attachment(text_arg(&args,"chat")?.into(),text_arg(&args,"path")?.into(),text_arg(&args,"kind")?.into(),args.get("caption").and_then(Value::as_str).unwrap_or("").into(),args.get("view_once").and_then(Value::as_bool).unwrap_or(false)).await?}),
         ),
         "save_attachment" => {
             service
@@ -369,7 +407,7 @@ pub(crate) fn tools() -> Value {
         ),
         (
             "list_statuses",
-            "List unexpired status updates and their viewed state, excluding locked contacts.",
+            "List the newest 500 kept status updates (oldest first, including expired ones, with deleted_at when the sender deleted them) and their viewed state, excluding locked contacts.",
             json!({}),
             vec![],
             true,
@@ -459,6 +497,13 @@ pub(crate) fn tools() -> Value {
             true,
         ),
         (
+            "transcribe_audio",
+            "Transcribe a voice message on this computer with the speech model selected in Settings (Whisper or Parakeet, automatic language detection). Voice messages already transcribed also carry a transcript in read_messages. Waits up to wait_seconds (default 120) and returns status done, failed, queued or running, plus the model that produced the text. Pass retranscribe to replace a finished transcript with a fresh one from the model selected in Settings.",
+            json!({"chat":{"type":"string"},"sender":{"type":"string"},"id":{"type":"string"},"wait_seconds":{"type":"integer","minimum":0,"maximum":600},"retranscribe":{"type":"boolean","description":"Transcribe again even if a transcript exists"}}),
+            vec!["chat", "sender", "id"],
+            true,
+        ),
+        (
             "read_messages",
             "Read persisted messages chronologically. Pass the oldest message timestamp, id and sender as cursor to page without skipping same-second messages.",
             json!({"chat":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":500},"before":{"type":"integer","description":"Exclusive Unix timestamp; prefer cursor"},"cursor":{"type":"object","properties":{"timestamp":{"type":"integer"},"id":{"type":"string"},"sender":{"type":"string"}},"required":["timestamp","id","sender"]}}),
@@ -470,6 +515,13 @@ pub(crate) fn tools() -> Value {
             "Send a WhatsApp text message to the exact chat JID. Reuse message_id to retry a failed send without changing its identity.",
             json!({"chat":{"type":"string"},"text":{"type":"string","minLength":1},"message_id":{"type":"string","maxLength":80},"reply_to":{"type":"object","properties":{"timestamp":{"type":"integer"},"id":{"type":"string"},"sender":{"type":"string"}},"required":["timestamp","id","sender"]}}),
             vec!["chat", "text"],
+            false,
+        ),
+        (
+            "edit_message",
+            "Edit the text of a message you sent, or the caption of your photo, video or document, within 15 minutes of sending it. Voice messages, stickers and other media cannot be edited. Returns the message with its new text and edited set.",
+            json!({"chat":{"type":"string"},"id":{"type":"string","description":"The id of your own message, from read_messages or send_message"},"text":{"type":"string","minLength":1}}),
+            vec!["chat", "id", "text"],
             false,
         ),
         (
@@ -495,15 +547,15 @@ pub(crate) fn tools() -> Value {
         ),
         (
             "send_voice",
-            "Send a local Ogg Opus recording as a WhatsApp voice message.",
-            json!({"chat":{"type":"string"},"path":{"type":"string"},"duration_seconds":{"type":"integer","minimum":1,"maximum":600},"waveform":{"type":"array","maxItems":64,"items":{"type":"integer","minimum":0,"maximum":255}},"reply_to":{"type":"object","properties":{"timestamp":{"type":"integer"},"id":{"type":"string"},"sender":{"type":"string"}},"required":["timestamp","id","sender"]}}),
+            "Send a local Ogg Opus recording as a WhatsApp voice message. With view_once, the recipient can play it only once and Brazap keeps no copy of the audio.",
+            json!({"chat":{"type":"string"},"path":{"type":"string"},"duration_seconds":{"type":"integer","minimum":1,"maximum":600},"waveform":{"type":"array","maxItems":64,"items":{"type":"integer","minimum":0,"maximum":255}},"reply_to":{"type":"object","properties":{"timestamp":{"type":"integer"},"id":{"type":"string"},"sender":{"type":"string"}},"required":["timestamp","id","sender"]},"view_once":{"type":"boolean","description":"Send as a view-once voice message"}}),
             vec!["chat", "path", "duration_seconds"],
             false,
         ),
         (
             "send_attachment",
-            "Upload and send a local file as an image, video, audio file, WebP sticker, or document. Captions are supported for images, videos, and documents.",
-            json!({"chat":{"type":"string"},"path":{"type":"string"},"kind":{"type":"string","enum":["image","video","audio","sticker","file"]},"caption":{"type":"string"}}),
+            "Upload and send a local file as an image, video, audio file, WebP sticker, or document. Captions are supported for images, videos, and documents. Images and videos can be sent view once: the recipient can open them only once, and Brazap keeps no copy and shows only a placeholder.",
+            json!({"chat":{"type":"string"},"path":{"type":"string"},"kind":{"type":"string","enum":["image","video","audio","sticker","file"]},"caption":{"type":"string"},"view_once":{"type":"boolean","description":"Send an image or video as view once; rejected for other kinds"}}),
             vec!["chat", "path", "kind"],
             false,
         ),
@@ -523,7 +575,7 @@ pub(crate) fn tools() -> Value {
         ),
         (
             "save_attachment",
-            "Save a message attachment from SQLite or WhatsApp to a local path.",
+            "Save a message attachment from SQLite or WhatsApp to a local path. View-once media cannot be saved; it opens only on the phone.",
             json!({"chat":{"type":"string"},"sender":{"type":"string"},"id":{"type":"string"},"path":{"type":"string"}}),
             vec!["chat", "sender", "id", "path"],
             false,

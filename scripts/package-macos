@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Package a macOS release binary as Brazap.app.
+#
+#   scripts/package-macos <brazap-binary> <aarch64|x86_64> <output-dir>
+#
+# Produces, in <output-dir>:
+#   brazap-macos-<arch>.dmg      Drag-to-Applications disk image for new installs.
+#   brazap-macos-<arch>.app.zip  The same bundle as a ditto archive for the in-app updater.
+#
+# Signing is ad hoc unless APPLE_CERTIFICATE_P12_BASE64, APPLE_CERTIFICATE_PASSWORD and
+# APPLE_SIGNING_IDENTITY ("Developer ID Application: Name (TEAMID)") are set; then the app
+# is signed with the hardened runtime. Also setting APPLE_ID, APPLE_TEAM_ID and
+# APPLE_APP_PASSWORD (an app-specific password) notarizes and staples the app and DMG.
+set -euo pipefail
+
+if [[ $# -ne 3 || ! "$2" =~ ^(aarch64|x86_64)$ ]]; then
+    echo "Usage: $0 <brazap-binary> <aarch64|x86_64> <output-dir>" >&2
+    exit 2
+fi
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+binary="$1"
+arch="$2"
+mkdir -p "$3"
+out="$(cd "$3" && pwd)"
+version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$root/Cargo.toml" | head -1)"
+
+work="$(mktemp -d)"
+keychain=""
+original_keychains=()
+cleanup() {
+    if [[ -n "$keychain" ]]; then
+        # Written for macOS's bash 3.2, where an empty array trips `set -u`.
+        if ((${#original_keychains[@]})); then
+            security list-keychains -d user -s "${original_keychains[@]}" || true
+        fi
+        security delete-keychain "$keychain" || true
+    fi
+    rm -rf "$work"
+}
+trap cleanup EXIT
+
+app="$work/Brazap.app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+install -m 755 "$binary" "$app/Contents/MacOS/brazap"
+sed "s/__VERSION__/$version/g" "$root/assets/macos/Info.plist" >"$app/Contents/Info.plist"
+plutil -lint "$app/Contents/Info.plist"
+printf 'APPL????' >"$app/Contents/PkgInfo"
+python3 "$root/packaging/icons.py" macos "$work" >/dev/null
+iconutil --convert icns --output "$app/Contents/Resources/Brazap.icns" "$work/Brazap.iconset"
+cp "$root/LICENSE" "$root/THIRD_PARTY_NOTICES.md" "$app/Contents/Resources/"
+
+identity="-"
+if [[ -n "${APPLE_CERTIFICATE_P12_BASE64:-}" && -n "${APPLE_CERTIFICATE_PASSWORD:-}" && -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+    # A temporary keychain keeps the certificate off the login keychain and unlocked
+    # only for this run.
+    keychain="$work/signing.keychain-db"
+    keychain_password="$(uuidgen)"
+    while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        original_keychains+=("${line//\"/}")
+    done < <(security list-keychains -d user)
+    security create-keychain -p "$keychain_password" "$keychain"
+    security set-keychain-settings -lut 21600 "$keychain"
+    security unlock-keychain -p "$keychain_password" "$keychain"
+    printf '%s' "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode >"$work/certificate.p12"
+    security import "$work/certificate.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign >/dev/null
+    rm -f "$work/certificate.p12"
+    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
+    security list-keychains -d user -s "$keychain" "${original_keychains[@]}"
+    identity="$APPLE_SIGNING_IDENTITY"
+    codesign --force --timestamp --options runtime \
+        --entitlements "$root/packaging/macos/brazap.entitlements" \
+        --keychain "$keychain" --sign "$identity" "$app"
+else
+    echo "Developer ID signing is not configured; signing ad hoc." >&2
+    codesign --force --deep --sign - "$app"
+fi
+codesign --verify --deep --strict --verbose=2 "$app"
+
+notarize=false
+if [[ "$identity" != "-" && -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]]; then
+    notarize=true
+elif [[ "$identity" != "-" ]]; then
+    echo "Notarization is not configured; Gatekeeper will still warn on first launch." >&2
+fi
+submit() {
+    local status id
+    xcrun notarytool submit "$1" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+        --password "$APPLE_APP_PASSWORD" --wait --timeout 1h --output-format json >"$work/notary.json" || true
+    status="$(plutil -extract status raw "$work/notary.json" 2>/dev/null || echo unknown)"
+    if [[ "$status" != "Accepted" ]]; then
+        cat "$work/notary.json" >&2 || true
+        id="$(plutil -extract id raw "$work/notary.json" 2>/dev/null || true)"
+        echo "Notarization of $(basename "$1") finished with status: $status" >&2
+        [[ -z "$id" ]] || xcrun notarytool log "$id" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" >&2 || true
+        exit 1
+    fi
+}
+if $notarize; then
+    ditto -c -k --keepParent "$app" "$work/notarize.zip"
+    submit "$work/notarize.zip"
+    xcrun stapler staple "$app"
+fi
+
+# The updater extracts this with `ditto -x -k`, which preserves permissions, symlinks
+# and the signature.
+ditto -c -k --sequesterRsrc --keepParent "$app" "$out/brazap-macos-$arch.app.zip"
+
+stage="$work/dmg"
+mkdir -p "$stage"
+ditto "$app" "$stage/Brazap.app"
+ln -s /Applications "$stage/Applications"
+dmg="$out/brazap-macos-$arch.dmg"
+rm -f "$dmg"
+# hdiutil occasionally fails with "Resource busy" on CI runners; retry briefly.
+for attempt in 1 2 3 4 5; do
+    if hdiutil create -volname Brazap -srcfolder "$stage" -fs HFS+ -format UDZO -ov "$dmg"; then
+        break
+    fi
+    [[ $attempt -lt 5 ]] || exit 1
+    sleep $((attempt * 5))
+done
+if [[ "$identity" != "-" ]]; then
+    codesign --force --timestamp --keychain "$keychain" --sign "$identity" "$dmg"
+fi
+if $notarize; then
+    submit "$dmg"
+    xcrun stapler staple "$dmg"
+fi
+hdiutil verify "$dmg"
+echo "$dmg"
+echo "$out/brazap-macos-$arch.app.zip"

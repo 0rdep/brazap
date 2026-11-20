@@ -1,5 +1,5 @@
-# Local upstream source checkouts used by project skills.
-/.references/
+# Local upstream source checkouts used by project skills (a directory or symlink).
+/.references
 /target/
 /dist/
 /.build-deps/
@@ -14,3 +14,4 @@
 /.brazap-demo
 /cache/
 /logs/
+__pycache__/

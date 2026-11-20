@@ -1,6 +1,9 @@
 use crate::model::{Message, MessageAction};
 use std::borrow::Cow;
-use whatsapp_rust::prelude::{MessageExt, wa};
+use whatsapp_rust::{
+    prelude::{MessageExt, wa},
+    waproto::buffa::MessageField,
+};
 
 fn call(view: &mut Message, video: Option<bool>, outcome: Option<&str>, duration: Option<u32>) {
     let (kind, label) = match video {
@@ -339,6 +342,9 @@ pub fn project(view: &mut Message, message: &wa::Message) {
         view.kind = "protocol".into();
         return;
     }
+    if crate::edits::project(view, base) {
+        return;
+    }
     if let Some(t) = base.template_message.as_option() {
         template(view, t);
     } else if let Some(hsm) = base.highly_structured_message.as_option() {
@@ -441,6 +447,9 @@ pub fn project(view: &mut Message, message: &wa::Message) {
         view.kind = "placeholder".into();
         view.text = "Message unavailable on this linked device".into();
     }
+    if project_view_once(view, message) {
+        return;
+    }
     let media = media_message(message);
     if let Some(m) = media.image_message.as_option() {
         view.kind = "image".into();
@@ -471,6 +480,149 @@ pub fn project(view: &mut Message, message: &wa::Message) {
         view.kind = "unsupported".into();
         view.text = "This message type is not supported yet.".into();
     }
+}
+
+/// The error for any attempt to open, save or forward view-once media.
+pub(crate) const VIEW_ONCE_LOCKED: &str = "View once media can only be opened on your phone";
+
+/// View-once photos, videos and voice messages. The caption is part of the hidden
+/// content, so only the media type is shown. An empty wrapper is the placeholder
+/// stored for WhatsApp's view-once `<unavailable>` fanout to linked devices.
+/// Only `encoded` keeps the media keys; nothing projects or downloads them.
+fn project_view_once(view: &mut Message, message: &wa::Message) -> bool {
+    if !message.is_view_once() {
+        return false;
+    }
+    let base = message.get_base_message();
+    let (kind, mime, seconds) = if let Some(m) = base.image_message.as_option() {
+        ("image", m.mimetype.clone(), None)
+    } else if let Some(m) = base.video_message.as_option() {
+        ("video", m.mimetype.clone(), m.seconds)
+    } else if let Some(m) = base.ptv_message.as_option() {
+        ("video", m.mimetype.clone(), m.seconds)
+    } else if let Some(m) = base.audio_message.as_option() {
+        ("audio", m.mimetype.clone(), m.seconds)
+    } else {
+        // An empty wrapper, or content this build cannot tell apart.
+        ("", None, None)
+    };
+    view.kind = "view_once".into();
+    view.view_once = kind.into();
+    view.mime = mime;
+    view.duration_seconds = seconds;
+    view.text.clear();
+    view.title.clear();
+    view.footer.clear();
+    view.mentions.clear();
+    view.link_preview = None;
+    view.background_argb = None;
+    true
+}
+
+/// Wrap a photo, video or voice message the way WhatsApp's apps send view-once
+/// media: the inline `view_once` flag inside `viewOnceMessageV2`, or
+/// `viewOnceMessageV2Extension` for voice messages.
+pub(crate) fn into_view_once(mut message: wa::Message) -> anyhow::Result<wa::Message> {
+    let voice = if let Some(m) = message.image_message.as_option_mut() {
+        m.view_once = Some(true);
+        false
+    } else if let Some(m) = message.video_message.as_option_mut() {
+        m.view_once = Some(true);
+        false
+    } else if let Some(m) = message
+        .audio_message
+        .as_option_mut()
+        .filter(|m| m.ptt == Some(true))
+    {
+        m.view_once = Some(true);
+        true
+    } else {
+        anyhow::bail!("{VIEW_ONCE_KINDS}");
+    };
+    let mut wrapper = wa::message::FutureProofMessage::default();
+    wrapper.message = MessageField::some(message);
+    let mut wrapped = wa::Message::default();
+    if voice {
+        wrapped.view_once_message_v2_extension = MessageField::some(wrapper);
+    } else {
+        wrapped.view_once_message_v2 = MessageField::some(wrapper);
+    }
+    Ok(wrapped)
+}
+
+pub(crate) const VIEW_ONCE_KINDS: &str =
+    "Only photos, videos and voice messages can be sent as view once";
+
+/// The stand-in kept for a view-once message WhatsApp did not deliver to this
+/// linked device: an empty view-once wrapper, which projects as its placeholder.
+pub(crate) fn view_once_placeholder() -> wa::Message {
+    let mut wrapper = wa::message::FutureProofMessage::default();
+    wrapper.message = MessageField::some(wa::Message::default());
+    let mut message = wa::Message::default();
+    message.view_once_message_v2 = MessageField::some(wrapper);
+    message
+}
+
+/// A copy of a message to quote in a reply. A quoted view-once message keeps its
+/// type but not the keys and preview that would let the recipient open it again.
+pub(crate) fn quotable(message: &wa::Message) -> Cow<'_, wa::Message> {
+    if !message.is_view_once() {
+        return Cow::Borrowed(message);
+    }
+    fn strip(message: &mut wa::Message) {
+        macro_rules! clear {
+            ($field:ident) => {
+                if let Some(m) = message.$field.as_option_mut() {
+                    m.url = None;
+                    m.direct_path = None;
+                    m.media_key = None;
+                    m.file_enc_sha256 = None;
+                    m.jpeg_thumbnail = None;
+                }
+            };
+        }
+        clear!(image_message);
+        clear!(video_message);
+        clear!(ptv_message);
+        if let Some(m) = message.audio_message.as_option_mut() {
+            m.url = None;
+            m.direct_path = None;
+            m.media_key = None;
+            m.file_enc_sha256 = None;
+        }
+        for inner in [
+            message
+                .device_sent_message
+                .as_option_mut()
+                .map(|m| &mut m.message),
+            message
+                .ephemeral_message
+                .as_option_mut()
+                .map(|m| &mut m.message),
+            message
+                .view_once_message
+                .as_option_mut()
+                .map(|m| &mut m.message),
+            message
+                .view_once_message_v2
+                .as_option_mut()
+                .map(|m| &mut m.message),
+            message
+                .view_once_message_v2_extension
+                .as_option_mut()
+                .map(|m| &mut m.message),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(inner) = inner.as_option_mut() {
+                strip(inner);
+            }
+        }
+    }
+    let mut copy = message.clone();
+    strip(&mut copy);
+    Cow::Owned(copy)
 }
 
 /// Expose media from business-message headers through the same download/cache path.

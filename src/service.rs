@@ -52,6 +52,7 @@ pub struct Service {
     media_jobs: std::sync::Mutex<std::collections::HashSet<String>>,
     /// The region of the account's own number, once known.
     pub(crate) region: std::sync::Mutex<Option<String>>,
+    pub(crate) transcriber: Arc<crate::transcription::Transcriber>,
 }
 
 impl Service {
@@ -133,6 +134,7 @@ impl Service {
             desktop: Mutex::new(crate::notifications::Desktop::default()),
             media_jobs: std::sync::Mutex::new(std::collections::HashSet::new()),
             region: std::sync::Mutex::new(None),
+            transcriber: Default::default(),
         }))
     }
 
@@ -144,10 +146,23 @@ impl Service {
         self.revision.load(Ordering::Relaxed)
     }
 
+    /// For progress reported from blocking work that cannot hold the service.
+    pub(crate) fn revision_handle(&self) -> Arc<AtomicU64> {
+        self.revision.clone()
+    }
+
+    pub(crate) fn media_job_running(&self, key: &str) -> bool {
+        self.media_jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(key)
+    }
+
     pub async fn run(self: Arc<Self>) {
         if !self.config.demo || std::env::var("BRAZAP_DEMO_UPDATE").as_deref() == Ok("check") {
             self.spawn_update_checker();
         }
+        self.spawn_transcriber();
         if self.config.demo {
             while !self.stopping.load(Ordering::Relaxed) {
                 self.restart.notified().await;
@@ -211,8 +226,16 @@ impl Service {
                 .with_platform_type(wa::device_props::PlatformType::UWP)
                 .with_require_full_sync(true)
                 .with_history_sync_config(sync);
+            // Secret-encrypted edits need the original's messageSecret; the
+            // archive keeps it with each message for when the library's own
+            // secret store does not have it.
+            let mut cache = whatsapp_rust::CacheConfig::default();
+            cache.original_message_resolver = Some(Arc::new(crate::edits::SecretResolver {
+                archive: self.archive.clone(),
+            }));
             let built = Bot::builder()
                 .with_device_props(props)
+                .with_cache_config(cache)
                 // Presence follows the window's focus (see `sync_presence`), not the connection.
                 .with_presence_policy(whatsapp_rust::PresencePolicy::Manual)
                 .with_backend_arc(self.archive.backend.clone())
@@ -681,8 +704,50 @@ impl Service {
                             log::warn!("Could not prepare an incoming notification: {error:#}");
                         }
                     }
+                    let fresh =
+                        !inbound.info.is_offline && inbound.info.unavailable_request_id.is_none();
                     if row.view.attachment() {
-                        self.queue_media(row.view, inbound.message.as_ref().clone());
+                        self.queue_media(row.view.clone(), inbound.message.as_ref().clone());
+                    }
+                    if fresh {
+                        self.queue_fresh_voice(&row.view);
+                    }
+                }
+            }
+            // WhatsApp never delivers view-once content to linked devices, only
+            // this notice; keep a placeholder so the conversation shows it.
+            Event::UndecryptableMessage(event)
+                if event.unavailable_type
+                    == whatsapp_rust::wacore::types::events::UnavailableType::ViewOnce
+                    && event.info.source.chat.to_string() != crate::stories::CHAT =>
+            {
+                let info = &event.info;
+                let name = if !info.source.is_group && !info.source.is_from_me {
+                    info.push_name.to_string()
+                } else {
+                    String::new()
+                };
+                let row = project_message(
+                    info.source.chat.to_string(),
+                    info.source.sender.to_string(),
+                    info.id.to_string(),
+                    info.source.is_from_me,
+                    info.timestamp.timestamp(),
+                    &crate::content::view_once_placeholder(),
+                    name,
+                    serde_json::to_string(&**info).unwrap_or_default(),
+                );
+                let view = row.view.clone();
+                self.archive.store_messages(vec![row], true).await?;
+                if !info.source.is_from_me && self.desktop_viewing(&view.chat).await {
+                    if let Err(error) = self.mark_chat_read(view.chat.clone()).await {
+                        log::warn!("Could not mark the visible conversation read: {error}");
+                    }
+                }
+                #[cfg(all(target_os = "windows", feature = "desktop"))]
+                if !info.is_offline && !info.source.is_from_me {
+                    if let Err(error) = self.notify_incoming(&view).await {
+                        log::warn!("Could not prepare an incoming notification: {error:#}");
                     }
                 }
             }
@@ -879,7 +944,7 @@ impl Service {
                         .map(|t| if t > 100_000_000_000 { t / 1000 } else { t })
                         .unwrap_or(i64::MAX),
                 );
-                self.archive.backend.shared().run(move |conn| {
+                self.archive.sql().run(move |conn| {
                     diesel::sql_query("UPDATE brazap_stickers SET recent_at=0 WHERE account=? AND hash=? AND recent_at<=?")
                         .bind::<BigInt,_>(account).bind::<Text,_>(hash).bind::<BigInt,_>(before).execute(conn).map_err(crate::storage::db_error)?;
                     Ok(())
@@ -892,8 +957,7 @@ impl Service {
                 };
                 let (account, jid) = (self.archive.account as i64, event.jid.to_string());
                 self.archive
-                    .backend
-                    .shared()
+                    .sql()
                     .run(move |conn| {
                         diesel::sql_query(
                             "DELETE FROM brazap_saved_contacts WHERE account=? AND jid=?",
@@ -968,9 +1032,11 @@ impl Service {
                     .flatten()
                     .map(|jid| jid.to_non_ad().to_string())
                     .collect();
+                let mut record = (*call.record).clone();
+                record.call_id.get_or_insert_with(|| call.call_id.clone());
                 self.archive
                     .store_call(
-                        &call.record,
+                        &record,
                         Some(call.from_me),
                         Some(call.call_creator_jid.to_string()),
                         &own,
@@ -1085,6 +1151,7 @@ impl Service {
             settings: self.settings.read().await.clone(),
             region: self.account_region().await,
             favorite_stickers: self.favorite_sticker_hashes().await.unwrap_or_default(),
+            transcription: self.transcription_engine().await,
         })
     }
 
@@ -1191,7 +1258,7 @@ impl Service {
                     &self.author(&target.sender).await?,
                     &jid,
                     &jid,
-                    &original,
+                    &crate::content::quotable(&original),
                 ),
             )
         } else {
@@ -1208,7 +1275,11 @@ impl Service {
             }
             let mut message = wa::Message::default();
             message.audio_message = MessageField::some(audio);
-            return self.demo_send(upload.chat, message, Some(bytes)).await;
+            if upload.view_once {
+                message = crate::content::into_view_once(message)?;
+            }
+            let media = (!upload.view_once).then_some(bytes);
+            return self.demo_send(upload.chat, message, media).await;
         }
         let client = self.connected().await?;
         let uploaded = client
@@ -1225,8 +1296,13 @@ impl Service {
         if let Some(context) = context {
             options = options.with_context_info(Box::new(context));
         }
-        let message = whatsapp_rust::media::audio_message(uploaded, options);
-        self.send_prepared(client, jid, message, Some(bytes)).await
+        let mut message = whatsapp_rust::media::audio_message(uploaded, options);
+        // A view-once voice message is not kept: only the phone can play it.
+        if upload.view_once {
+            message = crate::content::into_view_once(message)?;
+        }
+        let media = (!upload.view_once).then_some(bytes);
+        self.send_prepared(client, jid, message, media).await
     }
 
     pub async fn send_attachment(
@@ -1235,6 +1311,7 @@ impl Service {
         path: String,
         kind: String,
         caption: String,
+        view_once: bool,
     ) -> Result<Message> {
         self.archive.allow_chat(&chat).await?;
         ensure!(caption.len() <= 65_536, "Message is too long");
@@ -1242,8 +1319,16 @@ impl Service {
             kind != "audio" || caption.trim().is_empty(),
             "Audio files do not support captions."
         );
+        // Voice messages go through send_voice; audio files, stickers and
+        // documents cannot be view once.
+        ensure!(
+            !view_once || matches!(kind.as_str(), "image" | "video"),
+            crate::content::VIEW_ONCE_KINDS
+        );
         if self.config.demo {
-            return self.demo_attachment(chat, path, kind, caption).await;
+            return self
+                .demo_attachment(chat, path, kind, caption, view_once)
+                .await;
         }
         let client = self.connected().await?;
         let path = Path::new(&path);
@@ -1318,7 +1403,13 @@ impl Service {
                     .with_caption(caption),
             ),
         };
-        self.send_prepared(client, chat.parse()?, message, Some(bytes))
+        // Like WhatsApp, keep no copy of view-once media after sending it.
+        let (message, media) = if view_once {
+            (crate::content::into_view_once(message)?, None)
+        } else {
+            (message, Some(bytes))
+        };
+        self.send_prepared(client, chat.parse()?, message, media)
             .await
     }
 
@@ -1417,6 +1508,12 @@ impl Service {
 
     pub async fn download_media(&self, message: &Message, proto: wa::Message) -> Result<Vec<u8>> {
         self.archive.allow_chat(&message.chat).await?;
+        // Every UI and MCP path to message media (open, save, previews,
+        // stickers, transcripts) ends here or in the asset loader.
+        ensure!(
+            message.kind != "view_once" && !proto.is_view_once(),
+            crate::content::VIEW_ONCE_LOCKED
+        );
         if let Some(bytes) = self
             .archive
             .media(

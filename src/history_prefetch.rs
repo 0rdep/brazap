@@ -96,10 +96,10 @@ impl Request {
 }
 
 impl Archive {
-    async fn history_boundary(&self, chat: String) -> Result<Option<MessageCursor>> {
+    pub(crate) async fn history_boundary(&self, chat: String) -> Result<Option<MessageCursor>> {
         let account = self.account as i64;
         let chat = self.identities().await?.aliases_json(&chat);
-        let row:Option<Boundary>=self.backend.shared().read(move|conn| {
+        let row:Option<Boundary>=self.sql().read(move|conn| {
             diesel::sql_query("SELECT timestamp,id,sender FROM brazap_messages WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND timestamp>0 AND id!='' AND json_extract(payload,'$.kind')!='protocol' ORDER BY timestamp,id,sender LIMIT 1")
                 .bind::<BigInt,_>(account).bind::<Text,_>(chat).get_result(conn).optional().map_err(db_error)
         }).await?;
@@ -121,7 +121,7 @@ impl Archive {
     async fn history_request(&self, chat: String) -> Result<Option<Request>> {
         let account = self.account as i64;
         let aliases = serde_json::to_string(&self.chat_aliases(&chat).await?)?;
-        Ok(self.backend.shared().read(move|conn| {
+        Ok(self.sql().read(move|conn| {
             diesel::sql_query("SELECT request_id,anchor_id,anchor_sender,anchor_timestamp,requested_at,complete,next_auto_at FROM brazap_history_requests WHERE account=? AND chat IN (SELECT value FROM json_each(?)) ORDER BY requested_at DESC LIMIT 1")
                 .bind::<BigInt,_>(account).bind::<Text,_>(aliases).get_result(conn).optional().map_err(db_error)
         }).await?)
@@ -133,7 +133,7 @@ impl Archive {
         id: String,
     ) -> Result<()> {
         let account = self.account as i64;
-        self.backend.shared().run(move|conn| {
+        self.sql().run(move|conn| {
             conn.transaction::<_,diesel::result::Error,_>(|conn| {
             diesel::sql_query("INSERT INTO brazap_history_requests(account,chat,request_id,anchor_id,anchor_sender,anchor_timestamp,requested_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(account,chat) DO UPDATE SET request_id=excluded.request_id,anchor_id=excluded.anchor_id,anchor_sender=excluded.anchor_sender,anchor_timestamp=excluded.anchor_timestamp,requested_at=excluded.requested_at,response_at=0,complete=0,next_auto_at=0")
                 .bind::<BigInt,_>(account).bind::<Text,_>(&chat).bind::<Text,_>(id).bind::<Text,_>(cursor.id).bind::<Text,_>(cursor.sender).bind::<BigInt,_>(cursor.timestamp).bind::<BigInt,_>(now()).execute(conn)?;
@@ -153,7 +153,7 @@ impl Archive {
         let chats = identities.aliases_json(chat);
         let senders = identities.aliases_json(&cursor.sender);
         let (account, id, timestamp) = (self.account as i64, cursor.id.clone(), cursor.timestamp);
-        Ok(self.backend.shared().read(move|conn| {
+        Ok(self.sql().read(move|conn| {
             diesel::sql_query("SELECT request_id,anchor_id,anchor_sender,anchor_timestamp,requested_at,complete,next_auto_at FROM brazap_history_boundaries WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND anchor_id=? AND anchor_sender IN (SELECT value FROM json_each(?)) AND anchor_timestamp=? ORDER BY complete DESC,requested_at DESC LIMIT 1")
                 .bind::<BigInt,_>(account).bind::<Text,_>(chats).bind::<Text,_>(id).bind::<Text,_>(senders).bind::<BigInt,_>(timestamp).get_result(conn).optional().map_err(db_error)
         }).await?)
@@ -167,7 +167,7 @@ impl Archive {
             return Ok(());
         };
         let account = self.account as i64;
-        self.backend.shared().run(move|conn| {
+        self.sql().run(move|conn| {
             conn.transaction::<_,diesel::result::Error,_>(|conn| {
             // A response without chunk progress is a single completed payload.
             // Keep completion monotonic if duplicate/out-of-order chunks arrive.
@@ -188,7 +188,7 @@ impl Archive {
         failed: bool,
     ) -> Result<()> {
         let account = self.account as i64;
-        self.backend.shared().run(move|conn| {
+        self.sql().run(move|conn| {
             conn.transaction::<_,diesel::result::Error,_>(|conn| {
             diesel::sql_query("UPDATE brazap_history_requests SET next_auto_at=?,requested_at=CASE WHEN ? THEN 0 ELSE requested_at END WHERE account=? AND chat=? AND anchor_id=? AND anchor_sender=? AND anchor_timestamp=?")
                 .bind::<BigInt,_>(now()+seconds).bind::<BigInt,_>(i64::from(failed)).bind::<BigInt,_>(account).bind::<Text,_>(&chat).bind::<Text,_>(&cursor.id).bind::<Text,_>(&cursor.sender).bind::<BigInt,_>(cursor.timestamp).execute(conn)?;

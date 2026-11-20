@@ -265,6 +265,20 @@ pub fn configure_floating_window(window: &rune::WindowHandle) {
     });
 }
 
+/// Whether the window is minimized to the taskbar.
+pub fn is_minimized(window: &rune::WindowHandle) -> bool {
+    window
+        .with_raw_handle(|handle| {
+            if let rune::raw_window_handle::RawWindowHandle::Win32(handle) = handle.as_raw() {
+                let hwnd = HWND(handle.hwnd.get() as *mut _);
+                unsafe { windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool() }
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false)
+}
+
 pub fn allow_activation(pid: u32) {
     // A protocol launch may transfer its foreground permission to the existing UI.
     if pid != 0 {

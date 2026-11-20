@@ -113,10 +113,9 @@ impl Archive {
             .unwrap_or(0);
         loop {
             let rows: Vec<Row> = self
-                .backend
-                .shared()
+                .sql()
                 .read(move |conn| {
-                    diesel::sql_query("SELECT rowid AS cursor,encoded,metadata FROM brazap_messages WHERE account=? AND rowid>? ORDER BY rowid LIMIT ?")
+                    diesel::sql_query("SELECT rowid AS cursor,encoded,metadata FROM brazap_messages WHERE +account=? AND rowid>? ORDER BY rowid LIMIT ?")
                         .bind::<BigInt, _>(account)
                         .bind::<BigInt, _>(cursor)
                         .bind::<BigInt, _>(BATCH)
@@ -150,8 +149,7 @@ impl Archive {
             })
             .await?;
             if !updates.is_empty() {
-                self.backend
-                    .shared()
+                self.sql()
                     .run(move |conn| {
                         conn.transaction::<_, diesel::result::Error, _>(|conn| {
                             for (rowid, before, after) in updates {

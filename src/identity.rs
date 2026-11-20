@@ -335,7 +335,7 @@ impl Identities {
 impl Archive {
     pub(crate) async fn identities(&self) -> Result<Identities> {
         let account = self.account as i64;
-        let (rows,sources,saved,locks,names)=self.backend.shared().read(move|conn| {
+        let (rows,sources,saved,locks,names)=self.sql().read(move|conn| {
             let rows=diesel::sql_query("SELECT lid,phone_number FROM (SELECT lid,phone_number,updated_at FROM lid_pn_mapping WHERE device_id=? UNION ALL SELECT lid,phone_number,updated_at FROM brazap_identity_links WHERE account=?) ORDER BY updated_at DESC,lid")
                 .bind::<BigInt,_>(account).bind::<BigInt,_>(account).load::<Mapping>(conn).map_err(db_error)?;
             let sources=diesel::sql_query("SELECT jid FROM brazap_chats WHERE account=?")
@@ -404,8 +404,7 @@ impl Archive {
         Ok(identities)
     }
     pub(crate) async fn preserve_identity_links(&self) -> Result<()> {
-        self.backend
-            .shared()
+        self.sql()
             .run(|conn| {
                 use diesel::connection::SimpleConnection;
                 conn.batch_execute(include_str!("../migrations/012_identity_links.sql"))
@@ -417,7 +416,7 @@ impl Archive {
 
     pub(crate) async fn alias_settings(&self) -> Result<Vec<ChatSettings>> {
         let account = self.account as i64;
-        Ok(self.backend.shared().read(move|conn| {
+        Ok(self.sql().read(move|conn| {
             diesel::sql_query("SELECT jid,pinned,archived,muted,mute_until_ms,pin_changed_at,archive_changed_at,mute_changed_at FROM brazap_chat_settings WHERE account=?")
                 .bind::<BigInt,_>(account).load(conn).map_err(db_error)
         }).await?)
@@ -444,7 +443,7 @@ impl Archive {
         let account = self.account as i64;
         let id = id.to_owned();
 
-        Ok(self.backend.shared().read(move|conn| {
+        Ok(self.sql().read(move|conn| {
             diesel::sql_query("SELECT chat,sender FROM brazap_messages WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND sender IN (SELECT value FROM json_each(?)) AND id=? ORDER BY CASE json_extract(payload,'$.kind') WHEN 'protocol' THEN -1 WHEN 'placeholder' THEN 0 WHEN 'unsupported' THEN 0 ELSE 1 END DESC,CASE status WHEN 'read' THEN 4 WHEN 'delivered' THEN 3 WHEN 'sent' THEN 2 ELSE 0 END DESC,rowid LIMIT 1")
                 .bind::<BigInt,_>(account).bind::<Text,_>(chats).bind::<Text,_>(senders).bind::<Text,_>(id).get_result(conn).map_err(db_error)
         }).await?)

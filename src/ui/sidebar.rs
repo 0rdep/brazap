@@ -71,7 +71,7 @@ pub(super) fn layout(s: &State, _cx: &mut Cx<State>, layer: &mut Vec<El>) -> El 
     } else if s.section == Section::Calls {
         calls(s)
     } else if s.section == Section::Status {
-        super::stories::empty()
+        super::stories::feed(s)
     } else {
         match &s.selected {
             Some(jid) => conversation(s, jid, layer),
@@ -556,7 +556,7 @@ fn chat_row(s: &State, chat: &Chat) -> El {
     }
     preview = preview.child(
         label(
-            if is_call {
+            if is_call || chat.preview_kind == "view_once" {
                 super::locale::tr(&chat.preview)
             } else {
                 chat.preview.clone()

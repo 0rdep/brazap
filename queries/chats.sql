@@ -1,7 +1,9 @@
 SELECT c.jid,'[]' AS aliases,
        COALESCE(CASE WHEN lower(trim(n.name)) NOT IN ('unknown contact','unknown','unnamed group','contato desconhecido','contacto desconocido') THEN NULLIF(n.name,'') END,CASE WHEN lower(trim(p.name)) NOT IN ('unknown contact','unknown','unnamed group','contato desconhecido','contacto desconocido') THEN NULLIF(p.name,'') END,CASE WHEN lower(trim(c.name)) NOT IN ('unknown contact','unknown','unnamed group','contato desconhecido','contacto desconocido') THEN NULLIF(c.name,'') END,'') AS name,
        COALESCE(l.phone_number,'') AS phone,
-       COALESCE(json_extract(m.payload,'$.preview'),NULLIF(json_extract(m.payload,'$.text'),''),json_extract(m.payload,'$.file_name'),c.preview) AS preview,
+       COALESCE(NULLIF((SELECT e.preview FROM brazap_edits e WHERE e.account=m.account AND e.chat=m.chat
+                        AND e.sender=m.sender AND e.id=m.id),''),
+                json_extract(m.payload,'$.preview'),NULLIF(json_extract(m.payload,'$.text'),''),json_extract(m.payload,'$.file_name'),c.preview) AS preview,
        COALESCE(m.timestamp,c.updated_at) AS updated_at,c.unread,
        COALESCE(a.updated_at,0) AS photo_version,
        COALESCE(json_extract(m.payload,'$.kind'),'') AS preview_kind,

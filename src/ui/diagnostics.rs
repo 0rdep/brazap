@@ -183,6 +183,11 @@ pub(super) fn modal(s: &State) -> Option<El> {
                 "Measured native SQLite allocations across this process.",
             ))
             .child(item(
+                "SQLite peak",
+                report["sqlite_peak_bytes"].as_i64(),
+                "Highest native SQLite allocation since Brazap started.",
+            ))
+            .child(item(
                 "WhatsApp caches",
                 report["whatsapp"]["estimated_retained_bytes"].as_i64(),
                 "SDK estimate; included in Rust heap, not additional memory.",

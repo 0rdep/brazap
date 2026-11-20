@@ -120,6 +120,8 @@ impl crate::service::Service {
             .map(|(private, rust)| (private - rust).max(0));
         // SQLite's native allocator is outside the Rust global allocator.
         let sqlite_bytes = unsafe { libsqlite3_sys::sqlite3_memory_used() };
+        // Highest since start: a past spike stays visible after it is freed.
+        let sqlite_peak_bytes = unsafe { libsqlite3_sys::sqlite3_memory_highwater(0) };
         let sdk = if let Ok(client) = self.connected().await {
             let report = client.memory_report().await;
             Some(
@@ -134,7 +136,7 @@ impl crate::service::Service {
         let ui = Value::Null;
         Ok(
             json!({"process":process,"gpu":gpu(),"rust_heap":heap,"outside_rust_bytes":outside_rust,
-            "background_history":self.history_prefetch.report(),"sqlite_bytes":sqlite_bytes,"gauges":procwatch::gauges(),"whatsapp":sdk,"ui":ui}),
+            "background_history":self.history_prefetch.report(),"sqlite_bytes":sqlite_bytes,"sqlite_peak_bytes":sqlite_peak_bytes,"gauges":procwatch::gauges(),"whatsapp":sdk,"ui":ui}),
         )
     }
 }

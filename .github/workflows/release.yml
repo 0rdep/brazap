@@ -11,6 +11,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - patches/**
+      - packaging/**
       - scripts/**
       - .github/workflows/release.yml
   workflow_dispatch:
@@ -44,10 +45,12 @@ jobs:
             target: aarch64-apple-darwin
             binary: brazap
             asset: brazap-macos-aarch64
+            arch: aarch64
           - os: macos-15
             target: x86_64-apple-darwin
             binary: brazap
             asset: brazap-macos-x86_64
+            arch: x86_64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -100,8 +103,34 @@ jobs:
         shell: bash
         run: |
           mkdir -p release
+          # Bare executables stay published: releases up to v0.1.21 update from them.
           cp 'target/${{ matrix.target }}/release/${{ matrix.binary }}' 'release/${{ matrix.asset }}'
           cp LICENSE THIRD_PARTY_NOTICES.md release/
+      - name: Install Inno Setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install innosetup --version 6.7.1 --yes --no-progress --allow-downgrade
+      - name: Package Windows installer
+        if: runner.os == 'Windows'
+        shell: bash
+        run: ./scripts/package-windows 'target/${{ matrix.target }}/release/${{ matrix.binary }}' release
+      - name: Package Linux .deb and AppImage
+        if: runner.os == 'Linux'
+        shell: bash
+        run: ./scripts/package-linux 'target/${{ matrix.target }}/release/${{ matrix.binary }}' release
+      - name: Package macOS app and disk image
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          # Signing and notarization are optional and run only when these secrets
+          # exist; otherwise the app is signed ad hoc. Notarize only release tags.
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ github.ref_type == 'tag' && secrets.APPLE_ID || '' }}
+          APPLE_TEAM_ID: ${{ github.ref_type == 'tag' && secrets.APPLE_TEAM_ID || '' }}
+          APPLE_APP_PASSWORD: ${{ github.ref_type == 'tag' && secrets.APPLE_APP_PASSWORD || '' }}
+        run: ./scripts/package-macos 'target/${{ matrix.target }}/release/${{ matrix.binary }}' '${{ matrix.arch }}' release
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: ${{ matrix.asset }}
@@ -126,6 +155,7 @@ jobs:
           merge-multiple: true
       - name: Generate checksums
         working-directory: release
+        # Covers every executable, installer, package and update archive.
         run: sha256sum brazap-* > checksums.sha256
       - name: Publish release
         env:

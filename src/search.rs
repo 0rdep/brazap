@@ -18,9 +18,14 @@ struct NamedIdentity {
 
 pub(crate) fn decode(row: MessageRow) -> Result<Message> {
     let mut message: Message = serde_json::from_str(&row.payload)?;
+    crate::edits::apply_row(&mut message, row.edit.as_deref());
     message.deleted_at = row.deleted_at;
     if row.deleted_at.is_some() && row.retain_deleted == 0 {
         message.text = "This message was deleted".into();
+        message.edited = false;
+        message.edited_at = None;
+        message.mentions.clear();
+        message.link_preview = None;
         message.kind = "text".into();
         message.title.clear();
         message.footer.clear();
@@ -31,6 +36,15 @@ pub(crate) fn decode(row: MessageRow) -> Result<Message> {
     message.status = row.status;
     message.has_media = row.has_media != 0;
     message.reactions = serde_json::from_str(&row.reactions)?;
+    message.transcript = row
+        .transcript
+        .as_deref()
+        .and_then(|value| serde_json::from_str(value).ok());
+    if message.kind == "view_once" {
+        // Bytes or a transcript kept before the message was known to be view once.
+        message.has_media = false;
+        message.transcript = None;
+    }
     if !message.from_me {
         message.sender_photo_version = row.sender_photo_version;
         (message.sender_name, message.sender_phone) =
@@ -60,7 +74,7 @@ impl Archive {
         }
         let account = self.account as i64;
         let names = if chat.is_none() {
-            self.backend.shared().read(move|conn| {
+            self.sql().read(move|conn| {
             diesel::sql_query("SELECT jid,name FROM brazap_chats WHERE account=? UNION ALL SELECT jid,name FROM brazap_contacts WHERE account=? UNION ALL SELECT jid,name FROM brazap_saved_contacts WHERE account=?")
                 .bind::<BigInt,_>(account).bind::<BigInt,_>(account).bind::<BigInt,_>(account).load::<NamedIdentity>(conn).map_err(db_error)
         }).await?
@@ -111,7 +125,7 @@ impl Archive {
         } else {
             "? != ''"
         };
-        let rows:Vec<MessageRow>=self.backend.shared().read(move |conn| {
+        let rows:Vec<MessageRow>=self.sql().read(move |conn| {
             diesel::sql_query(format!("WITH hits AS MATERIALIZED (SELECT candidate.rowid AS message_rowid FROM {from} WHERE {predicate} AND candidate.account=? AND candidate.chat IN (SELECT value FROM json_each(?)) AND instr(s.text,?)>0 AND (candidate.timestamp,candidate.id,candidate.sender)<(?,?,?) ORDER BY candidate.timestamp DESC,candidate.id DESC,candidate.sender DESC LIMIT 401) {MESSAGE_SELECT} WHERE m.rowid IN (SELECT message_rowid FROM hits) ORDER BY m.timestamp DESC,m.id DESC,m.sender DESC"))
                 .bind::<Text,_>(phrase).bind::<BigInt,_>(account).bind::<Text,_>(allowed).bind::<Text,_>(query)
                 .bind::<BigInt,_>(cursor.timestamp).bind::<Text,_>(cursor.id).bind::<Text,_>(cursor.sender)
@@ -154,12 +168,18 @@ impl Archive {
 }
 
 fn excerpt(message: &Message, query: &str) -> String {
+    let transcript = message
+        .transcript
+        .as_ref()
+        .filter(|t| t.status == "done")
+        .map_or("", |t| t.text.as_str());
     let text = format!(
-        "{} {} {} {}",
+        "{} {} {} {} {}",
         message.title,
         message.text,
         message.footer,
-        message.file_name.as_deref().unwrap_or("")
+        message.file_name.as_deref().unwrap_or(""),
+        transcript
     );
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let lower = text.to_lowercase();

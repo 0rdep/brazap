@@ -28,8 +28,12 @@ struct PragmaValue {
 impl Archive {
     pub async fn storage_usage(&self, config: &Config) -> Result<Value> {
         let account = self.account as i64;
-        let items=self.backend.shared().read(move|conn| {
-            diesel::sql_query("SELECT 'messages' kind, COUNT(*) count, COALESCE(SUM(length(encoded)+length(payload)+length(metadata)),0) bytes FROM brazap_messages WHERE account=? UNION ALL SELECT COALESCE(json_extract(m.payload,'$.kind'),'file') kind, COUNT(*) count, COALESCE(SUM(length(b.data)),0) bytes FROM brazap_media b LEFT JOIN brazap_messages m ON m.account=b.account AND m.chat=b.chat AND m.sender=b.sender AND m.id=b.id WHERE b.account=? GROUP BY kind UNION ALL SELECT 'cache' kind,COUNT(*) count,COALESCE(SUM(length(data)),0) bytes FROM brazap_assets WHERE account=? UNION ALL SELECT 'history' kind,COUNT(*) count,COALESCE(SUM(length(data)+length(metadata)),0) bytes FROM brazap_history WHERE account=?")
+        let items=self.sql().read(move|conn| {
+            // Sizes come from octet_length, which reads each value's header but
+            // not its bytes. GROUP BY must only see the materialized sizes: a
+            // grouped SUM(length(b.data)) copies every BLOB into SQLite's sorter
+            // (gigabytes of native memory with a large media archive).
+            diesel::sql_query("WITH media AS MATERIALIZED (SELECT COALESCE(json_extract(m.payload,'$.kind'),'file') AS kind, octet_length(b.data) AS bytes FROM brazap_media b LEFT JOIN brazap_messages m ON m.account=b.account AND m.chat=b.chat AND m.sender=b.sender AND m.id=b.id WHERE b.account=?) SELECT 'messages' kind, COUNT(*) count, COALESCE(SUM(octet_length(encoded)+octet_length(payload)+octet_length(metadata)),0) bytes FROM brazap_messages WHERE account=? UNION ALL SELECT kind, COUNT(*) count, COALESCE(SUM(bytes),0) bytes FROM media GROUP BY kind UNION ALL SELECT 'cache' kind,COUNT(*) count,COALESCE(SUM(octet_length(data)),0) bytes FROM brazap_assets WHERE account=? UNION ALL SELECT 'history' kind,COUNT(*) count,COALESCE(SUM(octet_length(data)+octet_length(metadata)),0) bytes FROM brazap_history WHERE account=?")
                 .bind::<BigInt,_>(account).bind::<BigInt,_>(account).bind::<BigInt,_>(account).bind::<BigInt,_>(account).load::<Usage>(conn).map_err(db_error)
         }).await?;
         let file_size = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
@@ -56,8 +60,7 @@ impl Archive {
     }
     async fn pragma(&self, name: &'static str) -> Result<i64> {
         Ok(self
-            .backend
-            .shared()
+            .sql()
             .read(move |conn| {
                 diesel::sql_query(format!("SELECT {name} AS value FROM pragma_{name}"))
                     .get_result::<PragmaValue>(conn)
@@ -96,8 +99,7 @@ impl Archive {
                 "Compacting the database to release {} MiB",
                 reclaimable / MIB
             );
-            self.backend
-                .shared()
+            self.sql()
                 .run(|conn| {
                     conn.batch_execute("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")
                         .map_err(db_error)
@@ -108,8 +110,7 @@ impl Archive {
                 if self.pragma("freelist_count").await? == 0 {
                     break;
                 }
-                self.backend
-                    .shared()
+                self.sql()
                     .run(|conn| {
                         conn.batch_execute("PRAGMA incremental_vacuum(8192)")
                             .map_err(db_error)
@@ -118,8 +119,7 @@ impl Archive {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         }
-        self.backend
-            .shared()
+        self.sql()
             .run(|conn| {
                 conn.batch_execute("PRAGMA wal_checkpoint(TRUNCATE)")
                     .map_err(db_error)
@@ -130,8 +130,7 @@ impl Archive {
 
     pub async fn clear_derived_cache(&self) -> Result<()> {
         let account = self.account as i64;
-        self.backend
-            .shared()
+        self.sql()
             .run(move |conn| {
                 diesel::sql_query("DELETE FROM brazap_assets WHERE account=?")
                     .bind::<BigInt, _>(account)

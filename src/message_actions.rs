@@ -181,8 +181,7 @@ impl Service {
         };
         let account = self.archive.account as i64;
         self.archive
-            .backend
-            .shared()
+            .sql()
             .run(move |conn| {
                 store_reaction(conn, account, &message).map_err(crate::storage::db_error)
             })
@@ -236,6 +235,10 @@ impl Service {
                 String::new(),
             )
             .view;
+            ensure!(
+                projection.kind != "view_once",
+                crate::content::VIEW_ONCE_LOCKED
+            );
             ensure!(projection.actionable(), "This message cannot be forwarded");
             prepared.push((target, original));
         }

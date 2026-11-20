@@ -62,12 +62,18 @@ pub(crate) fn connection() -> crate::model::Connection {
 /// Sidebar update states for isolated visual checks; no network or installer runs.
 pub(crate) fn updates() -> crate::updates::UpdateState {
     let status = std::env::var("BRAZAP_DEMO_UPDATE").unwrap_or_default();
-    if !matches!(status.as_str(), "ready" | "downloading" | "error") {
+    if !matches!(
+        status.as_str(),
+        "ready" | "downloading" | "error" | "manual"
+    ) {
         return Default::default();
     }
+    // "manual" previews a package-managed install, which links to the release page.
+    let manual = status == "manual";
     crate::updates::UpdateState {
         downloaded: status == "ready",
-        status,
+        manual,
+        status: if manual { "available".into() } else { status },
         latest: Some("99.0.0".into()),
         ..Default::default()
     }
@@ -564,6 +570,7 @@ impl Service {
         path: String,
         kind: String,
         caption: String,
+        view_once: bool,
     ) -> Result<Message> {
         let path = std::path::Path::new(&path);
         let meta = tokio::fs::metadata(path)
@@ -617,6 +624,10 @@ impl Service {
                 proto.document_message = MessageField::some(m);
             }
             _ => anyhow::bail!("Unsupported attachment kind"),
+        }
+        if view_once {
+            let proto = crate::content::into_view_once(proto)?;
+            return self.demo_send(chat, proto, None).await;
         }
         self.demo_send(chat, proto, Some(bytes)).await
     }

@@ -14,6 +14,11 @@ const REPLY: Icon = Icon {
     view: 24.0,
     body: r#"<path d="m10 5-7 6 7 6v-4c6 0 9 2 11 6-1-9-4-10-11-10Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>"#,
 };
+const EDIT: Icon = Icon {
+    name: "edit-message",
+    view: 24.0,
+    body: r#"<path d="M4 20h4L19 9l-4-4L4 16v4Zm9-13 4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
 const FORWARD: Icon = Icon {
     name: "forward-message",
     view: 24.0,
@@ -42,7 +47,7 @@ pub(super) struct Forwarding {
 
 impl State {
     pub(super) fn toggle_forward(&mut self, message: &Message) {
-        if !message.actionable() {
+        if !message.forwardable() {
             return;
         }
         if let Some(flow) = &mut self.forwarding {
@@ -64,6 +69,9 @@ impl State {
     }
 
     pub(super) fn begin_forward(&mut self, message: Message) {
+        if !message.forwardable() {
+            return;
+        }
         self.reply = None;
         self.reaction_menu = None;
         self.attachments_open = false;
@@ -155,9 +163,11 @@ pub(super) fn toolbar(s: &State, message: &Message) -> El {
             s.reaction_menu = None;
             s.attachments_open = false;
         }))
-        .child(action(&FORWARD, "Forward message", move |s, _| {
-            s.picker.open = false;
-            s.begin_forward(forward.clone())
+        .children(message.forwardable().then(|| {
+            action(&FORWARD, "Forward message", move |s, _| {
+                s.picker.open = false;
+                s.begin_forward(forward.clone())
+            })
         }))
         .children(unsaved.then(|| {
             action(&ADD_STICKER, "Add to My stickers", move |s, _| {
@@ -281,6 +291,55 @@ pub(super) fn reply_banner(s: &State) -> Option<El> {
             .child(icon_button(&glyphs::CLOSE, "Cancel reply", |s, _| {
                 s.reply = None
             })),
+    )
+}
+
+/// Shown above the composer while it edits one of your messages.
+pub(super) fn edit_banner(s: &State) -> Option<El> {
+    let (message, _) = s.editing.as_ref()?;
+    let cancel = icon_button(&glyphs::CLOSE, "Cancel editing", |s, _| {
+        s.cancel_edit();
+    });
+    // One line beside the search panel, like the reply preview.
+    if s.chat_search.open {
+        return Some(
+            row()
+                .key("edit-preview-compact")
+                .w_full()
+                .gap(8.0)
+                .padding(11.0)
+                .radius(10.0)
+                .fill(MINT.alpha(0.08))
+                .instant_changes()
+                .child(icon(&EDIT, 16.0).color(MINT))
+                .child(
+                    label(message.preview(), 12.0, MUTED)
+                        .truncate()
+                        .grow(1.0)
+                        .min_w(0.0),
+                )
+                .child(cancel),
+        );
+    }
+    Some(
+        row()
+            .key("edit-preview")
+            .w_full()
+            .gap(12.0)
+            .padding(11.0)
+            .radius(10.0)
+            .instant_changes()
+            .fill(MINT.alpha(0.08))
+            .child(icon(&EDIT, 18.0).color(MINT))
+            .child(
+                col()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .gap(4.0)
+                    .child(label(super::locale::tr("Editing message"), 11.0, MINT).truncate())
+                    .child(label(message.preview(), 12.0, MUTED).truncate()),
+            )
+            .child(cancel),
     )
 }
 

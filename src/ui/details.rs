@@ -263,7 +263,11 @@ pub(super) fn modal(s: &State, _layer: &mut Vec<El>) -> Option<El> {
                                 .grow(1.0)
                                 .min_w(0.0)
                                 .gap(5.0)
-                                .child(super::audio::view(s, message))
+                                .child(super::audio::view(
+                                    s,
+                                    message,
+                                    super::audio::TRANSCRIPT_WIDTH,
+                                ))
                                 .child(label(
                                     super::times::chat_date(message.timestamp),
                                     10.0,

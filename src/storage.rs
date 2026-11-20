@@ -56,6 +56,10 @@ pub(crate) struct MessageRow {
     pub sender_photo_version: i64,
     #[diesel(sql_type = Text)]
     pub reactions: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+    pub transcript: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+    pub edit: Option<String>,
 }
 
 #[derive(QueryableByName)]
@@ -94,7 +98,70 @@ pub(crate) fn db_error(error: diesel::result::Error) -> StoreError {
     StoreError::Database(Box::new(error))
 }
 
+/// Brazap's queries on the pool it shares with whatsapp-rust. Same permits,
+/// connections and snapshot rules as `SqliteStore::shared`, but every call
+/// first lets SQLite spill temporary data to disk.
+pub(crate) struct Sql<'a>(&'a SqliteStore);
+
+impl Sql<'_> {
+    /// Write path: see `SharedSqlite::run`.
+    pub(crate) async fn run<F, T>(&self, f: F) -> Result<T, StoreError>
+    where
+        F: FnOnce(&mut diesel::SqliteConnection) -> Result<T, StoreError> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.0
+            .shared()
+            .run(move |conn| {
+                spill_to_disk(conn);
+                f(conn)
+            })
+            .await
+    }
+
+    /// Read-only snapshot: see `SharedSqlite::read`.
+    pub(crate) async fn read<F, T>(&self, f: F) -> Result<T, StoreError>
+    where
+        F: FnOnce(&mut diesel::SqliteConnection) -> Result<T, StoreError> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.0
+            .shared()
+            .read(move |conn| {
+                spill_to_disk(conn);
+                f(conn)
+            })
+            .await
+    }
+}
+
+/// whatsapp-rust sets `temp_store = memory` on each pooled connection, after
+/// any init hook, and reopens idle readers. In memory, SQLite never flushes a
+/// sorter and keeps temp B-trees (GROUP BY, DISTINCT, materialized views,
+/// index builds) and VACUUM's full copy of the database on the heap, so one
+/// broad query can take as much RAM as the data it reads. Temporary files cap
+/// that at a few MiB; they are deleted on close and results are unchanged.
+/// The setting stays on the connection, so after the first call this pragma
+/// returns without work. Best effort: SQLite refuses the change only while a
+/// TEMP schema is open in a transaction, which Brazap never creates.
+///
+/// This cannot bound a sort whose rows carry large BLOBs: each spilled run
+/// keeps its current row in memory while runs are merged. Queries must not
+/// sort, group or materialize `encoded`, `data` or other bodies; sort keys
+/// (rowids) first and read the bodies afterwards.
+pub(crate) fn spill_to_disk(conn: &mut diesel::SqliteConnection) {
+    use diesel::connection::SimpleConnection;
+    if let Err(error) = conn.batch_execute("PRAGMA temp_store=FILE") {
+        log::debug!("SQLite kept in-memory temporary storage: {error}");
+    }
+}
+
 impl Archive {
+    /// Run Brazap queries on the shared pool; see [`Sql`].
+    pub(crate) fn sql(&self) -> Sql<'_> {
+        Sql(&self.backend)
+    }
+
     pub async fn open(path: &std::path::Path) -> Result<Self> {
         let database = whatsapp_rust::store::SqliteDatabase::open(
             path.to_str().context("Database path is not UTF-8")?,
@@ -112,6 +179,8 @@ impl Archive {
         backend
             .shared()
             .run(|conn| {
+                // Migrations may build indexes or copy tables (see `Sql`).
+                spill_to_disk(conn);
                 conn.batch_execute(SCHEMA).map_err(db_error)?;
                 conn.batch_execute(VIEW_SCHEMA).map_err(db_error)?;
                 conn.batch_execute(MESSAGE_SCHEMA).map_err(db_error)?;
@@ -145,7 +214,14 @@ impl Archive {
                 conn.batch_execute(include_str!("../migrations/019_deleted_chats.sql"))
                     .map_err(db_error)?;
                 conn.batch_execute(include_str!("../migrations/020_media_retention.sql"))
-                    .map_err(db_error)
+                    .map_err(db_error)?;
+                conn.batch_execute(include_str!("../migrations/021_transcripts.sql"))
+                    .map_err(db_error)?;
+                conn.batch_execute(include_str!("../migrations/022_edits.sql"))
+                    .map_err(db_error)?;
+                conn.batch_execute(include_str!("../migrations/023_call_timeline.sql"))
+                    .map_err(db_error)?;
+                crate::transcription::upgrade_schema(conn)
             })
             .await?;
         Ok(Self {
@@ -167,10 +243,10 @@ impl Archive {
                 (row, aliases, senders)
             })
             .collect();
-        self.backend.shared().run(move |conn| {
+        self.sql().run(move |conn| {
             conn.transaction::<_, diesel::result::Error, _>(|conn| {
                 for (row,aliases,senders) in rows {
-                    let m = row.view;
+                    let mut m = row.view;
                     let fresh_outgoing=m.from_me && m.status=="sending" && row.metadata=="{}";
                     let deleted:CountRow=diesel::sql_query("SELECT (EXISTS(SELECT 1 FROM brazap_deleted_message_ids WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND sender IN (SELECT value FROM json_each(?)) AND id=?) OR (?=0 AND EXISTS(SELECT 1 FROM brazap_deleted_chats WHERE account=? AND jid IN (SELECT value FROM json_each(?)) AND (through_timestamp>? OR (?=0 AND through_timestamp=?))))) AS count")
                         .bind::<BigInt,_>(account as i64).bind::<Text,_>(&aliases).bind::<Text,_>(&senders).bind::<Text,_>(&m.id)
@@ -197,9 +273,14 @@ impl Archive {
                         apply_receipts(conn, account as i64, &aliases, &m.id)?;
                     }
                     crate::message_actions::store_reaction(conn, account as i64, &m)?;
+                    crate::edits::store(conn, account as i64, &m, &aliases, &senders)?;
+                    if m.kind == "view_once" {
+                        forget_view_once_media(conn, account as i64, &aliases, &senders, &m.id)?;
+                    }
                     if !m.visible() {continue;}
-                    diesel::sql_query("INSERT INTO brazap_message_search(account,chat,sender,id,text) VALUES(?,?,?,?,?) ON CONFLICT(account,chat,sender,id) DO UPDATE SET text=excluded.text")
-                        .bind::<BigInt,_>(account as i64).bind::<Text,_>(&m.chat).bind::<Text,_>(&m.sender).bind::<Text,_>(&m.id).bind::<Text,_>(searchable(&m)).execute(conn)?;
+                    // Search and the chat preview use the latest edit, if one arrived first.
+                    crate::edits::overlay(conn, account as i64, &mut m, &aliases, &senders)?;
+                    index_message(conn, account as i64, &m)?;
                     let read:CountRow=diesel::sql_query("SELECT (EXISTS(SELECT 1 FROM brazap_chat_reads WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND through_timestamp>?) OR EXISTS(SELECT 1 FROM brazap_read_messages WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND id=? AND (sender='' OR sender IN (SELECT value FROM json_each(?))))) AS count")
                         .bind::<BigInt,_>(account as i64).bind::<Text,_>(&aliases).bind::<BigInt,_>(m.timestamp).bind::<BigInt,_>(account as i64).bind::<Text,_>(&aliases).bind::<Text,_>(&m.id).bind::<Text,_>(&senders).get_result(conn)?;
                     let unread = i64::from(existed.count == 0 && live && !m.from_me && read.count==0);
@@ -218,8 +299,7 @@ impl Archive {
     pub async fn chats(&self) -> Result<Vec<Chat>> {
         let account = self.account as i64;
         let chats: Vec<Chat> = self
-            .backend
-            .shared()
+            .sql()
             .read(move |conn| {
                 diesel::sql_query(include_str!("../queries/chats.sql"))
                     .bind::<BigInt, _>(account)
@@ -256,7 +336,7 @@ impl Archive {
         timestamp: i64,
     ) -> Result<()> {
         let account = self.account as i64;
-        self.backend.shared().run(move |conn| {
+        self.sql().run(move |conn| {
             diesel::sql_query("INSERT INTO brazap_chats(account,jid,name,preview,updated_at,unread) VALUES(?,?,?,'',?,?) ON CONFLICT(account,jid) DO UPDATE SET name=CASE WHEN excluded.name!='' THEN excluded.name ELSE brazap_chats.name END,updated_at=MAX(brazap_chats.updated_at,excluded.updated_at)")
                 .bind::<BigInt,_>(account).bind::<Text,_>(jid).bind::<Text,_>(name)
                 .bind::<BigInt,_>(timestamp).bind::<BigInt,_>(unread).execute(conn).map_err(db_error)?;
@@ -273,7 +353,7 @@ impl Archive {
         saved: bool,
     ) -> Result<()> {
         let account = self.account as i64;
-        self.backend.shared().run(move |conn| {
+        self.sql().run(move |conn| {
             if saved {
                 diesel::sql_query("INSERT INTO brazap_saved_contacts(account,jid,name,payload) VALUES(?,?,?,?) ON CONFLICT(account,jid) DO UPDATE SET name=excluded.name,payload=excluded.payload")
                     .bind::<BigInt,_>(account).bind::<Text,_>(&jid).bind::<Text,_>(&name)
@@ -289,8 +369,7 @@ impl Archive {
 
     pub async fn event(&self, kind: String, payload: String) -> Result<()> {
         let account = self.account as i64;
-        self.backend
-            .shared()
+        self.sql()
             .run(move |conn| {
                 diesel::sql_query(
                     "INSERT INTO brazap_events(account,kind,identity,payload) VALUES(?,?,?,?)",
@@ -322,7 +401,7 @@ impl Archive {
     pub async fn receipt(&self, chat: String, ids: Vec<String>, status: String) -> Result<()> {
         let account = self.account as i64;
         let aliases = self.identities().await?.aliases_json(&chat);
-        self.backend.shared().run(move |conn| {
+        self.sql().run(move |conn| {
             conn.transaction::<_,diesel::result::Error,_>(|conn| {
                 for id in ids {
                     diesel::sql_query("INSERT INTO brazap_receipts(account,chat,id,status) VALUES(?,?,?,?) ON CONFLICT(account,chat,id) DO UPDATE SET status=CASE WHEN (CASE excluded.status WHEN 'read' THEN 4 WHEN 'delivered' THEN 3 WHEN 'sent' THEN 2 WHEN 'failed' THEN 1 ELSE 0 END) >= (CASE brazap_receipts.status WHEN 'read' THEN 4 WHEN 'delivered' THEN 3 WHEN 'sent' THEN 2 WHEN 'failed' THEN 1 ELSE 0 END) THEN excluded.status ELSE brazap_receipts.status END")
@@ -346,7 +425,7 @@ impl Archive {
             source.sender,
             message.id.clone(),
         );
-        self.backend.shared().run(move |conn| {
+        self.sql().run(move |conn| {
             diesel::sql_query("INSERT INTO brazap_media(account,chat,sender,id,data) VALUES(?,?,?,?,?) ON CONFLICT(account,chat,sender,id) DO UPDATE SET data=excluded.data")
                 .bind::<BigInt,_>(account).bind::<Text,_>(&chat).bind::<Text,_>(&sender)
                 .bind::<Text,_>(&id).bind::<Binary,_>(bytes).execute(conn).map_err(db_error)?;
@@ -374,7 +453,7 @@ impl Archive {
         let chat = identities.aliases_json(&chat);
         let sender = identities.aliases_json(&sender);
         let (usage_chat, usage_sender, usage_id) = (chat.clone(), sender.clone(), id.clone());
-        let row: Option<MediaRow> = self.backend.shared().read(move |conn| {
+        let row: Option<MediaRow> = self.sql().read(move |conn| {
             diesel::sql_query("SELECT b.data AS data,COALESCE(u.accessed_at,0) AS accessed_at FROM brazap_media b LEFT JOIN brazap_media_usage u ON u.account=b.account AND u.chat=b.chat AND u.sender=b.sender AND u.id=b.id WHERE b.account=? AND b.chat IN (SELECT value FROM json_each(?)) AND b.sender IN (SELECT value FROM json_each(?)) AND b.id=? LIMIT 1")
                 .bind::<BigInt,_>(account).bind::<Text,_>(chat).bind::<Text,_>(sender)
                 .bind::<Text,_>(id).get_result(conn).optional().map_err(db_error)
@@ -383,7 +462,7 @@ impl Archive {
         // Opening media restarts its retention clock; write at most once a day.
         let now = chrono::Utc::now().timestamp_millis();
         if now - row.accessed_at >= crate::retention::TOUCH_INTERVAL_MS {
-            self.backend.shared().run(move |conn| {
+            self.sql().run(move |conn| {
                 diesel::sql_query("UPDATE brazap_media_usage SET accessed_at=? WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND sender IN (SELECT value FROM json_each(?)) AND id=?")
                     .bind::<BigInt,_>(now).bind::<BigInt,_>(account).bind::<Text,_>(usage_chat)
                     .bind::<Text,_>(usage_sender).bind::<Text,_>(usage_id).execute(conn).map_err(db_error)?;
@@ -404,7 +483,7 @@ impl Archive {
         let chat = source.chat;
         let sender = source.sender;
         let account = self.account as i64;
-        let row: BytesRow = self.backend.shared().read(move |conn| {
+        let row: BytesRow = self.sql().read(move |conn| {
             diesel::sql_query("SELECT encoded AS data FROM brazap_messages WHERE account=? AND chat=? AND sender=? AND id=?")
                 .bind::<BigInt,_>(account).bind::<Text,_>(chat).bind::<Text,_>(sender)
                 .bind::<Text,_>(id).get_result(conn).map_err(db_error)
@@ -425,7 +504,7 @@ impl Archive {
             key.sender.clone(),
             key.id.clone(),
         );
-        self.backend.shared().run(move |conn| {
+        self.sql().run(move |conn| {
             diesel::sql_query("INSERT OR IGNORE INTO brazap_history(account,chat,sender,id,stage,data,metadata,processed) VALUES(?,?,?,?,?,?,?,0)")
                 .bind::<BigInt,_>(account).bind::<Text,_>(&chat).bind::<Text,_>(&sender).bind::<Text,_>(&id)
                 .bind::<BigInt,_>(stage).bind::<Binary,_>(&data).bind::<Text,_>(metadata).execute(conn).map_err(db_error)?;
@@ -440,8 +519,8 @@ impl Archive {
 
     pub async fn pending_history(&self) -> Result<Vec<RecoveryRow>> {
         let account = self.account as i64;
-        Ok(self.backend.shared().read(move |conn| {
-            diesel::sql_query("SELECT chat,sender,id,data FROM brazap_history WHERE account=? AND stage=0 AND processed=0 ORDER BY rowid LIMIT 32")
+        Ok(self.sql().read(move |conn| {
+            diesel::sql_query("SELECT chat,sender,id,data FROM brazap_history WHERE +account=? AND stage=0 AND processed=0 ORDER BY rowid LIMIT 32")
                 .bind::<BigInt,_>(account).load(conn).map_err(db_error)
         }).await?)
     }
@@ -453,7 +532,7 @@ impl Archive {
             key.sender.clone(),
             key.id.clone(),
         );
-        self.backend.shared().run(move |conn| {
+        self.sql().run(move |conn| {
             diesel::sql_query("UPDATE brazap_history SET processed=1 WHERE account=? AND chat=? AND sender=? AND id=?")
                 .bind::<BigInt,_>(account).bind::<Text,_>(chat).bind::<Text,_>(sender).bind::<Text,_>(id).execute(conn).map_err(db_error)?;
             Ok(())
@@ -608,6 +687,35 @@ pub(crate) fn searchable(message: &Message) -> String {
     )
     .to_lowercase()
 }
+/// Index a visible message's text for search, keeping its transcript. The row
+/// is rebuilt from the message, so the current transcript is appended once, as
+/// the suffix `transcription::index_transcript` replaces on re-transcription.
+pub(crate) fn index_message(
+    conn: &mut diesel::SqliteConnection,
+    account: i64,
+    m: &Message,
+) -> diesel::QueryResult<usize> {
+    diesel::sql_query("INSERT INTO brazap_message_search(account,chat,sender,id,text) VALUES(?1,?2,?3,?4,?5 || COALESCE((SELECT ' ' || t.search FROM brazap_transcripts t WHERE t.account=?1 AND t.chat=?2 AND t.sender=?3 AND t.id=?4 AND t.search!=''),'')) ON CONFLICT(account,chat,sender,id) DO UPDATE SET text=excluded.text")
+        .bind::<BigInt,_>(account).bind::<Text,_>(&m.chat).bind::<Text,_>(&m.sender).bind::<Text,_>(&m.id).bind::<Text,_>(searchable(m)).execute(conn)
+}
+/// Drop any bytes, previews or transcript kept for a message that turned out to
+/// be view once (older archives showed it as ordinary media). The raw message
+/// stays in `brazap_messages.encoded`.
+pub(crate) fn forget_view_once_media(
+    conn: &mut diesel::SqliteConnection,
+    account: i64,
+    chats: &str,
+    senders: &str,
+    id: &str,
+) -> diesel::QueryResult<()> {
+    for table in ["brazap_media", "brazap_media_usage", "brazap_transcripts"] {
+        diesel::sql_query(format!("DELETE FROM {table} WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND sender IN (SELECT value FROM json_each(?)) AND id=?"))
+            .bind::<BigInt,_>(account).bind::<Text,_>(chats).bind::<Text,_>(senders).bind::<Text,_>(id).execute(conn)?;
+    }
+    diesel::sql_query("DELETE FROM brazap_assets WHERE account=?1 AND key IN (SELECT p.value || ':' || c.value || ':' || s.value || ':' || ?4 FROM json_each('[\"thumb\",\"image\"]') p, json_each(?2) c, json_each(?3) s)")
+        .bind::<BigInt,_>(account).bind::<Text,_>(chats).bind::<Text,_>(senders).bind::<Text,_>(id).execute(conn)?;
+    Ok(())
+}
 pub(crate) fn status_rank(status: &str) -> i64 {
     match status {
         "read" => 4,
@@ -759,7 +867,7 @@ impl Archive {
             encoded: Vec<u8>,
         }
         let account = self.account as i64;
-        self.backend.shared().run(move|conn| {
+        self.sql().run(move|conn| {
             let rows=diesel::sql_query("SELECT chat,timestamp,encoded FROM brazap_messages WHERE account=? AND json_extract(payload,'$.kind')='protocol'").bind::<BigInt,_>(account).load::<Row>(conn).map_err(db_error)?;
             conn.transaction::<_,diesel::result::Error,_>(|conn| {for row in rows {store_deletion(conn,account,&row.chat,row.timestamp,&row.encoded)?;} Ok(())}).map_err(db_error)
         }).await?;

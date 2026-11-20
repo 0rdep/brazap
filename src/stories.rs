@@ -12,12 +12,15 @@ use diesel::{
 
 pub(crate) const CHAT: &str = "status@broadcast";
 
+/// Status updates kept in every snapshot (the status pane and its viewer).
+const STATUS_LIMIT: usize = 500;
+
 #[derive(QueryableByName)]
-struct Row {
+struct Viewed {
     #[diesel(sql_type=Text)]
-    payload: String,
-    #[diesel(sql_type=BigInt)]
-    viewed: i64,
+    sender: String,
+    #[diesel(sql_type=Text)]
+    id: String,
 }
 
 impl Archive {
@@ -33,7 +36,7 @@ impl Archive {
         };
         let ids = serde_json::to_string(ids)?;
         let when = now();
-        self.backend.shared().run(move |conn| {
+        self.sql().run(move |conn| {
             diesel::sql_query("INSERT OR IGNORE INTO brazap_status_views(account,sender,id,viewed_at) SELECT account,sender,id,? FROM brazap_messages WHERE account=? AND chat='status@broadcast' AND id IN (SELECT value FROM json_each(?)) AND (?='[]' OR sender IN (SELECT value FROM json_each(?)))")
                 .bind::<BigInt,_>(when).bind::<BigInt,_>(account).bind::<Text,_>(ids).bind::<Text,_>(&aliases).bind::<Text,_>(&aliases).execute(conn).map_err(db_error)?;
             Ok(())
@@ -50,7 +53,7 @@ impl Archive {
         let account = self.account as i64;
         let identities = self.identities().await?;
         let aliases = identities.aliases_json(&chat);
-        let row: Option<crate::storage::MessageRow> = self.backend.shared().read(move |conn| {
+        let row: Option<crate::storage::MessageRow> = self.sql().read(move |conn| {
             diesel::sql_query(format!("{} WHERE m.account=? AND m.chat IN (SELECT value FROM json_each(?)) AND json_extract(m.payload,'$.kind')='audio' AND (m.timestamp,m.id,m.sender)>(?,?,?) AND NOT EXISTS(SELECT 1 FROM brazap_deletions d WHERE d.account=m.account AND d.chat=m.chat AND d.id=m.id) ORDER BY m.timestamp,m.id,m.sender LIMIT 1",crate::storage::MESSAGE_SELECT))
                 .bind::<BigInt,_>(account).bind::<Text,_>(aliases).bind::<BigInt,_>(cursor.timestamp).bind::<Text,_>(cursor.id).bind::<Text,_>(cursor.sender)
                 .get_result(conn).optional().map_err(db_error)
@@ -60,17 +63,19 @@ impl Archive {
             .map(|m| m.map(|m| identities.message(m)))
     }
 
+    /// The newest status updates, oldest first. Statuses stay past WhatsApp's
+    /// 24-hour expiry (and after the sender deletes them, when deleted messages are
+    /// kept); only their media follows the Storage retention settings.
     pub async fn statuses(&self) -> Result<Vec<StatusUpdate>> {
         let account = self.account as i64;
-        let cutoff = now() - 24 * 3600;
-        let rows: Vec<Row> = self.backend.shared().read(move |conn| {
-            diesel::sql_query("SELECT m.payload, EXISTS(SELECT 1 FROM brazap_status_views v WHERE v.account=m.account AND v.sender=m.sender AND v.id=m.id) AS viewed FROM brazap_messages m WHERE m.account=? AND m.chat='status@broadcast' AND m.timestamp>? AND json_extract(m.payload,'$.kind') IN ('text','image','video','audio') AND NOT EXISTS(SELECT 1 FROM brazap_deletions d WHERE d.account=m.account AND d.chat=m.chat AND d.id=m.id) ORDER BY m.timestamp,m.id LIMIT 1000")
-                .bind::<BigInt,_>(account).bind::<BigInt,_>(cutoff).load(conn).map_err(db_error)
+        let rows: Vec<crate::storage::MessageRow> = self.sql().read(move |conn| {
+            diesel::sql_query(format!("{} WHERE m.account=? AND m.chat='status@broadcast' AND json_extract(m.payload,'$.kind') IN ('text','image','video','audio') ORDER BY m.timestamp DESC,m.id DESC LIMIT {STATUS_LIMIT}", crate::storage::MESSAGE_SELECT))
+                .bind::<BigInt,_>(account).load(conn).map_err(db_error)
         }).await?;
         let identities = self.identities().await?;
         let mut updates = Vec::new();
-        for row in rows {
-            let mut message: Message = serde_json::from_str(&row.payload)?;
+        for row in rows.into_iter().rev() {
+            let mut message = crate::search::decode(row)?;
             if identities.is_locked(&message.sender) {
                 continue;
             }
@@ -83,8 +88,23 @@ impl Archive {
             }
             updates.push(StatusUpdate {
                 message,
-                viewed: row.viewed != 0,
+                viewed: false,
             });
+        }
+        let ids = serde_json::to_string(
+            &updates
+                .iter()
+                .map(|u| u.message.id.as_str())
+                .collect::<Vec<_>>(),
+        )?;
+        let viewed: Vec<Viewed> = self.sql().read(move |conn| {
+            diesel::sql_query("SELECT sender,id FROM brazap_status_views WHERE account=? AND id IN (SELECT value FROM json_each(?))")
+                .bind::<BigInt,_>(account).bind::<Text,_>(ids).load(conn).map_err(db_error)
+        }).await?;
+        for update in &mut updates {
+            update.viewed = viewed
+                .iter()
+                .any(|v| v.id == update.message.id && v.sender == update.message.sender);
         }
         Ok(updates)
     }
@@ -108,6 +128,10 @@ impl Service {
         anyhow::ensure!(
             !update.message.from_me,
             "You cannot reply to your own status"
+        );
+        anyhow::ensure!(
+            update.message.deleted_at.is_none(),
+            "This status was deleted"
         );
         let jid: whatsapp_rust::Jid = sender.parse()?;
         anyhow::ensure!(

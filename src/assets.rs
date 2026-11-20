@@ -88,8 +88,7 @@ impl Archive {
     async fn cached_asset(&self, key: String) -> Result<Option<CachedAsset>> {
         let account = self.account as i64;
         Ok(self
-            .backend
-            .shared()
+            .sql()
             .read(move |conn| {
                 diesel::sql_query(
                     "SELECT mime,data,expires_at FROM brazap_assets WHERE account=? AND key=?",
@@ -112,7 +111,7 @@ impl Archive {
     ) -> Result<()> {
         let account = self.account as i64;
         let time = now();
-        self.backend.shared().run(move |conn| {
+        self.sql().run(move |conn| {
             diesel::sql_query("INSERT INTO brazap_assets(account,key,mime,data,updated_at,expires_at) VALUES(?,?,?,?,?,?) ON CONFLICT(account,key) DO UPDATE SET mime=excluded.mime,data=excluded.data,updated_at=MAX(brazap_assets.updated_at+1,excluded.updated_at),expires_at=excluded.expires_at")
                 .bind::<BigInt,_>(account).bind::<Text,_>(key).bind::<Text,_>(mime).bind::<Nullable<Binary>,_>(data)
                 .bind::<BigInt,_>(time).bind::<BigInt,_>(time.saturating_add(ttl)).execute(conn)
@@ -125,7 +124,7 @@ impl Archive {
     pub async fn invalidate_avatar(&self, jid: String) -> Result<()> {
         let account = self.account as i64;
         let aliases = self.chat_aliases(&jid).await?;
-        self.backend.shared().run(move |conn| {
+        self.sql().run(move |conn| {
             for jid in aliases {
             diesel::sql_query("UPDATE brazap_assets SET expires_at=0,updated_at=updated_at+1 WHERE account=? AND key IN (?,?)")
                 .bind::<BigInt,_>(account).bind::<Text,_>(format!("avatar:{jid}")).bind::<Text,_>(format!("profile:{jid}")).execute(conn)
@@ -162,6 +161,11 @@ impl Service {
                     .archive
                     .raw_message(chat.clone(), sender.clone(), id.clone())
                     .await?;
+                // Not even the embedded preview of view-once media is shown.
+                ensure!(
+                    !whatsapp_rust::prelude::MessageExt::is_view_once(&raw),
+                    crate::content::VIEW_ONCE_LOCKED
+                );
                 let base = crate::content::media_message(&raw);
                 if let Some(sticker) = base.sticker_message.as_option() {
                     sticker.is_animated == Some(true)
@@ -646,7 +650,7 @@ impl Service {
         }
         let _guard = Guard(&self.avatar_warming);
         let account = self.archive.account as i64;
-        let targets = self.archive.backend.shared().read(move |conn| {
+        let targets = self.archive.sql().read(move |conn| {
             diesel::sql_query("SELECT jid,MAX(common_group) common_group FROM (SELECT jid,NULL common_group FROM brazap_contacts WHERE account=? UNION ALL SELECT jid,NULL FROM brazap_chats WHERE account=? UNION ALL SELECT sender jid,chat common_group FROM brazap_messages WHERE account=? AND chat LIKE '%@g.us' AND sender!='self' GROUP BY sender) WHERE jid LIKE '%@s.whatsapp.net' OR jid LIKE '%@lid' OR jid LIKE '%@g.us' GROUP BY jid")
                 .bind::<BigInt,_>(account).bind::<BigInt,_>(account).bind::<BigInt,_>(account).load::<AvatarTarget>(conn).map_err(crate::storage::db_error)
         }).await?;

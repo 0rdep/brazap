@@ -48,9 +48,20 @@ pub(super) struct Panel {
     pub sending: bool,
     sent: usize,
     total: usize,
+    /// Send the whole batch as view once. Off whenever the preview opens.
+    view_once: bool,
 }
 
 impl Panel {
+    /// View once applies to photos and videos only, so the whole batch must be media.
+    fn view_once_allowed(&self) -> bool {
+        !self.items.is_empty()
+            && self
+                .items
+                .iter()
+                .all(|item| matches!(item.kind, "image" | "video"))
+    }
+
     pub(super) fn caption_available(&self) -> bool {
         !self.sending
             && self
@@ -65,6 +76,7 @@ pub(super) struct Upload {
     pub path: String,
     pub kind: String,
     pub caption: String,
+    pub view_once: bool,
 }
 
 fn classify(path: &std::path::Path, document: bool) -> &'static str {
@@ -279,6 +291,7 @@ impl State {
                 sending: false,
                 sent: 0,
                 total: 0,
+                view_once: false,
             });
         }
         let panel = self.attachments.as_mut().unwrap();
@@ -389,6 +402,7 @@ impl State {
         {
             return;
         }
+        let view_once = panel.view_once && panel.view_once_allowed();
         let mut uploads = Vec::new();
         for item in &mut panel.items {
             let prepared = item.prepared.as_ref().unwrap();
@@ -402,6 +416,7 @@ impl State {
                 path: prepared.path.to_string_lossy().into_owned(),
                 kind: prepared.kind.into(),
                 caption: item.caption.text.clone(),
+                view_once,
             });
         }
         panel.total = uploads.len();
@@ -738,6 +753,8 @@ pub(super) fn modal(s: &State) -> Option<(El, Vec<El>)> {
         && !panel.items.is_empty()
         && panel.items.iter().all(|i| i.prepared.is_some())
         && s.snapshot.connection.phase == Phase::Connected;
+    let view_once_allowed = panel.view_once_allowed();
+    let view_once = panel.view_once && view_once_allowed;
     let status = if panel.sending {
         locale::format(
             "Sending {sent} of {total}…",
@@ -745,6 +762,11 @@ pub(super) fn modal(s: &State) -> Option<(El, Vec<El>)> {
                 ("sent", panel.sent.to_string()),
                 ("total", panel.total.to_string()),
             ],
+        )
+    } else if view_once {
+        locale::format(
+            "{count} attachment(s) · Can be opened only once",
+            &[("count", panel.items.len().to_string())],
         )
     } else {
         locale::format(
@@ -757,7 +779,25 @@ pub(super) fn modal(s: &State) -> Option<(El, Vec<El>)> {
             .w_full()
             .center_y()
             .gap(12.0)
-            .child(label(status, 11.0, MUTED).grow(1.0))
+            .child(
+                label(status, 11.0, if view_once { MINT } else { MUTED })
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .truncate(),
+            )
+            .child(view_once_toggle(
+                view_once,
+                view_once_allowed && !panel.sending,
+                40.0,
+                "View once is only available for photos and videos",
+                |s| {
+                    if let Some(panel) = &mut s.attachments
+                        && !panel.sending
+                    {
+                        panel.view_once = !panel.view_once;
+                    }
+                },
+            ))
             .child(
                 row()
                     .h(40.0)

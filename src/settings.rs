@@ -13,6 +13,7 @@ pub struct Settings {
     pub appearance: AppearanceSettings,
     pub storage: StorageSettings,
     pub mcp: McpSettings,
+    pub transcription: TranscriptionSettings,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -22,6 +23,35 @@ impl Default for Settings {
             appearance: Default::default(),
             storage: Default::default(),
             mcp: Default::default(),
+            transcription: Default::default(),
+        }
+    }
+}
+/// Voice messages are transcribed on this computer. The speech model downloads
+/// the first time it is needed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TranscriptionSettings {
+    pub enabled: bool,
+    /// A [`crate::transcription::SpeechModel::id`]. Settings saved before this
+    /// option existed keep the original base model; ids of the earlier
+    /// whisper.cpp models (`base`, `small`, `large-v3-turbo`) read as their
+    /// transcribe.cpp successors.
+    #[serde(deserialize_with = "speech_model_id")]
+    pub model: String,
+    /// Offer "Transcribe again" on finished transcripts.
+    pub retranscribe: bool,
+}
+fn speech_model_id<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let id = String::deserialize(deserializer)?;
+    Ok(crate::transcription::SpeechModel::migrate(&id))
+}
+impl Default for TranscriptionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: crate::transcription::DEFAULT_MODEL.into(),
+            retranscribe: false,
         }
     }
 }
@@ -145,6 +175,12 @@ impl Settings {
             ["en", "pt-BR", "es"].contains(&self.appearance.language.as_str()),
             "Unsupported language"
         );
+        ensure!(
+            crate::transcription::MODELS
+                .iter()
+                .any(|m| m.id == self.transcription.model),
+            "Unsupported speech model"
+        );
         for (_, days) in self.storage.retention.by_kind() {
             ensure!(
                 RETENTION_CHOICES.contains(&days),
@@ -185,6 +221,7 @@ impl Service {
             .set_preference("app_settings".into(), serde_json::to_string(&value)?)
             .await?;
         *self.settings.write().await = value.clone();
+        self.transcription_toggled(value.transcription.enabled);
         // Presence follows the window focus and this setting on the next desktop poll.
         self.changed();
         Ok(self.revision())

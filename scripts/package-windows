@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Build the per-user Windows installer from a release executable.
+#
+#   scripts/package-windows <brazap.exe> <output-dir>
+#
+# Produces <output-dir>/brazap-windows-x86_64-setup.exe. Runs in Git Bash and needs
+# Inno Setup 6.6 or newer (ISCC.exe): set ISCC, put it on PATH, or install it
+# to its default location (CI installs a pinned version with Chocolatey).
+set -euo pipefail
+
+if [[ $# -ne 2 ]]; then
+    echo "Usage: $0 <brazap.exe> <output-dir>" >&2
+    exit 2
+fi
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+binary="$1"
+out="$2"
+version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$root/Cargo.toml" | head -1)"
+# VERSIONINFO only takes numbers; pre-release labels stay in the displayed version.
+numeric="${version%%[-+]*}"
+
+iscc="${ISCC:-}"
+if [[ -z "$iscc" ]]; then
+    for candidate in "$(command -v iscc || true)" "$(command -v ISCC.exe || true)" \
+        "${PROGRAMFILES:-C:/Program Files}/Inno Setup 6/ISCC.exe" \
+        "C:/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+        "${LOCALAPPDATA:-}/Programs/Inno Setup 6/ISCC.exe"; do
+        if [[ -n "$candidate" && -f "$candidate" ]]; then
+            iscc="$candidate"
+            break
+        fi
+    done
+fi
+[[ -n "$iscc" ]] || { echo "Inno Setup's ISCC.exe was not found. Install Inno Setup 6 or set ISCC." >&2; exit 1; }
+
+python=""
+for candidate in python3 python py; do
+    # Windows can expose a Store placeholder named python3 that does not run scripts.
+    if command -v "$candidate" >/dev/null && "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; then
+        python="$candidate"
+        break
+    fi
+done
+[[ -n "$python" ]] || { echo "Python 3 is required to generate the installer icon." >&2; exit 1; }
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+"$python" "$root/packaging/icons.py" windows "$work" >/dev/null
+mkdir -p "$out"
+
+winpath() { if command -v cygpath >/dev/null; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
+# Git Bash would rewrite ISCC's /D switches as POSIX paths.
+MSYS2_ARG_CONV_EXCL='*' "$iscc" /Qp \
+    "/DAppVersion=$version" \
+    "/DNumericVersion=$numeric" \
+    "/DSourceExe=$(winpath "$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")")" \
+    "/DIconFile=$(winpath "$work/brazap.ico")" \
+    "/DOutputDir=$(winpath "$(cd "$out" && pwd)")" \
+    "$(winpath "$root/packaging/windows/brazap.iss")"
+echo "$out/brazap-windows-x86_64-setup.exe"

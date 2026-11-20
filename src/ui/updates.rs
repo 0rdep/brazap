@@ -13,9 +13,13 @@ pub(super) fn prompt(s: &State) -> Option<El> {
         return None;
     }
     let ready = update.ready_for(env!("CARGO_PKG_VERSION"));
-    let downloading = update.status == "downloading" || update.status == "checking";
+    // Package-managed and read-only installs never download; they link to the release.
+    let manual = update.manual && !ready;
+    let downloading = !manual && (update.status == "downloading" || update.status == "checking");
     let action = if ready {
         "Restart and update"
+    } else if manual {
+        "Download update"
     } else if downloading {
         "Downloading update…"
     } else {
@@ -45,6 +49,11 @@ pub(super) fn prompt(s: &State) -> Option<El> {
         .help(if ready {
             locale::format(
                 "Restart to install Brazap {version}.",
+                &[("version", update.latest.clone().unwrap_or_default())],
+            )
+        } else if manual {
+            locale::format(
+                "Brazap {version} is available. Download it from the release page.",
                 &[("version", update.latest.clone().unwrap_or_default())],
             )
         } else {
@@ -84,6 +93,16 @@ pub(super) fn prompt(s: &State) -> Option<El> {
                     }
                 }
             });
+    } else if manual {
+        let url = update
+            .release_url
+            .clone()
+            .unwrap_or_else(|| "https://github.com/0rdep/brazap/releases/latest".into());
+        button = button.hover(hover).on_press_tx(move |s: &mut State, tx| {
+            if let Err(error) = tx.open_url(&url) {
+                s.error = Some(error.to_string());
+            }
+        });
     } else if !downloading {
         button = button.hover(hover).on_press(|s: &mut State| {
             s.snapshot.updates.status = "downloading".into();

@@ -34,7 +34,17 @@ if [[ ! -f "$cpp_runtime" ]]; then
     exit 1
 fi
 export CXXSTDLIB_x86_64_pc_windows_gnu=static=stdc++
-export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="${CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS:-} -Lnative=$(dirname -- "$cpp_runtime")"
+# Offer a search directory with only the static C++ runtime first, so a
+# `-lstdc++` can never pick libstdc++.dll.a.
+static_runtime="$project_root/target/mingw-static-runtime"
+mkdir -p "$static_runtime"
+ln -sf "$cpp_runtime" "$static_runtime/libstdc++.a"
+export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="${CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS:-} -Lnative=$static_runtime -Lnative=$(dirname -- "$cpp_runtime")"
+# transcribe.cpp (voice transcription): ggml names its MinGW archives without
+# the `lib` prefix Rust expects; restore it (scripts/cmake/mingw-ggml-prefix.cmake).
+# transcribe-cpp-sys appends CMAKE_ARGS to its configure line, after the CPU
+# flags from .cargo/config.toml (TRANSCRIBE_CMAKE_ARGS).
+export CMAKE_ARGS="${CMAKE_ARGS:-} -DCMAKE_PROJECT_INCLUDE=$project_root/scripts/cmake/mingw-ggml-prefix.cmake"
 
 export AR_x86_64_pc_windows_gnu="${AR_x86_64_pc_windows_gnu:-$(command -v x86_64-w64-mingw32-ar || command -v ar)}"
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="$CC_x86_64_pc_windows_gnu"

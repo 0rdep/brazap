@@ -7,8 +7,11 @@ description = "A native WhatsApp desktop client with a local MCP interface"
 license = "MIT"
 
 [features]
-default = ["desktop"]
+default = ["desktop", "transcription"]
 memory-profiling = []
+# Local speech-to-text for voice messages (transcribe.cpp on ggml: Whisper and
+# Parakeet from GGUF files).
+transcription = ["dep:transcribe-cpp", "dep:transcribe-cpp-sys", "dep:symphonia", "dep:opuscule"]
 desktop = ["dep:rune", "dep:rune-kit", "dep:qrcode", "dep:tempfile", "dep:windows", "dep:windows-core", "dep:symphonia", "dep:opuscule", "dep:cpal", "dep:opus", "dep:ogg", "dep:nokhwa", "dep:openh264", "dep:mp4", "dep:webp-animation", "dep:ringbuf"]
 
 [dependencies]
@@ -46,6 +49,10 @@ webp-animation = { version = "0.9", optional = true }
 nokhwa = { version = "0.10.11", features = ["input-native"], optional = true }
 ringbuf = { version = "0.6", optional = true }
 uuid = { version = "1", features = ["v4"] }
+transcribe-cpp = { version = "=0.4.1", optional = true }
+# The bindings refuse a native library of another base version (0.4.2's sys
+# crate builds transcribe.cpp 0.4.2), so the sys crate is pinned with them.
+transcribe-cpp-sys = { version = "=0.4.1", optional = true }
 ureq = "3.5"
 whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "b84f2af3d4029612a3c0cd45823bced1ee4614eb", features = ["voip"] }
 rune = { git = "https://github.com/anomalyco/rune", rev = "1213159f9ec300c7a309c67a89176f61a0b47753", default-features = false, features = ["embedded-fonts", "native-file-dialog"], optional = true }

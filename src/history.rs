@@ -1,9 +1,8 @@
 use crate::{
+    calls::{CALL_LOG_PREFIX, TimelineCall, timeline_calls},
     model::{Message, MessageCursor, MessagePage},
     search::decode,
-    storage::{
-        Archive, MESSAGE_SELECT, MessageRow, db_error, message_payload, project_message, searchable,
-    },
+    storage::{Archive, MESSAGE_SELECT, MessageRow, db_error, message_payload, project_message},
 };
 use anyhow::{Context, Result};
 use diesel::{
@@ -63,16 +62,20 @@ impl Archive {
             id: String::new(),
             sender: String::new(),
         });
-        let rows:Vec<MessageRow>=self.backend.shared().read(move |conn| {
+        let (rows, calls)=self.sql().read(move |conn| {
             let mut rows=Vec::new();
             for source in sources {
             rows.extend(diesel::sql_query(format!("{select} WHERE m.account=? AND {scope} AND json_extract(m.payload,'$.kind')!='protocol' AND (m.timestamp,m.id,m.sender)<(?,?,?) ORDER BY m.timestamp DESC,m.id DESC,m.sender DESC LIMIT ?"))
                 .bind::<BigInt,_>(account).bind::<Text,_>(source).bind::<Text,_>(&aliases).bind::<BigInt,_>(cursor.timestamp).bind::<Text,_>(&cursor.id).bind::<Text,_>(&cursor.sender).bind::<BigInt,_>((limit+1) as i64).load::<MessageRow>(conn).map_err(db_error)?);
-            } Ok(rows)
+            }
+            let calls = timeline_calls(conn, account, &aliases, &cursor, limit + 1, false).map_err(db_error)?;
+            Ok((rows, calls))
         }).await?;
         let mut messages = rows
             .into_iter()
-            .map(|row| decode(row).map(|m| identities.message(m)))
+            .map(decode)
+            .chain(calls.into_iter().map(TimelineCall::message))
+            .map(|message| message.map(|m| identities.message(m)))
             .collect::<Result<Vec<_>>>()?;
         messages
             .sort_by(|a, b| (b.timestamp, &b.id, &b.sender).cmp(&(a.timestamp, &a.id, &a.sender)));
@@ -101,7 +104,7 @@ impl Archive {
         let sources = identities.aliases(&chat);
         let scope = identities.timeline_scope(&chat);
         let select = timeline_select();
-        let rows: Vec<MessageRow> = self.backend.shared().read(move |conn| {
+        let (rows, calls) = self.sql().read(move |conn| {
             let mut rows = Vec::new();
             for source in sources {
                 rows.extend(diesel::sql_query(format!("{select} WHERE m.account=? AND {scope} AND json_extract(m.payload,'$.kind')!='protocol' AND (m.timestamp,m.id,m.sender)>(?,?,?) ORDER BY m.timestamp,m.id,m.sender LIMIT ?"))
@@ -109,11 +112,14 @@ impl Archive {
                     .bind::<BigInt,_>(cursor.timestamp).bind::<Text,_>(&cursor.id).bind::<Text,_>(&cursor.sender)
                     .bind::<BigInt,_>((limit+1) as i64).load::<MessageRow>(conn).map_err(db_error)?);
             }
-            Ok(rows)
+            let calls = timeline_calls(conn, account, &aliases, &cursor, limit + 1, true).map_err(db_error)?;
+            Ok((rows, calls))
         }).await?;
         let mut messages = rows
             .into_iter()
-            .map(|row| decode(row).map(|m| identities.message(m)))
+            .map(decode)
+            .chain(calls.into_iter().map(TimelineCall::message))
+            .map(|message| message.map(|m| identities.message(m)))
             .collect::<Result<Vec<_>>>()?;
         messages
             .sort_by(|a, b| (a.timestamp, &a.id, &a.sender).cmp(&(b.timestamp, &b.id, &b.sender)));
@@ -139,8 +145,7 @@ impl Archive {
         let authors = identities.aliases_json(&sender);
         let scope = identities.message_scope(&chat);
         let target: MessageRow =
-            self.backend
-                .shared()
+            self.sql()
                 .read({
                     let aliases=aliases.clone();let authors=authors.clone();let scope=scope.clone();
                     move |conn| {
@@ -185,16 +190,20 @@ impl Archive {
         let sources = identities.aliases(&chat);
         let scope = identities.timeline_scope(&chat);
         let select = timeline_select();
-        let rows:Vec<MessageRow>=self.backend.shared().read(move |conn| {
+        let (rows, calls)=self.sql().read(move |conn| {
             let mut rows=Vec::new();
             for source in sources {
                 rows.extend(diesel::sql_query(format!("{select} WHERE m.account=? AND {scope} AND json_extract(m.payload,'$.kind')!='protocol' AND (m.timestamp,m.id,m.sender)>=(?,?,?) ORDER BY m.timestamp,m.id,m.sender LIMIT 52"))
                     .bind::<BigInt,_>(account).bind::<Text,_>(source).bind::<Text,_>(&aliases).bind::<BigInt,_>(pivot.timestamp).bind::<Text,_>(&pivot.id).bind::<Text,_>(&pivot.sender).load::<MessageRow>(conn).map_err(db_error)?);
-            } Ok(rows)
+            }
+            let calls = timeline_calls(conn, account, &aliases, &pivot.cursor(), 52, true).map_err(db_error)?;
+            Ok((rows, calls))
         }).await?;
         let mut after = rows
             .into_iter()
-            .map(|row| decode(row).map(|m| identities.message(m)))
+            .map(decode)
+            .chain(calls.into_iter().map(TimelineCall::message))
+            .map(|message| message.map(|m| identities.message(m)))
             .collect::<Result<Vec<_>>>()?;
         after.sort_by(|a, b| (a.timestamp, &a.id, &a.sender).cmp(&(b.timestamp, &b.id, &b.sender)));
         page.has_newer = after.len() > 51;
@@ -214,7 +223,23 @@ impl Archive {
                 " AND json_extract(payload,'$.kind') IN ('video','sticker')",
             )
             .await?;
-        Ok(all || media)
+        // Edits arrived as protocol messages before they were applied, and
+        // undecrypted add-ons used to be shown as unsupported.
+        let edits = self
+            .reproject(
+                "message_edits_v1",
+                " AND json_extract(payload,'$.kind') IN ('protocol','unsupported')",
+            )
+            .await?;
+        // View-once media used to be shown (and kept) like ordinary media, and
+        // its empty placeholders as unsupported.
+        let view_once = self
+            .reproject(
+                "message_view_once_v1",
+                " AND json_extract(payload,'$.kind') IN ('image','video','audio','unsupported')",
+            )
+            .await?;
+        Ok(all || media || edits || view_once)
     }
 
     async fn reproject(&self, marker: &'static str, only: &'static str) -> Result<bool> {
@@ -225,8 +250,10 @@ impl Archive {
         let mut cursor = 0;
         loop {
             let account = self.account as i64;
-            let rows:Vec<RawRow>=self.backend.shared().read(move |conn| {
-                diesel::sql_query(format!("SELECT rowid AS cursor,payload,encoded,metadata FROM brazap_messages WHERE account=? AND rowid>?{only} ORDER BY rowid LIMIT 256")).bind::<BigInt,_>(account).bind::<BigInt,_>(cursor).load(conn).map_err(db_error)
+            // `+account` keeps SQLite on the rowid B-tree: with the account
+            // index it re-scanned and sorted every remaining row per batch.
+            let rows:Vec<RawRow>=self.sql().read(move |conn| {
+                diesel::sql_query(format!("SELECT rowid AS cursor,payload,encoded,metadata FROM brazap_messages WHERE +account=? AND rowid>?{only} ORDER BY rowid LIMIT 256")).bind::<BigInt,_>(account).bind::<BigInt,_>(cursor).load(conn).map_err(db_error)
             }).await?;
             if rows.is_empty() {
                 break;
@@ -254,20 +281,34 @@ impl Archive {
                         crate::storage::archived_history_status(&metadata, &message.chat).into();
                 }
                 let aliases = identities.aliases_json(&message.chat);
-                updates.push((row.cursor, message_payload(&message)?, message, aliases));
+                let senders = identities.aliases_json(&message.sender);
+                updates.push((
+                    row.cursor,
+                    message_payload(&message)?,
+                    message,
+                    aliases,
+                    senders,
+                ));
             }
-            self.backend.shared().run(move |conn| {
+            self.sql().run(move |conn| {
                 conn.transaction::<_,diesel::result::Error,_>(|conn| {
-                    for (rowid,payload,m,aliases) in updates {
+                    for (rowid,payload,mut m,aliases,senders) in updates {
                         crate::message_actions::store_reaction(conn, account, &m)?;
+                        crate::edits::store(conn, account, &m, &aliases, &senders)?;
                         diesel::sql_query("UPDATE brazap_messages SET payload=? WHERE rowid=?").bind::<Text,_>(payload).bind::<BigInt,_>(rowid).execute(conn)?;
+                        if m.kind == "view_once" {
+                            crate::storage::forget_view_once_media(conn, account, &aliases, &senders, &m.id)?;
+                        }
                         if m.from_me && crate::storage::status_rank(&m.status)>2 {
                             diesel::sql_query("UPDATE brazap_messages SET status=? WHERE rowid=? AND status!='read'").bind::<Text,_>(&m.status).bind::<BigInt,_>(rowid).execute(conn)?;
                         }
                         if m.from_me {
                             crate::storage::apply_receipts(conn, account, &aliases, &m.id)?;
                         }
-                        if m.visible(){diesel::sql_query("INSERT INTO brazap_message_search(account,chat,sender,id,text) VALUES(?,?,?,?,?) ON CONFLICT(account,chat,sender,id) DO UPDATE SET text=excluded.text").bind::<BigInt,_>(account).bind::<Text,_>(m.chat.clone()).bind::<Text,_>(m.sender.clone()).bind::<Text,_>(m.id.clone()).bind::<Text,_>(searchable(&m)).execute(conn)?;}
+                        if m.visible(){
+                            crate::edits::overlay(conn, account, &mut m, &aliases, &senders)?;
+                            crate::storage::index_message(conn, account, &m)?;
+                        }
                         else {diesel::sql_query("DELETE FROM brazap_message_search WHERE account=? AND chat=? AND sender=? AND id=?").bind::<BigInt,_>(account).bind::<Text,_>(&m.chat).bind::<Text,_>(&m.sender).bind::<Text,_>(&m.id).execute(conn)?;}
                     }Ok(())
                 }).map_err(db_error)
@@ -288,8 +329,8 @@ impl Archive {
         let mut cursor = 0;
         loop {
             let account = self.account as i64;
-            let chunk:Option<Chunk>=self.backend.shared().read(move |conn|{
-                diesel::sql_query("SELECT rowid AS cursor,data FROM brazap_history WHERE account=? AND stage=1 AND rowid>? ORDER BY rowid LIMIT 1").bind::<BigInt,_>(account).bind::<BigInt,_>(cursor).get_result(conn).optional().map_err(db_error)
+            let chunk:Option<Chunk>=self.sql().read(move |conn|{
+                diesel::sql_query("SELECT rowid AS cursor,data FROM brazap_history WHERE +account=? AND stage=1 AND rowid>? ORDER BY rowid LIMIT 1").bind::<BigInt,_>(account).bind::<BigInt,_>(cursor).get_result(conn).optional().map_err(db_error)
             }).await?;
             let Some(chunk) = chunk else {
                 break;
@@ -330,8 +371,17 @@ impl crate::service::Service {
         if self.config.demo {
             return Ok(page);
         }
+        // The phone expects a real message key for an on-demand history request.
+        let anchor = if cursor.id.starts_with(CALL_LOG_PREFIX) {
+            let Some(anchor) = self.archive.history_boundary(chat.clone()).await? else {
+                return Ok(page);
+            };
+            anchor
+        } else {
+            cursor.clone()
+        };
         let client = self.connected().await?;
-        let result = self.fetch_older_history(&client, &chat, &cursor).await?;
+        let result = self.fetch_older_history(&client, &chat, &anchor).await?;
         let mut page = self
             .archive
             .message_page(chat, CHAT_PAGE_SIZE, Some(cursor))

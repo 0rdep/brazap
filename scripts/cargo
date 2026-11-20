@@ -25,6 +25,19 @@ if [[ -x .build-deps/cc && -x .build-deps/root/usr/bin/pkgconf ]]; then
     if [[ -x .build-deps/cxx ]]; then
         export CXX="$project_root/.build-deps/cxx"
     fi
+    # Bindgen (the Linux camera bindings) needs libclang and the sysroot headers.
+    sysroot="$project_root/.build-deps/root"
+    if [[ -z "${LIBCLANG_PATH:-}" ]]; then
+        for libclang in "$sysroot"/usr/lib/llvm-*/lib; do
+            [[ -d "$libclang" ]] && export LIBCLANG_PATH="$libclang"
+        done
+    fi
+    gcc_headers=("$sysroot"/usr/lib/gcc/x86_64-linux-gnu/*/include)
+    export BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu="${BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu:--I${gcc_headers[0]} -I$sysroot/usr/include -I$sysroot/usr/include/x86_64-linux-gnu}"
+fi
+# transcribe.cpp (voice transcription) builds its C++ core with CMake.
+if [[ -z "${CMAKE_GENERATOR:-}" ]] && ! command -v make >/dev/null && command -v ninja >/dev/null; then
+    export CMAKE_GENERATOR=Ninja
 fi
 
 exec cargo "$@"

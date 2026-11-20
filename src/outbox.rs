@@ -22,7 +22,7 @@ impl Archive {
         self.allow_chat(chat).await?;
         let aliases = self.identities().await?.aliases_json(chat);
         let (account, id) = (self.account as i64, id.to_owned());
-        let row = self.backend.shared().read(move |conn| {
+        let row = self.sql().read(move |conn| {
             diesel::sql_query(format!("{MESSAGE_SELECT} WHERE m.account=? AND m.chat IN (SELECT value FROM json_each(?)) AND m.id=? AND json_extract(m.payload,'$.from_me')=1 LIMIT 1"))
                 .bind::<BigInt,_>(account).bind::<Text,_>(aliases).bind::<Text,_>(id)
                 .get_result::<MessageRow>(conn).optional().map_err(db_error)
@@ -31,7 +31,7 @@ impl Archive {
     }
     pub(crate) async fn recover_pending_sends(&self) -> Result<()> {
         let account = self.account as i64;
-        self.backend.shared().run(move |conn| {
+        self.sql().run(move |conn| {
             conn.transaction::<_,diesel::result::Error,_>(|conn| {
                 diesel::sql_query("UPDATE brazap_messages SET status='failed' WHERE account=? AND status='sending' AND json_extract(payload,'$.from_me')=1")
                     .bind::<BigInt,_>(account).execute(conn)?;
@@ -45,7 +45,7 @@ impl Archive {
     async fn retry_sending(&self, chat: &str, id: &str) -> Result<()> {
         let (account, id) = (self.account as i64, id.to_owned());
         let aliases = self.identities().await?.aliases_json(chat);
-        self.backend.shared().run(move|conn| {
+        self.sql().run(move|conn| {
             diesel::sql_query("UPDATE brazap_messages SET status='sending' WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND id=? AND status='failed' AND json_extract(payload,'$.from_me')=1")
                 .bind::<BigInt,_>(account).bind::<Text,_>(aliases).bind::<Text,_>(id).execute(conn).map_err(db_error)
         }).await?;
@@ -129,7 +129,7 @@ impl Service {
                     &author,
                     &source.parse()?,
                     &jid,
-                    &original,
+                    &crate::content::quotable(&original),
                 );
                 wa::Message::text_with_context(text, context)
             } else {

@@ -30,7 +30,8 @@ server is opt-in: disabled by default (Settings → MCP or `BRAZAP_MCP=1`).
   default, so enable it with `BRAZAP_MCP=1` or Settings → MCP in that profile.
 - In an isolated demo profile, `BRAZAP_DEMO_STARTUP=loading|qr|connecting|syncing|restoring`
   previews startup states without a real account. Omit it for the normal connected demo.
-- `BRAZAP_DEMO_UPDATE=ready|downloading|error` previews sidebar update states.
+- `BRAZAP_DEMO_UPDATE=ready|downloading|error|manual` previews sidebar update states
+  (`manual` is a package-managed install that links to the release page).
   `BRAZAP_DEMO_UPDATE=check` enables real release checks in an isolated demo
   profile without creating a WhatsApp client.
 
@@ -66,6 +67,9 @@ server is opt-in: disabled by default (Settings → MCP or `BRAZAP_MCP=1`).
   new features that need body fields must read `encoded`, or call
   `compaction::rehydrate_metadata`, and never depend on `metadata.message`.
   Any storage reduction of message data must be lossless and verified per row.
+- Message edits stay as their MESSAGE_EDIT protocol rows; `brazap_edits` (derived,
+  rebuildable from those rows) is overlaid on reads and in search. Never rewrite
+  an original's payload or `encoded` with edited text.
 - Downloaded media follows the per-type retention settings (Settings → Storage;
   defaults: videos 1 week, photos 1 month, stickers/audio/files never). Retention
   is measured from the last open (`brazap_media_usage`), only removes media that
@@ -84,6 +88,26 @@ server is opt-in: disabled by default (Settings → MCP or `BRAZAP_MCP=1`).
   Suppress notifications for the active foreground chat and coalesce bursts.
 - The desktop UI and MCP server must read and write through the same service and
   SQLite-backed data layer so their view of chats and messages stays consistent.
+
+## Voice transcription
+
+- Transcribe voice messages locally with transcribe.cpp (`src/transcription.rs`,
+  `src/transcription/`); audio and text never leave the device. The model chosen in
+  Settings → Privacy (Whisper base by default, Whisper small, Parakeet TDT v3, or
+  Whisper large-v3 turbo; Q8_0 GGUFs) downloads on first use or when chosen into the
+  derived cache; every model is pinned by repository revision, size and SHA-256.
+  Only the model in use stays on disk.
+- Keep transcription memory low: weights memory-mapped (never `no_mmap`), a fresh
+  transcribe.cpp session per message, one model loaded at a time, unloaded after
+  five idle minutes. On Windows a mapped model file is renamed aside, not deleted.
+- Re-transcription (an opt-in bubble button, or MCP `retranscribe`) replaces the
+  stored result and its search text; record the producing model in `brazap_transcripts.model`.
+- Transcribe the voice messages on screen first, then fresh incoming ones (not
+  offline, history or retry replays). Never transcribe locked chats.
+- Store results in `brazap_transcripts` and expose them as `Message::transcript`,
+  so the UI and MCP read the same text. Keep the release CPU baseline portable
+  (`TRANSCRIBE_CMAKE_ARGS` in `.cargo/config.toml`: x86-64-v3, no native tuning)
+  and check it at runtime.
 
 ## Startup and authentication
 

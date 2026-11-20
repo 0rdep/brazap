@@ -1209,3 +1209,88 @@ patent infringement, then any patent rights granted to you under this License
 for these implementations of WebM shall terminate as of the date such
 litigation is filed.
 ```
+
+## Voice transcription: transcribe.cpp, ggml and the speech models
+
+Voice messages are transcribed locally with transcribe.cpp
+(https://github.com/handy-computer/transcribe.cpp) 0.4, compiled into Brazap through
+the `transcribe-cpp` and `transcribe-cpp-sys` crates. transcribe.cpp is distributed
+under the following license.
+
+```
+MIT License
+
+Copyright (c) 2026 The transcribe.cpp authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+transcribe.cpp vendors ggml (https://github.com/ggml-org/ggml), distributed under the
+following license.
+
+```
+MIT License
+
+Copyright (c) 2023-2026 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+transcribe.cpp also vendors miniz (https://github.com/richgel999/miniz), used for
+Whisper's compression-ratio heuristic, under the MIT License: Copyright 2013-2014 RAD
+Game Tools and Valve Software, Copyright 2010-2014 Rich Geldreich and Tenacious Software
+LLC. All Rights Reserved. Its voice activity segmentation is translated from Silero VAD
+(https://github.com/snakers4/silero-vad), MIT License, Copyright (c) 2020-present Silero
+Team. Both carry the same MIT permission notice and disclaimer as above.
+
+The speech models are not bundled. Brazap downloads the model selected in Settings, as a
+Q8_0 GGUF converted by handy-computer for transcribe.cpp, from Hugging Face at a pinned
+revision, and verifies each file's size and SHA-256 hash, recorded in
+`src/transcription/catalog.rs`:
+
+- `whisper-base-Q8_0.gguf` (the default), `whisper-small-Q8_0.gguf` and
+  `whisper-large-v3-turbo-Q8_0.gguf`, from https://huggingface.co/handy-computer/whisper-base-gguf,
+  https://huggingface.co/handy-computer/whisper-small-gguf and
+  https://huggingface.co/handy-computer/whisper-large-v3-turbo-gguf: OpenAI Whisper
+  "base" and "small" (Apache License 2.0, https://huggingface.co/openai/whisper-base and
+  https://huggingface.co/openai/whisper-small) and "large-v3-turbo" (MIT License,
+  https://huggingface.co/openai/whisper-large-v3-turbo), Copyright (c) 2022 OpenAI.
+- `parakeet-tdt-0.6b-v3-Q8_0.gguf`, from
+  https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf: NVIDIA Parakeet TDT
+  0.6B v3 (https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), licensed under the
+  Creative Commons Attribution 4.0 International License (CC BY 4.0,
+  https://creativecommons.org/licenses/by/4.0/). The weights were converted to GGUF and
+  quantized to Q8_0 by handy-computer; Brazap does not modify them further. Settings →
+  Privacy credits the model next to it.

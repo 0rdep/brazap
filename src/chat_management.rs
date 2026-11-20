@@ -24,8 +24,7 @@ impl Archive {
     pub(crate) async fn filter_deleted_chats(&self, chats: Vec<Chat>) -> Result<Vec<Chat>> {
         let account = self.account as i64;
         let deleted: Vec<Deleted> = self
-            .backend
-            .shared()
+            .sql()
             .read(move |conn| {
                 diesel::sql_query("SELECT jid FROM brazap_deleted_chats WHERE account=?")
                     .bind::<BigInt, _>(account)
@@ -46,9 +45,9 @@ impl Archive {
     pub(crate) async fn chat_boundary(&self, chat: &str) -> Result<i64> {
         let account = self.account as i64;
         let aliases = self.identities().await?.aliases_json(chat);
-        let boundary:Boundary=self.backend.shared().read(move |conn|{
-            diesel::sql_query("SELECT COALESCE(MAX(timestamp),0) AS timestamp FROM (SELECT timestamp FROM brazap_messages WHERE account=? AND chat IN (SELECT value FROM json_each(?)) UNION ALL SELECT updated_at AS timestamp FROM brazap_chats WHERE account=? AND jid IN (SELECT value FROM json_each(?)))")
-                .bind::<BigInt,_>(account).bind::<Text,_>(&aliases).bind::<BigInt,_>(account).bind::<Text,_>(&aliases).get_result(conn).map_err(db_error)
+        let boundary:Boundary=self.sql().read(move |conn|{
+            diesel::sql_query("SELECT COALESCE(MAX(timestamp),0) AS timestamp FROM (SELECT timestamp FROM brazap_messages WHERE account=? AND chat IN (SELECT value FROM json_each(?)) UNION ALL SELECT updated_at AS timestamp FROM brazap_chats WHERE account=? AND jid IN (SELECT value FROM json_each(?)) UNION ALL SELECT timestamp FROM brazap_calls WHERE account=? AND peer IN (SELECT value FROM json_each(?)))")
+                .bind::<BigInt,_>(account).bind::<Text,_>(&aliases).bind::<BigInt,_>(account).bind::<Text,_>(&aliases).bind::<BigInt,_>(account).bind::<Text,_>(&aliases).get_result(conn).map_err(db_error)
         }).await?;
         Ok(boundary.timestamp)
     }
@@ -56,7 +55,7 @@ impl Archive {
     pub(crate) async fn delete_chat_through(&self, chat: &str, through: i64) -> Result<()> {
         let account = self.account as i64;
         let aliases = self.identities().await?.aliases_json(chat);
-        self.backend.shared().run(move |conn| {
+        self.sql().run(move |conn| {
             conn.transaction::<_,diesel::result::Error,_>(|conn| {
                 diesel::sql_query("INSERT INTO brazap_deleted_chats(account,jid,through_timestamp) SELECT ?,value,? FROM json_each(?) WHERE true ON CONFLICT(account,jid) DO UPDATE SET through_timestamp=MAX(through_timestamp,excluded.through_timestamp)")
                     .bind::<BigInt,_>(account).bind::<BigInt,_>(through).bind::<Text,_>(&aliases).execute(conn)?;
@@ -64,7 +63,7 @@ impl Archive {
                 // boundary prevents old history chunks from recreating deleted rows.
                 diesel::sql_query("INSERT OR IGNORE INTO brazap_deleted_message_ids(account,chat,sender,id) SELECT account,chat,sender,id FROM brazap_messages WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND timestamp<=?")
                     .bind::<BigInt,_>(account).bind::<Text,_>(&aliases).bind::<BigInt,_>(through).execute(conn)?;
-                for table in ["brazap_media","brazap_message_search","brazap_receipts","brazap_read_messages"] {
+                for table in ["brazap_media","brazap_message_search","brazap_receipts","brazap_read_messages","brazap_edits"] {
                     diesel::sql_query(format!("DELETE FROM {table} WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND id IN (SELECT id FROM brazap_messages WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND timestamp<=?)"))
                         .bind::<BigInt,_>(account).bind::<Text,_>(&aliases).bind::<BigInt,_>(account).bind::<Text,_>(&aliases).bind::<BigInt,_>(through).execute(conn)?;
                 }

@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# Package a Linux x86_64 release binary.
+#
+#   scripts/package-linux <brazap-binary> <output-dir>
+#
+# Produces, in <output-dir>:
+#   brazap-linux-x86_64.deb       Debian/Ubuntu package (/usr/bin/brazap, menu entry, icons).
+#   brazap-linux-x86_64.AppImage  Portable single file; the in-app updater replaces it.
+#
+# Needs python3, objdump and dpkg-deb. appimagetool and its static runtime are
+# downloaded at pinned versions and verified by SHA-256 (cached under
+# ${XDG_CACHE_HOME:-~/.cache}/brazap-packaging). Set SKIP_APPIMAGE=1 to build only the .deb.
+set -euo pipefail
+
+if [[ $# -ne 2 ]]; then
+    echo "Usage: $0 <brazap-binary> <output-dir>" >&2
+    exit 2
+fi
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+binary="$1"
+mkdir -p "$2"
+out="$(cd "$2" && pwd)"
+version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$root/Cargo.toml" | head -1)"
+
+appimagetool_url="https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
+appimagetool_sha256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+runtime_url="https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64"
+runtime_sha256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+# Lay out the files shared by both packages under a /usr prefix.
+layout() {
+    local prefix="$1"
+    install -D -m 755 "$binary" "$prefix/bin/brazap"
+    install -D -m 644 "$root/packaging/linux/brazap.desktop" "$prefix/share/applications/brazap.desktop"
+    (cd "$work/icons" && find hicolor -type f) | while read -r icon; do
+        install -D -m 644 "$work/icons/$icon" "$prefix/share/icons/$icon"
+    done
+}
+python3 "$root/packaging/icons.py" linux "$work/icons" >/dev/null
+
+# Debian package. The binary links only libc, libgcc and ALSA at load time; Rune opens
+# the Vulkan loader, xkbcommon and the Wayland or X11 client libraries when it starts.
+deb="$work/deb"
+layout "$deb/usr"
+install -D -m 644 "$root/LICENSE" "$deb/usr/share/doc/brazap/copyright"
+install -D -m 644 "$root/THIRD_PARTY_NOTICES.md" "$deb/usr/share/doc/brazap/THIRD_PARTY_NOTICES.md"
+depends=()
+add_depend() {
+    local item
+    for item in ${depends[@]+"${depends[@]}"}; do
+        [[ "$item" != "$1" ]] || return 0
+    done
+    depends+=("$1")
+}
+glibc="$(objdump -T "$binary" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/^GLIBC_//' | sort -uV | tail -1)"
+for library in $(objdump -p "$binary" | awk '$1 == "NEEDED" { print $2 }'); do
+    case "$library" in
+        libc.so.6 | libm.so.6 | libdl.so.2 | libpthread.so.0 | librt.so.1 | ld-linux-x86-64.so.2)
+            add_depend "libc6 (>= ${glibc:-2.31})" ;;
+        libgcc_s.so.1) add_depend "libgcc-s1" ;;
+        libstdc++.so.6) add_depend "libstdc++6" ;;
+        libasound.so.2) add_depend "libasound2t64 | libasound2" ;;
+        *)
+            echo "No Debian dependency is mapped for $library; add it to $0." >&2
+            exit 1 ;;
+    esac
+done
+add_depend "libxkbcommon0"
+add_depend "libvulkan1"
+recommends="libwayland-client0, libxkbcommon-x11-0, libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6, libxrandr2, mesa-vulkan-drivers | vulkan-icd"
+# Debian sorts "~" before a release, so 1.0.0~rc.1 upgrades to 1.0.0.
+deb_version="${version/-/\~}"
+installed_size="$(du -sk --apparent-size "$deb/usr" | cut -f1)"
+mkdir -p "$deb/DEBIAN"
+{
+    echo "Package: brazap"
+    echo "Version: $deb_version"
+    echo "Architecture: amd64"
+    echo "Maintainer: Brazap <https://github.com/0rdep/brazap>"
+    echo "Installed-Size: $installed_size"
+    (
+        IFS=,
+        echo "Depends: ${depends[*]}" | sed 's/,/, /g'
+    )
+    echo "Recommends: $recommends"
+    echo "Section: net"
+    echo "Priority: optional"
+    echo "Homepage: https://github.com/0rdep/brazap"
+    echo "Description: Native desktop client for WhatsApp"
+    echo " Brazap is an alternative WhatsApp desktop client. It keeps chat history in a"
+    echo " local SQLite archive and can offer an optional local MCP server to AI agents."
+    echo " It needs a graphical session and a Vulkan driver."
+} >"$deb/DEBIAN/control"
+find "$deb" -type d -exec chmod 755 {} +
+dpkg-deb --root-owner-group -Zxz --build "$deb" "$out/brazap-linux-x86_64.deb" >/dev/null
+echo "$out/brazap-linux-x86_64.deb"
+
+if [[ "${SKIP_APPIMAGE:-}" == 1 ]]; then
+    exit 0
+fi
+
+# AppImage. Like the .deb, it relies on the system's graphics and audio libraries, which
+# the AppImage exclude list keeps out of bundles.
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/brazap-packaging"
+mkdir -p "$cache"
+fetch() {
+    local url="$1" sha="$2" file="$cache/$3"
+    if [[ ! -f "$file" ]] || ! echo "$sha  $file" | sha256sum --check --status; then
+        curl --fail --location --silent --show-error --retry 3 --output "$file.partial" "$url"
+        echo "$sha  $file.partial" | sha256sum --check --status || {
+            echo "Checksum mismatch for $url" >&2
+            rm -f "$file.partial"
+            exit 1
+        }
+        mv "$file.partial" "$file"
+    fi
+    chmod 755 "$file"
+}
+fetch "$appimagetool_url" "$appimagetool_sha256" appimagetool-1.9.1-x86_64.AppImage
+fetch "$runtime_url" "$runtime_sha256" runtime-20251108-x86_64
+
+appdir="$work/Brazap.AppDir"
+layout "$appdir/usr"
+ln -s usr/bin/brazap "$appdir/AppRun"
+cp "$root/packaging/linux/brazap.desktop" "$appdir/brazap.desktop"
+cp "$work/icons/hicolor/256x256/apps/brazap.png" "$appdir/brazap.png"
+ln -s brazap.png "$appdir/.DirIcon"
+appimage="$out/brazap-linux-x86_64.AppImage"
+rm -f "$appimage"
+# Extract-and-run avoids needing FUSE on build machines and containers.
+ARCH=x86_64 VERSION="$version" APPIMAGE_EXTRACT_AND_RUN=1 \
+    "$cache/appimagetool-1.9.1-x86_64.AppImage" --no-appstream \
+    --runtime-file "$cache/runtime-20251108-x86_64" "$appdir" "$appimage"
+chmod 755 "$appimage"
+echo "$appimage"

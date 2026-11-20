@@ -70,7 +70,8 @@ impl State {
     }
 }
 
-pub(super) fn view(s: &State, message: &Message) -> El {
+/// `width` is the most the transcript below the player may take.
+pub(super) fn view(s: &State, message: &Message, width: f32) -> El {
     let active = s.voice.as_ref().filter(|v| {
         v.message.id == message.id
             && v.message.sender == message.sender
@@ -203,7 +204,192 @@ pub(super) fn view(s: &State, message: &Message) -> El {
                 .wrap(),
         );
     }
+    if let Some(transcript) = transcript(s, message, width.max(TRANSCRIPT_WIDTH)) {
+        content = content.child(transcript);
+    }
     content
+}
+
+pub(super) const TRANSCRIPT: Icon = Icon {
+    name: "voice-transcript",
+    view: 24.0,
+    body: r#"<path d="M4 7h11M4 12h16M4 17h9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>"#,
+};
+
+pub(super) const RETRANSCRIBE: Icon = Icon {
+    name: "voice-retranscribe",
+    view: 24.0,
+    body: r#"<path d="M20 11a8 8 0 0 0-14.3-4.9L4 8M4 4v4h4M4 13a8 8 0 0 0 14.3 4.9L20 16m0 4v-4h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
+/// "Transcribe again" on a finished transcript, when enabled in Settings.
+fn retranscribe(s: &State, message: &Message) -> Option<El> {
+    if !s.snapshot.settings.transcription.retranscribe {
+        return None;
+    }
+    let target = (message.sender.clone(), message.id.clone());
+    Some(
+        el().size(22.0, 22.0)
+            .center()
+            .radius(11.0)
+            .fill(Color::WHITE.alpha(0.06))
+            .hover(Color::WHITE.alpha(0.1))
+            .role("button")
+            .label(super::locale::tr("Transcribe again"))
+            .help(super::locale::tr(
+                "Transcribe this voice message again with the selected model",
+            ))
+            .on_press(move |s: &mut State| s.request_transcripts(vec![target.clone()], true))
+            .child(icon(&RETRANSCRIBE, 12.0).color(MINT)),
+    )
+}
+
+/// Which model produced a transcript, for its caption's tooltip.
+fn produced_by(transcript: &crate::transcription::Transcript) -> Option<String> {
+    let model = crate::transcription::SpeechModel::by_name(&transcript.model)?;
+    Some(super::locale::format(
+        "Transcribed on this computer with {model}",
+        &[("model", model.title.to_owned())],
+    ))
+}
+
+/// Transcripts longer than this show their beginning with "Show more".
+const PREVIEW_CHARS: usize = 320;
+/// The voice player's own width, and the transcript's where no wider bubble is known.
+pub(super) const TRANSCRIPT_WIDTH: f32 = 290.0;
+
+/// The voice message's text below the player: pending, failed or done.
+fn transcript(s: &State, message: &Message, width: f32) -> Option<El> {
+    let current = s.transcript(message);
+    let requested = s
+        .transcript_request
+        .iter()
+        .any(|(sender, id)| *sender == message.sender && *id == message.id);
+    let engine = &s.snapshot.transcription;
+    let enabled = s.snapshot.settings.transcription.enabled && engine.status != "unsupported";
+    let unfinished = current.is_some_and(|t| !t.finished() && t.error.is_none());
+    if unfinished && !enabled {
+        return None;
+    }
+    let pending = enabled && (unfinished || (current.is_none() && requested));
+    let note = |text: String| {
+        row()
+            .gap(6.0)
+            .center_y()
+            .max_w(width)
+            .child(icon(&TRANSCRIPT, 13.0).color(MUTED))
+            .child(label(text, 11.0, MUTED).wrap())
+    };
+    if pending {
+        let text = if engine.status == "downloading" {
+            super::locale::format(
+                "Downloading speech model… {percent}%",
+                &[("percent", engine.progress.unwrap_or(0).to_string())],
+            )
+        } else {
+            super::locale::tr("Transcribing…")
+        };
+        return Some(note(text).pl(46.0).motion(rune::tok::motion::SNAPPY));
+    }
+    let t = current?;
+    let body = if t.status != "done" {
+        let target = (message.sender.clone(), message.id.clone());
+        let error = t
+            .error
+            .as_deref()
+            .unwrap_or("Could not transcribe this voice message");
+        row()
+            .gap(8.0)
+            .center_y()
+            .max_w(width)
+            .child(note(super::locale::tr(error)).shrink())
+            .child(
+                el().px(8.0)
+                    .h(22.0)
+                    .center()
+                    .radius(11.0)
+                    .fill(Color::WHITE.alpha(0.06))
+                    .role("button")
+                    .label(super::locale::tr("Try again"))
+                    .help(super::locale::tr("Transcribe this voice message again"))
+                    .on_press(move |s: &mut State| {
+                        s.request_transcripts(vec![target.clone()], false)
+                    })
+                    .child(label(super::locale::tr("Try again"), 10.0, MINT)),
+            )
+    } else if t.text.trim().is_empty() {
+        let mut line = row()
+            .gap(8.0)
+            .center_y()
+            .max_w(width)
+            .child(note(super::locale::tr("No speech detected")).shrink());
+        if let Some(help) = produced_by(t) {
+            line = line.help(help);
+        }
+        if let Some(button) = retranscribe(s, message) {
+            line = line.child(button);
+        }
+        line
+    } else {
+        let key = super::transcript_key(&message.chat, &message.sender, &message.id);
+        let open = s.transcripts_open.contains(&key);
+        let long = t.text.chars().count() > PREVIEW_CHARS;
+        let mut text = if long && !open {
+            preview(&t.text)
+        } else {
+            t.text.clone()
+        };
+        if t.partial && (open || !long) {
+            text.push(' ');
+            text.push_str(&super::locale::tr("(only the first 15 minutes)"));
+        }
+        let mut caption = row()
+            .gap(5.0)
+            .center_y()
+            .child(icon(&TRANSCRIPT, 12.0).color(MINT.alpha(0.8)))
+            .child(label(super::locale::tr("Transcript"), 10.0, MUTED));
+        if let Some(help) = produced_by(t) {
+            caption = caption.help(help);
+        }
+        let mut header = row().gap(8.0).center_y().child(caption);
+        if let Some(button) = retranscribe(s, message) {
+            header = header.child(button);
+        }
+        let mut body = col().gap(4.0).max_w(width).child(header).child(
+            label(text, 12.0, INK.alpha(0.86))
+                .wrap()
+                .selectable(true)
+                .label(super::locale::tr("Voice message transcript")),
+        );
+        if long {
+            let caption = if open { "Show less" } else { "Show more" };
+            body = body.child(
+                label(super::locale::tr(caption), 11.0, MINT)
+                    .role("button")
+                    .label(super::locale::tr(caption))
+                    .on_press(move |s: &mut State| {
+                        if !s.transcripts_open.remove(&key) {
+                            s.transcripts_open.insert(key.clone());
+                        }
+                    }),
+            );
+        }
+        body
+    };
+    Some(col().pt(2.0).child(body).motion(rune::tok::motion::SNAPPY))
+}
+
+/// The beginning of a long transcript, cut at a word boundary.
+fn preview(text: &str) -> String {
+    let cut: String = text.chars().take(PREVIEW_CHARS).collect();
+    let cut = match cut.rfind(char::is_whitespace) {
+        Some(index) if index > PREVIEW_CHARS / 2 => &cut[..index],
+        _ => cut.as_str(),
+    };
+    format!(
+        "{}…",
+        cut.trim_end_matches(|c: char| c.is_whitespace() || c == ',' || c == '.')
+    )
 }
 
 fn clock(seconds: f64) -> String {

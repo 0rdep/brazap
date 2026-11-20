@@ -178,6 +178,9 @@ fn run() -> Result<()> {
                 }
             }
         }
+        // Wayland matches windows to packaging/linux/brazap.desktop by this ID.
+        #[cfg(target_os = "linux")]
+        rune::set_app_id("brazap");
         brazap::ui::run(config, initial_chat)
     }
     #[cfg(not(feature = "desktop"))]

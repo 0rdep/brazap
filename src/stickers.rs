@@ -47,6 +47,12 @@ struct Stored {
     id: String,
 }
 #[derive(QueryableByName)]
+struct RowKey {
+    #[diesel(sql_type=BigInt)]
+    cursor: i64,
+}
+
+#[derive(QueryableByName)]
 struct Source {
     #[diesel(sql_type=Binary)]
     encoded: Vec<u8>,
@@ -96,13 +102,21 @@ impl Archive {
             return Ok(());
         }
         let account = self.account as i64;
-        self.backend.shared().run(move |conn| {
-            let rows: Vec<Source> = diesel::sql_query("SELECT encoded,payload FROM brazap_messages WHERE account=? AND json_extract(payload,'$.kind')='sticker' ORDER BY timestamp")
+        self.sql().run(move |conn| {
+            // Order only the row ids, then read the protobufs a page at a time,
+            // so neither SQLite's sorter nor this Vec holds every sticker body.
+            let keys: Vec<RowKey> = diesel::sql_query("SELECT rowid AS cursor FROM brazap_messages WHERE account=? AND json_extract(payload,'$.kind')='sticker' ORDER BY timestamp,rowid")
                 .bind::<BigInt,_>(account).load(conn).map_err(db_error)?;
             conn.transaction::<_,diesel::result::Error,_>(|conn| {
-                for row in rows {
-                    let message: Message = serde_json::from_str(&row.payload).map_err(|e|diesel::result::Error::DeserializationError(Box::new(e)))?;
-                    index(conn,account,&message,&row.encoded)?;
+                for page in keys.chunks(128) {
+                    let ids = serde_json::to_string(&page.iter().map(|key| key.cursor).collect::<Vec<_>>())
+                        .map_err(|e| diesel::result::Error::SerializationError(Box::new(e)))?;
+                    let rows: Vec<Source> = diesel::sql_query("SELECT m.encoded,m.payload FROM json_each(?) j JOIN brazap_messages m ON m.rowid=j.value ORDER BY j.key")
+                        .bind::<Text,_>(ids).load(conn)?;
+                    for row in rows {
+                        let message: Message = serde_json::from_str(&row.payload).map_err(|e|diesel::result::Error::DeserializationError(Box::new(e)))?;
+                        index(conn,account,&message,&row.encoded)?;
+                    }
                 }
                 Ok(())
             }).map_err(db_error)
@@ -139,7 +153,7 @@ impl Archive {
             i64::from(action.is_favorite == Some(true)),
             event.timestamp.timestamp(),
         );
-        self.backend.shared().run(move |conn| {
+        self.sql().run(move |conn| {
             diesel::sql_query("INSERT INTO brazap_stickers(account,hash,encoded,favorite,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(account,hash) DO UPDATE SET favorite=excluded.favorite,encoded=CASE WHEN ?=1 AND excluded.updated_at>=brazap_stickers.updated_at THEN excluded.encoded ELSE brazap_stickers.encoded END,updated_at=MAX(brazap_stickers.updated_at,excluded.updated_at)")
                 .bind::<BigInt,_>(account).bind::<Text,_>(hash).bind::<Binary,_>(encoded).bind::<BigInt,_>(favorite).bind::<BigInt,_>(at).bind::<BigInt,_>(has_media).execute(conn).map_err(db_error)?;
             Ok(())
@@ -149,7 +163,7 @@ impl Archive {
 
     async fn stored_sticker(&self, hash: String) -> Result<Stored> {
         let account = self.account as i64;
-        Ok(self.backend.shared().read(move|conn|diesel::sql_query("SELECT encoded,data,from_me,chat,sender,id FROM brazap_stickers WHERE account=? AND hash=?")
+        Ok(self.sql().read(move|conn|diesel::sql_query("SELECT encoded,data,from_me,chat,sender,id FROM brazap_stickers WHERE account=? AND hash=?")
             .bind::<BigInt,_>(account).bind::<Text,_>(hash).get_result(conn).map_err(db_error)).await?)
     }
 }
@@ -172,7 +186,7 @@ impl Service {
         }
         let account = self.archive.account as i64;
         let identities = self.archive.identities().await?;
-        let stickers:Vec<Sticker>=self.archive.backend.shared().read(move|conn|diesel::sql_query("SELECT chat,hash,label,emojis,favorite,recent_at FROM brazap_stickers WHERE account=? ORDER BY MAX(recent_at,updated_at) DESC LIMIT 2000")
+        let stickers:Vec<Sticker>=self.archive.sql().read(move|conn|diesel::sql_query("SELECT chat,hash,label,emojis,favorite,recent_at FROM brazap_stickers WHERE account=? ORDER BY MAX(recent_at,updated_at) DESC LIMIT 2000")
             .bind::<BigInt,_>(account).load(conn).map_err(db_error)).await?;
         Ok(stickers
             .into_iter()
@@ -221,8 +235,7 @@ impl Service {
         };
         let (account, data) = (self.archive.account as i64, bytes.clone());
         self.archive
-            .backend
-            .shared()
+            .sql()
             .run(move |conn| {
                 diesel::sql_query("UPDATE brazap_stickers SET data=? WHERE account=? AND hash=?")
                     .bind::<Binary, _>(data)
@@ -367,7 +380,7 @@ impl Service {
     ) -> Result<()> {
         let account = self.archive.account as i64;
         let now = crate::model::now();
-        self.archive.backend.shared().run(move |conn| {
+        self.archive.sql().run(move |conn| {
             diesel::sql_query("INSERT INTO brazap_stickers(account,hash,encoded,favorite,updated_at,chat,sender,id,data) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(account,hash) DO UPDATE SET favorite=excluded.favorite,updated_at=MAX(brazap_stickers.updated_at,excluded.updated_at),data=COALESCE(excluded.data,brazap_stickers.data),chat=CASE WHEN brazap_stickers.chat='' THEN excluded.chat ELSE brazap_stickers.chat END,sender=CASE WHEN brazap_stickers.chat='' THEN excluded.sender ELSE brazap_stickers.sender END,id=CASE WHEN brazap_stickers.chat='' THEN excluded.id ELSE brazap_stickers.id END")
                 .bind::<BigInt,_>(account).bind::<Text,_>(hash).bind::<Binary,_>(encoded).bind::<BigInt,_>(i64::from(favorite)).bind::<BigInt,_>(now)
                 .bind::<Text,_>(chat).bind::<Text,_>(sender).bind::<Text,_>(id).bind::<Nullable<Binary>,_>(data)
@@ -387,8 +400,7 @@ impl Service {
         }
         let rows: Vec<Row> = self
             .archive
-            .backend
-            .shared()
+            .sql()
             .read(move |conn| {
                 diesel::sql_query("SELECT hash FROM brazap_stickers WHERE account=? AND favorite=1")
                     .bind::<BigInt, _>(account)

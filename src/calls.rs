@@ -7,7 +7,10 @@ use diesel::{
 };
 use whatsapp_rust::{prelude::wa, waproto::buffa::Message as ProtoMessage};
 
-use crate::{model::Call, storage::Archive};
+use crate::{
+    model::{Call, Message, MessageCursor},
+    storage::Archive,
+};
 
 fn db_error(error: diesel::result::Error) -> whatsapp_rust::store::error::StoreError {
     whatsapp_rust::store::error::StoreError::Database(Box::new(error))
@@ -49,6 +52,83 @@ struct CallMessageRow {
     metadata: String,
 }
 
+pub(crate) const CALL_LOG_PREFIX: &str = "call-log:";
+
+#[derive(QueryableByName)]
+pub(crate) struct TimelineCall {
+    #[diesel(sql_type=BigInt)]
+    timestamp: i64,
+    #[diesel(sql_type=Text)]
+    sender: String,
+    #[diesel(sql_type=Text)]
+    payload: String,
+}
+
+impl TimelineCall {
+    pub(crate) fn message(self) -> Result<Message> {
+        let call: Call = serde_json::from_str(&self.payload)?;
+        let from_me = call.from_me == Some(true);
+        let (kind, label) = if call.video {
+            ("video_call", "Video call")
+        } else {
+            ("voice_call", "Voice call")
+        };
+        let outcome = match call.outcome.trim_start_matches("result_") {
+            "missed" if from_me => "Unanswered",
+            "missed" => "Missed",
+            "rejected" | "declined" => "Declined",
+            "cancelled" | "abandoned" => "cancelled",
+            "acceptedelsewhere" | "accepted_elsewhere" => "Answered on another device",
+            "unavailable" => "Unavailable",
+            "failed" | "invalid" => "Failed",
+            "ongoing" => "Ongoing",
+            "connected" | "completed" => "completed",
+            _ => "",
+        };
+        Ok(Message {
+            id: format!("{CALL_LOG_PREFIX}{}", call.id),
+            chat: call.peer,
+            sender: self.sender,
+            from_me,
+            timestamp: self.timestamp,
+            text: label.into(),
+            kind: kind.into(),
+            footer: outcome.into(),
+            duration_seconds: call
+                .duration
+                .and_then(|seconds| u32::try_from(seconds).ok()),
+            ..Default::default()
+        })
+    }
+}
+
+pub(crate) fn timeline_calls(
+    conn: &mut SqliteConnection,
+    account: i64,
+    aliases: &str,
+    cursor: &MessageCursor,
+    limit: usize,
+    newer: bool,
+) -> diesel::QueryResult<Vec<TimelineCall>> {
+    let (timestamp_bound, cursor_bound, order) = if newer {
+        (">=", ">", "ASC")
+    } else {
+        ("<=", "<", "DESC")
+    };
+    let query = include_str!("../queries/call_timeline.sql")
+        .replace("{timestamp_bound}", timestamp_bound)
+        .replace("{cursor_bound}", cursor_bound)
+        .replace("{order}", order);
+    diesel::sql_query(query)
+        .bind::<Text, _>(aliases)
+        .bind::<BigInt, _>(account)
+        .bind::<BigInt, _>(cursor.timestamp)
+        .bind::<Text, _>(&cursor.id)
+        .bind::<Text, _>(&cursor.sender)
+        .bind::<BigInt, _>(limit as i64)
+        .load(conn)
+}
+
 fn canonical(jid: &str) -> String {
     jid.parse::<whatsapp_rust::Jid>()
         .map(|jid| jid.to_non_ad().to_string())
@@ -64,8 +144,8 @@ impl Archive {
         let mut cursor = 0i64;
         loop {
             let account = self.account as i64;
-            let rows: Vec<CallMessageRow> = self.backend.shared().read(move |conn| {
-                diesel::sql_query("SELECT rowid AS cursor,payload,encoded,metadata FROM brazap_messages WHERE account=? AND rowid>? AND json_extract(payload,'$.kind') IN ('unsupported','text','placeholder','protocol') ORDER BY rowid LIMIT 256")
+            let rows: Vec<CallMessageRow> = self.sql().read(move |conn| {
+                diesel::sql_query("SELECT rowid AS cursor,payload,encoded,metadata FROM brazap_messages WHERE +account=? AND rowid>? AND json_extract(payload,'$.kind') IN ('unsupported','text','placeholder','protocol') ORDER BY rowid LIMIT 256")
                     .bind::<BigInt,_>(account).bind::<BigInt,_>(cursor).load(conn).map_err(db_error)
             }).await?;
             let Some(last) = rows.last() else {
@@ -82,7 +162,7 @@ impl Archive {
                     updates.push((row.cursor, crate::storage::message_payload(&view)?, view));
                 }
             }
-            self.backend.shared().run(move |conn| {
+            self.sql().run(move |conn| {
                 conn.transaction::<_,diesel::result::Error,_>(|conn| {
                     for (rowid, payload, view) in updates {
                         let search = crate::storage::searchable(&view);
@@ -119,7 +199,7 @@ impl Archive {
 
     pub async fn calls(&self) -> Result<Vec<Call>> {
         let account = self.account as i64;
-        let rows:Vec<CallRow>=self.backend.shared().read(move |conn| {
+        let rows:Vec<CallRow>=self.sql().read(move |conn| {
             diesel::sql_query("SELECT b.payload,COALESCE(NULLIF(n.name,''),NULLIF(c.name,''),'') AS name,COALESCE(l.phone_number,'') AS phone,COALESCE(a.updated_at,0) AS photo_version FROM brazap_calls b LEFT JOIN brazap_chats c ON c.account=b.account AND c.jid=b.peer LEFT JOIN brazap_contacts n ON n.account=b.account AND n.jid=b.peer LEFT JOIN lid_pn_mapping l ON l.device_id=b.account AND b.peer LIKE '%@lid' AND (l.lid=b.peer OR l.lid=substr(b.peer,1,instr(b.peer,'@')-1)) LEFT JOIN brazap_assets a ON a.account=b.account AND a.key='avatar:'||b.peer WHERE b.account=? ORDER BY b.timestamp DESC,b.id DESC LIMIT 500")
                 .bind::<BigInt,_>(account).load(conn).map_err(db_error)
         }).await?;
@@ -144,7 +224,7 @@ impl Archive {
         let id = call.id.clone();
         let ended = i64::from(call.ended());
         let payload = serde_json::to_string(call)?;
-        self.backend.shared().run(move |conn| {
+        self.sql().run(move |conn| {
             diesel::sql_query("INSERT INTO brazap_call_sessions(account,id,ended,payload) VALUES(?,?,?,?) ON CONFLICT(account,id) DO UPDATE SET ended=excluded.ended,payload=excluded.payload")
                 .bind::<BigInt,_>(account).bind::<Text,_>(id).bind::<BigInt,_>(ended).bind::<Text,_>(payload).execute(conn).map_err(db_error)?;
             Ok(())
@@ -160,8 +240,7 @@ impl Archive {
         }
         let account = self.account as i64;
         let rows: Vec<Row> = self
-            .backend
-            .shared()
+            .sql()
             .read(move |conn| {
                 diesel::sql_query(
                     "SELECT payload FROM brazap_call_sessions WHERE account=? AND ended=0",
@@ -241,7 +320,7 @@ impl Archive {
         let record = record.encode_to_vec();
         let payload = serde_json::to_string(&value)?;
         let account = self.account as i64;
-        self.backend.shared().run(move |conn| {
+        self.sql().run(move |conn| {
             diesel::sql_query("INSERT INTO brazap_calls(account,creator,id,peer,timestamp,payload,record) VALUES(?,?,?,?,?,?,?) ON CONFLICT(account,creator,id) DO UPDATE SET peer=excluded.peer,timestamp=excluded.timestamp,payload=excluded.payload,record=excluded.record")
                 .bind::<BigInt,_>(account).bind::<Text,_>(creator).bind::<Text,_>(id).bind::<Text,_>(value.peer)
                 .bind::<Nullable<BigInt>,_>(value.timestamp).bind::<Text,_>(payload).bind::<Binary,_>(record).execute(conn).map_err(db_error)?;
@@ -261,7 +340,9 @@ impl Archive {
             .or_else(|| record.call_creator_jid.clone())
             .unwrap_or_default();
         let creator = canonical(&creator);
+        // WhatsApp's own direction wins over guessing from the creator.
         let from_me = from_me
+            .or(record.is_incoming.map(|incoming| !incoming))
             .or_else(|| (!own.is_empty() && !creator.is_empty()).then(|| own.contains(&creator)));
         let id = record
             .call_id
@@ -298,8 +379,8 @@ impl Archive {
         let payload = serde_json::to_string(&call)?;
         let bytes = record.encode_to_vec();
         let account = self.account as i64;
-        self.backend.shared().run(move |conn| {
-            diesel::sql_query("INSERT INTO brazap_calls(account,creator,id,peer,timestamp,payload,record) VALUES(?,?,?,?,?,?,?) ON CONFLICT(account,creator,id) DO UPDATE SET peer=CASE WHEN excluded.peer!='' THEN excluded.peer ELSE brazap_calls.peer END,timestamp=COALESCE(excluded.timestamp,brazap_calls.timestamp),payload=json_set(excluded.payload,'$.peer',COALESCE(NULLIF(excluded.peer,''),brazap_calls.peer),'$.from_me',json(CASE COALESCE(json_extract(excluded.payload,'$.from_me'),json_extract(brazap_calls.payload,'$.from_me')) WHEN 1 THEN 'true' WHEN 0 THEN 'false' ELSE 'null' END)),record=excluded.record")
+        self.sql().run(move |conn| {
+            diesel::sql_query("INSERT INTO brazap_calls(account,creator,id,peer,timestamp,payload,record) VALUES(?,?,?,?,?,?,?) ON CONFLICT(account,creator,id) DO UPDATE SET peer=CASE WHEN excluded.peer!='' THEN excluded.peer ELSE brazap_calls.peer END,timestamp=COALESCE(excluded.timestamp,brazap_calls.timestamp),payload=json_set(excluded.payload,'$.peer',COALESCE(NULLIF(excluded.peer,''),brazap_calls.peer),'$.timestamp',COALESCE(excluded.timestamp,brazap_calls.timestamp),'$.duration',COALESCE(json_extract(excluded.payload,'$.duration'),json_extract(brazap_calls.payload,'$.duration')),'$.outcome',COALESCE(NULLIF(json_extract(excluded.payload,'$.outcome'),'unknown'),json_extract(brazap_calls.payload,'$.outcome')),'$.from_me',json(CASE COALESCE(json_extract(excluded.payload,'$.from_me'),json_extract(brazap_calls.payload,'$.from_me')) WHEN 1 THEN 'true' WHEN 0 THEN 'false' ELSE 'null' END)),record=excluded.record")
                 .bind::<BigInt,_>(account).bind::<Text,_>(creator).bind::<Text,_>(id).bind::<Text,_>(call.peer)
                 .bind::<Nullable<BigInt>,_>(call.timestamp).bind::<Text,_>(payload).bind::<Binary,_>(bytes).execute(conn).map_err(db_error)?;
             Ok(())
@@ -310,8 +391,7 @@ impl Archive {
     pub async fn preference(&self, key: String) -> Result<Option<String>> {
         let account = self.account as i64;
         let row: Option<ValueRow> = self
-            .backend
-            .shared()
+            .sql()
             .read(move |conn| {
                 diesel::sql_query("SELECT value FROM brazap_preferences WHERE account=? AND key=?")
                     .bind::<BigInt, _>(account)
@@ -326,7 +406,7 @@ impl Archive {
 
     pub async fn set_preference(&self, key: String, value: String) -> Result<()> {
         let account = self.account as i64;
-        self.backend.shared().run(move |conn| {
+        self.sql().run(move |conn| {
             diesel::sql_query("INSERT INTO brazap_preferences(account,key,value) VALUES(?,?,?) ON CONFLICT(account,key) DO UPDATE SET value=excluded.value")
                 .bind::<BigInt,_>(account).bind::<Text,_>(key).bind::<Text,_>(value).execute(conn).map_err(db_error)?;
             Ok(())
@@ -342,8 +422,8 @@ impl Archive {
         let mut cursor = 0i64;
         loop {
             let account = self.account as i64;
-            let row:Option<HistoryRow>=self.backend.shared().read(move |conn| {
-                diesel::sql_query("SELECT rowid AS cursor,data FROM brazap_history WHERE account=? AND stage=1 AND rowid>? ORDER BY rowid LIMIT 1")
+            let row:Option<HistoryRow>=self.sql().read(move |conn| {
+                diesel::sql_query("SELECT rowid AS cursor,data FROM brazap_history WHERE +account=? AND stage=1 AND rowid>? ORDER BY rowid LIMIT 1")
                     .bind::<BigInt,_>(account).bind::<BigInt,_>(cursor).get_result(conn).optional().map_err(db_error)
             }).await?;
             let Some(row) = row else {

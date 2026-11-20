@@ -198,9 +198,28 @@ fn preview(frame: &RgbImage, target: &Mutex<PreviewFrame>) -> Result<()> {
     Ok(())
 }
 
+/// AVFoundation delivers decoded frames: asking its video output for JPEG is an
+/// invalid pixel format there and raises an Objective-C exception, which aborts
+/// the process. macOS captures YUYV (`yuvs`), which nokhwa converts itself.
+#[cfg(target_os = "macos")]
+const CAPTURE_FORMAT: FrameFormat = FrameFormat::YUYV;
+#[cfg(not(target_os = "macos"))]
+const CAPTURE_FORMAT: FrameFormat = FrameFormat::MJPEG;
+
+/// Stops and drops a camera. nokhwa's AVFoundation delegate holds an uncounted
+/// pointer to the frame channel and releases it when a late frame finds the
+/// receiver gone, so on macOS the device stays alive until in-flight frame
+/// callbacks have drained.
+fn release_camera(mut camera: Camera) {
+    let _ = camera.stop_stream();
+    #[cfg(target_os = "macos")]
+    std::thread::sleep(Duration::from_millis(500));
+    drop(camera);
+}
+
 fn open_camera() -> Result<Camera> {
     let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
-        CameraFormat::new(Resolution::new(640, 480), FrameFormat::MJPEG, 30),
+        CameraFormat::new(Resolution::new(640, 480), CAPTURE_FORMAT, 30),
     ));
     let mut camera = Camera::new(CameraIndex::Index(0), format).or_else(|_| {
         Camera::new(
@@ -210,7 +229,11 @@ fn open_camera() -> Result<Camera> {
     })?;
     let mut formats = camera.compatible_camera_formats()?;
     formats.retain(|f| {
-        f.width() <= 1280 && f.height() <= 720 && f.frame_rate() >= FPS && f.frame_rate() <= 30
+        f.width() <= 1280
+            && f.height() <= 720
+            && f.frame_rate() >= FPS
+            && f.frame_rate() <= 30
+            && (cfg!(not(target_os = "macos")) || f.format() == FrameFormat::YUYV)
     });
     formats.sort_by_key(|f| {
         (
@@ -227,7 +250,10 @@ fn open_camera() -> Result<Camera> {
             RequestedFormatType::Exact(*format),
         ))?;
     }
-    camera.open_stream()?;
+    if let Err(error) = camera.open_stream() {
+        release_camera(camera);
+        return Err(error.into());
+    }
     Ok(camera)
 }
 
@@ -289,8 +315,9 @@ fn capture_frames(
                 Ok(frame) => Some(frame),
                 Err(error) => {
                     log::warn!("Camera capture stopped; using black video: {error:#}");
-                    let _ = device.stop_stream();
-                    camera = None;
+                    if let Some(device) = camera.take() {
+                        release_camera(device);
+                    }
                     *control.local.lock().unwrap_or_else(|e| e.into_inner()) =
                         PreviewFrame::default();
                     control.black.store(true, Ordering::Release);
@@ -362,8 +389,8 @@ fn capture_frames(
             std::thread::sleep(delay);
         }
     }
-    if let Some(camera) = camera.as_mut() {
-        let _ = camera.stop_stream();
+    if let Some(camera) = camera {
+        release_camera(camera);
     }
     Ok(())
 }
@@ -371,6 +398,7 @@ fn capture_frames(
 fn decode_frames(control: &Control, receive: Receiver<VideoFrame>) -> Result<()> {
     let mut decoder = Decoder::new()?;
     let mut last_preview = Instant::now() - Duration::from_secs(1);
+    let mut orientation = None;
     while !control.stop.load(Ordering::Acquire) {
         let frame = match receive.try_recv() {
             Ok(f) => f,
@@ -403,6 +431,15 @@ fn decode_frames(control: &Control, receive: Receiver<VideoFrame>) -> Result<()>
         decoded.write_rgb8(&mut rgb);
         let rgb =
             RgbImage::from_raw(w as u32, h as u32, rgb).context("Invalid call video dimensions")?;
+        if orientation != Some((frame.orientation, w, h)) {
+            // Kept in the log at the default level: rotation reports need it.
+            log::warn!(
+                "Peer video: {w}x{h}, orientation {} (keyframe {})",
+                frame.orientation,
+                frame.keyframe
+            );
+            orientation = Some((frame.orientation, w, h));
+        }
         let rgb = match frame.orientation % 4 {
             1 => imageops::rotate90(&rgb),
             2 => imageops::rotate180(&rgb),

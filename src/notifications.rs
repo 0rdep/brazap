@@ -214,7 +214,7 @@ impl Service {
             message.sender.clone(),
             message.id.clone(),
         );
-        let rows = self.archive.backend.shared().run(move |conn| {
+        let rows = self.archive.sql().run(move |conn| {
             conn.transaction::<_, diesel::result::Error, _>(|conn| {
                 let inserted = diesel::sql_query("INSERT OR IGNORE INTO brazap_notification_deliveries(account,chat,sender,id) SELECT ?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM brazap_notification_deliveries WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND id=?)")
                     .bind::<BigInt,_>(account).bind::<Text,_>(&delivery_chat).bind::<Text,_>(&delivery_sender).bind::<Text,_>(&id)

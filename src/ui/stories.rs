@@ -37,9 +37,6 @@ fn author(s: &State, sender: &str) -> String {
 fn authors(s: &State) -> Vec<StatusUpdate> {
     let mut rows: Vec<StatusUpdate> = Vec::new();
     for update in &s.snapshot.statuses {
-        if update.message.timestamp <= crate::model::now() - 86400 {
-            continue;
-        }
         let key = author(s, &update.message.sender);
         if let Some(row) = rows
             .iter_mut()
@@ -82,7 +79,14 @@ impl State {
             .filter(|s| author(self, &s.message.sender) == key)
             .cloned()
             .collect();
-        let index = queue.iter().position(|s| !s.viewed).unwrap_or(0);
+        // Statuses are kept past WhatsApp's expiry, so with nothing unseen start
+        // at the last day's updates (or the newest one) instead of the oldest kept.
+        let recent = crate::model::now() - 86400;
+        let index = queue
+            .iter()
+            .position(|s| !s.viewed)
+            .or_else(|| queue.iter().position(|s| s.message.timestamp > recent))
+            .unwrap_or(queue.len().saturating_sub(1));
         for person in authors(self) {
             let other = author(self, &person.message.sender);
             if other != key && !person.viewed {
@@ -173,7 +177,7 @@ impl State {
             return;
         }
         let m = &story.queue[story.index].message;
-        if m.from_me {
+        if m.from_me || m.deleted_at.is_some() {
             return;
         }
         if let Some(text) = quick {
@@ -291,7 +295,7 @@ pub(super) fn list(s: &State) -> El {
     let rows = authors(s);
     if rows.is_empty() {
         return list.child(
-            label(super::locale::tr("No recent status updates"), 13.0, MUTED)
+            label(super::locale::tr("No status updates yet"), 13.0, MUTED)
                 .wrap()
                 .padding(12.0),
         );
@@ -339,11 +343,245 @@ pub(super) fn list(s: &State) -> El {
     list
 }
 
-pub(super) fn empty() -> El {
-    col().w_full().h_full().center().gap(18.0)
-        .child(icon(&STATUS,56.0).color(MINT))
-        .child(title(super::locale::tr("Status"),24.0))
-        .child(label(super::locale::tr("Select a status to view photos, videos, and updates. Statuses disappear after 24 hours."),14.0,MUTED).max_w(360.0).wrap().center())
+/// The status pane: every kept status update as a group conversation, oldest
+/// first, each with its author, content and time.
+pub(super) fn feed(s: &State) -> El {
+    let count = s.snapshot.statuses.len();
+    let unseen = s
+        .snapshot
+        .statuses
+        .iter()
+        .filter(|u| !u.viewed && !u.message.from_me)
+        .count();
+    let header = row()
+        .w_full()
+        .h(76.0)
+        .px(24.0)
+        .gap(12.0)
+        .center_y()
+        .border(1.0, BORDER)
+        .child(
+            el().size(39.0, 39.0)
+                .radius(12.0)
+                .fill(MINT.alpha(0.10))
+                .border(1.0, MINT.alpha(0.08))
+                .center()
+                .child(icon(&STATUS, 22.0).color(MINT)),
+        )
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(4.0)
+                .child(title(super::locale::tr("Status"), 16.0).truncate())
+                .child(label(
+                    if unseen > 0 {
+                        super::locale::format(
+                            "{count} unseen updates",
+                            &[("count", unseen.to_string())],
+                        )
+                    } else {
+                        super::locale::tr("Updates from your contacts")
+                    },
+                    11.0,
+                    MUTED,
+                )),
+        );
+    let body = if count == 0 {
+        col()
+            .grow(1.0)
+            .min_h(0.0)
+            .w_full()
+            .center()
+            .gap(18.0)
+            .child(icon(&STATUS, 56.0).color(MINT))
+            .child(label(
+                super::locale::tr("No status updates yet"),
+                14.0,
+                MUTED,
+            ))
+    } else {
+        col()
+            .key("status-feed")
+            .instant_changes()
+            .grow(1.0)
+            .min_h(0.0)
+            .w_full()
+            .scroll(rune::ScrollSpec { stick_bottom: true })
+            .scroll_anchor()
+            .child(
+                col()
+                    .key("status-feed-rows")
+                    .instant_changes()
+                    .w_full()
+                    .px(24.0)
+                    .py(16.0)
+                    .growth(rune::GrowthSpec::default())
+                    .virtual_rows(
+                        count,
+                        124.0,
+                        |s: &State, i| {
+                            let m = &s.snapshot.statuses[i].message;
+                            format!("status-{}-{}", m.sender, m.id).into()
+                        },
+                        |s: &State, i| feed_row(s, i),
+                    )
+                    .on_visible_rows(|s: &mut State, range| {
+                        s.request_status_media(range);
+                        false
+                    }),
+            )
+    };
+    col()
+        .grow(1.0)
+        .min_w(0.0)
+        .w_full()
+        .h_full()
+        .on_layout(|s: &mut State, bounds| s.chat_bounds = bounds)
+        .child(header)
+        .child(body)
+}
+
+impl State {
+    fn request_status_media(&mut self, range: std::ops::Range<usize>) {
+        let visible: Vec<Message> = self
+            .snapshot
+            .statuses
+            .get(range.start.saturating_sub(2)..(range.end + 2).min(self.snapshot.statuses.len()))
+            .unwrap_or_default()
+            .iter()
+            .map(|u| u.message.clone())
+            .collect();
+        for m in visible {
+            self.request_avatar(&m.sender, m.sender_photo_version);
+            self.request_thumbnail(&m);
+        }
+        self.update_animations();
+    }
+}
+
+fn feed_row(s: &State, index: usize) -> El {
+    let statuses = &s.snapshot.statuses;
+    let update = &statuses[index];
+    let m = &update.message;
+    let mut row = col().w_full().pb(14.0).gap(12.0);
+    if index == 0
+        || super::times::day(m.timestamp)
+            != super::times::day(statuses[index - 1].message.timestamp)
+    {
+        row = row.child(row_day(m.timestamp));
+    }
+    row.child(feed_bubble(s, update))
+}
+
+fn feed_bubble(s: &State, update: &StatusUpdate) -> El {
+    let m = &update.message;
+    let mine = m.from_me;
+    let width =
+        (s.chat_bounds[2] - 48.0 - 113.0 - if mine { 0.0 } else { 39.0 }).clamp(120.0, 480.0);
+    let name = if mine {
+        super::locale::tr("My status")
+    } else {
+        m.sender_name.clone()
+    };
+    let (sender, id) = (m.sender.clone(), m.id.clone());
+    let mut bubble = col()
+        .key(format!("status-bubble-{}-{}", m.sender, m.id))
+        .max_w(width)
+        .padding(13.0)
+        .gap(8.0)
+        .radius(15.0)
+        .fill(if mine {
+            MINT.alpha(0.135)
+        } else {
+            Color::WHITE.alpha(0.045)
+        })
+        .border(1.0, if mine { MINT.alpha(0.14) } else { BORDER })
+        .hover(if mine {
+            MINT.alpha(0.17)
+        } else {
+            Color::WHITE.alpha(0.07)
+        })
+        .role("button")
+        .label(super::locale::format(
+            "View status from {name}",
+            &[("name", name.clone())],
+        ))
+        .help(super::locale::tr("Open in the status viewer"))
+        .on_press(move |s: &mut State| s.open_quoted_status(&sender, &id))
+        .instant_changes();
+    if !mine {
+        let mut heading = row()
+            .gap(6.0)
+            .center_y()
+            .child(label(name.clone(), 10.0, MINT).truncate());
+        if !update.viewed {
+            heading = heading.child(
+                el().size(6.0, 6.0)
+                    .radius(3.0)
+                    .fill(MINT)
+                    .help(super::locale::tr("Not viewed yet")),
+            );
+        }
+        bubble = bubble.child(heading);
+    }
+    if let Some(at) = m.deleted_at {
+        bubble = bubble.child(
+            label(super::times::deleted_label(m.timestamp, at), 10.0, MUTED)
+                .help(super::times::day_label(at)),
+        );
+    }
+    match m.kind.as_str() {
+        "image" | "video" => {
+            bubble = bubble.child(media::thumbnail(s, m));
+            if !m.text.is_empty() {
+                bubble = bubble.child(super::links::message_text(m, 14.0));
+            }
+        }
+        "audio" => {
+            bubble = bubble.child(super::audio::view(s, m, width - 26.0));
+        }
+        _ => {
+            let mut text = col()
+                .w_full()
+                .min_w(180.0)
+                .padding(18.0)
+                .radius(10.0)
+                .center()
+                .child(super::links::text(&m.text, 16.0).center());
+            text = match m.background_argb {
+                Some(argb) => text.fill(Color {
+                    r: story_channel((argb >> 16) & 255),
+                    g: story_channel((argb >> 8) & 255),
+                    b: story_channel(argb & 255),
+                    a: 1.0,
+                }),
+                None => text.fill(Color::WHITE.alpha(0.04)),
+            };
+            bubble = bubble.child(text);
+        }
+    }
+    bubble =
+        bubble.child(row().gap(6.0).center_y().child(el().grow(1.0)).child(
+            label(clock(m.timestamp), 9.0, MUTED).help(super::times::day_label(m.timestamp)),
+        ));
+    let mut line = row().w_full().gap(9.0).center_y();
+    if mine {
+        line = line.child(el().grow(1.0));
+    } else {
+        line = line.child(el().self_start().mt(2.0).child(media::avatar(
+            s,
+            &m.sender,
+            &name,
+            m.sender_photo_version,
+            30.0,
+        )));
+    }
+    line = line.child(bubble);
+    if !mine {
+        line = line.child(el().grow(1.0));
+    }
+    line
 }
 
 fn image_key(m: &Message) -> String {
@@ -360,10 +598,6 @@ pub(super) fn poll(s: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
         return false;
     };
     let m = story.queue[story.index].message.clone();
-    if m.timestamp <= crate::model::now() - 86400 {
-        s.step_story(true);
-        return true;
-    }
     // A contact locked since opening must disappear from the active viewer too.
     if !s
         .snapshot
@@ -551,7 +785,7 @@ pub(super) fn viewer(s: &State) -> Option<El> {
             };
         }
         "audio" => {
-            display = display.child(super::audio::view(s, m));
+            display = display.child(super::audio::view(s, m, super::audio::TRANSCRIPT_WIDTH));
         }
         _ => {
             if let Some(argb) = m.background_argb {
@@ -624,7 +858,14 @@ pub(super) fn viewer(s: &State) -> Option<El> {
     if let Some(error) = error {
         card = card.child(label(super::locale::tr(error), 12.0, MUTED).wrap());
     }
-    if !m.from_me {
+    if let Some(at) = m.deleted_at {
+        card = card.child(label(
+            super::times::deleted_label(m.timestamp, at),
+            12.0,
+            MUTED,
+        ));
+    }
+    if !m.from_me && m.deleted_at.is_none() {
         let enabled =
             s.snapshot.connection.phase == crate::model::Phase::Connected && !story.replying;
         let edit = rune::text_input(&story.reply, super::locale::style(13.0, 450.0))

@@ -37,7 +37,7 @@ pub(super) fn view(s: &State, mut body: El) -> El {
     if !enabled {
         return body.child(label(super::locale::tr("The MCP server is off. Agents cannot connect and no tools are offered until you turn it on."), 12.0, MUTED).wrap());
     }
-    let executable = std::env::current_exe().unwrap_or_else(|_| "brazap".into());
+    let executable = crate::updates::launcher();
     let config = serde_json::to_string_pretty(&json!({
         "mcpServers": { "brazap": {
             "command": executable,

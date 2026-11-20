@@ -159,6 +159,38 @@ pub struct Message {
     /// The sticker's file hash, which identifies it in My stickers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sticker_hash: Option<String>,
+    /// Local speech-to-text of a voice message, filled when messages are read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<crate::transcription::Transcript>,
+    /// The sender edited the text or caption; `text` is the latest version.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub edited: bool,
+    /// When the latest edit was made (Unix seconds), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_at: Option<i64>,
+    /// The edit a MESSAGE_EDIT protocol message carries for another message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_update: Option<EditUpdate>,
+    /// For `kind == "view_once"`: the hidden media, `image`, `video` or `audio`, or
+    /// empty when WhatsApp only delivered a placeholder. Its bytes are never kept or shown.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub view_once: String,
+}
+
+/// New text for an earlier message. Only its author can edit it, so the
+/// target's sender is the edit's own sender.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EditUpdate {
+    pub target_id: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<Mention>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_preview: Option<LinkPreview>,
+    /// The editor's clock when editing (milliseconds), which orders edits
+    /// made within the same second.
+    #[serde(default)]
+    pub timestamp_ms: i64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -268,6 +300,9 @@ pub struct VoiceUpload {
     pub waveform: Vec<u8>,
     #[serde(default)]
     pub reply_to: Option<MessageCursor>,
+    /// Send as a view-once voice message.
+    #[serde(default)]
+    pub view_once: bool,
 }
 
 impl Message {
@@ -287,8 +322,49 @@ impl Message {
             "image" | "video" | "audio" | "file" | "sticker"
         )
     }
+    /// Whether the message can be forwarded: never view-once media.
+    pub fn forwardable(&self) -> bool {
+        self.actionable() && self.kind != "view_once"
+    }
     pub fn visible(&self) -> bool {
         self.kind != "protocol"
+    }
+    /// Show an edit's text in place of the original body or caption.
+    pub fn apply_edit(&mut self, edit: &EditUpdate, edited_at: Option<i64>) {
+        self.text = edit.text.clone();
+        self.mentions = edit.mentions.clone();
+        self.link_preview = edit.link_preview.clone();
+        self.edited = true;
+        self.edited_at = edited_at;
+    }
+    /// Why this message cannot be edited now, following WhatsApp's rules: only
+    /// your own sent text messages and media captions, within 15 minutes.
+    pub fn edit_blocker(&self, now: i64) -> Option<&'static str> {
+        use whatsapp_rust::wacore_binary::JidExt;
+        if !self.from_me {
+            return Some("You can only edit messages you sent");
+        }
+        if self.deleted_at.is_some() {
+            return Some("Deleted messages cannot be edited");
+        }
+        let chat = self.chat.parse::<whatsapp_rust::Jid>().ok();
+        if chat.as_ref().is_none_or(|jid| {
+            jid.is_status_broadcast() || jid.is_broadcast_list() || jid.is_newsletter()
+        }) {
+            return Some("Messages in this chat cannot be edited");
+        }
+        let captioned = matches!(self.kind.as_str(), "image" | "video" | "file")
+            && !self.text.trim().is_empty();
+        if !(self.kind == "text" || captioned) || !self.actions.is_empty() {
+            return Some("Only text messages and captions can be edited");
+        }
+        if !crate::outbox::confirmed(&self.status) {
+            return Some("Wait until the message is sent before editing it");
+        }
+        if now.saturating_sub(self.timestamp) >= crate::edits::SEND_WINDOW_SECS {
+            return Some("Messages can only be edited within 15 minutes of sending");
+        }
+        None
     }
     pub fn actionable(&self) -> bool {
         !matches!(
@@ -308,6 +384,12 @@ impl Message {
             "file" => "Document",
             "sticker" => "Sticker",
             "placeholder" => "Message unavailable",
+            "view_once" => match self.view_once.as_str() {
+                "image" => "View once photo",
+                "video" => "View once video",
+                "audio" => "View once voice message",
+                _ => "View once message",
+            },
             "template" => "Business message",
             "contact" => "Contact",
             "location" => "Location",
@@ -386,6 +468,9 @@ pub struct Snapshot {
     /// File hashes of the stickers in My stickers.
     #[serde(default)]
     pub favorite_stickers: Vec<String>,
+    /// The voice transcription engine: model download and availability.
+    #[serde(default)]
+    pub transcription: crate::transcription::Engine,
 }
 
 pub fn now() -> i64 {

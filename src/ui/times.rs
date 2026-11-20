@@ -40,6 +40,22 @@ pub(super) fn chat_date(timestamp: i64) -> String {
     }
 }
 
+/// "Deleted on WhatsApp at 14:32", naming the day too when it differs from the
+/// day the message was sent.
+pub(super) fn deleted_label(sent: i64, deleted: i64) -> String {
+    let time = super::view::clock(deleted);
+    if time.is_empty() {
+        return locale::tr("Deleted on WhatsApp");
+    }
+    match day(deleted) {
+        Some(date) if day(sent) != Some(date) => locale::format(
+            "Deleted on WhatsApp on {date} at {time}",
+            &[("date", full_date(date)), ("time", time)],
+        ),
+        _ => locale::format("Deleted on WhatsApp at {time}", &[("time", time)]),
+    }
+}
+
 fn full_date(date: NaiveDate) -> String {
     locale::format(
         "{day} {month} {year}",

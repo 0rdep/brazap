@@ -4,3 +4,12 @@
 rune = { path = ".build-deps/rune/crates/rune" }
 rune-kit = { path = ".build-deps/rune/crates/rune-kit" }
 procwatch = { path = ".build-deps/rune/crates/procwatch" }
+
+# transcribe.cpp's ggml (voice transcription) must not tune itself for the
+# build machine: release binaries run on other CPUs. x86-64 builds target
+# x86-64-v3 (AVX2, BMI2, FMA, F16C: Haswell, 2013+); Brazap checks those
+# features before loading a model and reports transcription as unsupported
+# otherwise. ARM builds ignore the x86 flags. transcribe-cpp-sys forwards
+# these to CMake; an explicit TRANSCRIBE_CMAKE_ARGS in the environment wins.
+[env]
+TRANSCRIBE_CMAKE_ARGS = "-DGGML_NATIVE=OFF -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_BMI2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF -DGGML_AVX_VNNI=OFF"

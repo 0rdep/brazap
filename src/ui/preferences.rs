@@ -27,6 +27,7 @@ pub(super) enum Page {
     Appearance,
     Notifications,
     Privacy,
+    Transcription,
     Storage,
     Mcp,
     Debug,
@@ -38,6 +39,7 @@ impl Page {
             Self::Appearance => "Appearance",
             Self::Notifications => "Notifications",
             Self::Privacy => "Privacy",
+            Self::Transcription => "Transcription",
             Self::Storage => "Storage",
             Self::Mcp => "MCP",
             Self::Debug => "Debug",
@@ -62,12 +64,15 @@ pub(super) struct Panel {
     pub logout: bool,
     pub logging_out: bool,
     pub confirm_cache: bool,
+    /// The speech model whose Delete was pressed once and awaits confirmation.
+    pub speech_delete: Option<&'static str>,
     /// `BRAZAP_MCP` override reported by the running service.
     pub mcp_override: Option<bool>,
 }
 impl State {
     pub(super) fn open_preferences(&mut self) {
         self.preferences.open = true;
+        self.preferences.speech_delete = None;
         if !self.preferences.saving {
             self.preferences.value = self.snapshot.settings.clone();
         }
@@ -146,6 +151,7 @@ impl State {
     }
     fn preferences_page(&mut self, page: Page) {
         self.preferences.page = page;
+        self.preferences.speech_delete = None;
         self.preferences.notice = None;
         self.preferences.error = None;
         if page == Page::Privacy {
@@ -195,6 +201,16 @@ impl State {
                 self.save_preferences();
             }
             self.sync_floating();
+            return;
+        }
+        if action == "speech_model" {
+            match result {
+                // The next snapshot shows the download or the new selection.
+                Ok(_) => {
+                    let _ = self.tx.send(Command::Refresh);
+                }
+                Err(error) => self.preferences.error = Some(error),
+            }
             return;
         }
         match action {
@@ -288,6 +304,35 @@ pub(super) fn footer(s: &State) -> El {
             s.preferences.error = None;
         }))
 }
+/// The selected model's loading state or error, under the model picker.
+fn transcription_status(s: &State) -> Option<String> {
+    if !s.preferences.value.transcription.enabled {
+        return None;
+    }
+    let engine = &s.snapshot.transcription;
+    let selected =
+        crate::transcription::SpeechModel::find(&s.preferences.value.transcription.model);
+    // Settings saved a moment ago reach the snapshot on the next poll.
+    if engine.status != "unsupported" && engine.model != selected.id {
+        return None;
+    }
+    let model = || ("model", selected.title.to_owned());
+    Some(match engine.status.as_str() {
+        "loading" => super::locale::format("Loading {model}…", &[model()]),
+        "error" | "unsupported" => super::locale::tr(
+            engine
+                .error
+                .as_deref()
+                .unwrap_or("Voice transcription is unavailable."),
+        ),
+        "idle" if !engine.downloaded && engine.progress.is_none() => super::locale::format(
+            "{model} downloads the first time a voice message is transcribed.",
+            &[model()],
+        ),
+        _ => return None,
+    })
+}
+
 fn section(name: &str, description: &str) -> El {
     col()
         .w_full()
@@ -351,6 +396,220 @@ fn choice(name: &str, selected: bool, action: impl Fn(&mut State) + 'static) -> 
     .on_press(action)
 }
 
+const TRASH: Icon = Icon {
+    name: "speech-model-delete",
+    view: 24.0,
+    body: r#"<path d="M4 7h16M10 11v6m4-6v6M6 7l1 13h10l1-13M9 7V4h6v3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+const DOWNLOAD: Icon = Icon {
+    name: "speech-model-download",
+    view: 24.0,
+    body: r#"<path d="M12 4v11m-5-5 5 5 5-5M5 20h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+const DANGER: Color = Color {
+    r: 0.95,
+    g: 0.33,
+    b: 0.33,
+    a: 1.0,
+};
+
+/// A download size the way people read it: `85 MB`.
+fn model_size(bytes: u64) -> String {
+    format!("{} MB", (bytes as f64 / 1_000_000.0).round())
+}
+
+fn speech_action(s: &mut State, id: &'static str, action: &'static str) {
+    s.preferences.speech_delete = None;
+    s.preferences.error = None;
+    s.request_preference(
+        "speech_model",
+        json!({"name": "speech_model", "arguments": {"id": id, "action": action}}),
+    );
+}
+
+/// A small text button in a model row.
+fn model_button(name: String, color: Color, action: impl Fn(&mut State) + 'static) -> El {
+    row()
+        .h(28.0)
+        .px(11.0)
+        .gap(5.0)
+        .center()
+        .radius(8.0)
+        .fill(Color::WHITE.alpha(0.04))
+        .border(1.0, CONTROL_BORDER)
+        .role("button")
+        .label(name.clone())
+        .hover(Color::WHITE.alpha(0.08))
+        .press(Color::WHITE.alpha(0.12))
+        .motion(rune::tok::motion::SNAPPY)
+        .on_press(action)
+        .child(label(name, 11.0, color).font(super::locale::style(11.0, 600.0)))
+}
+
+/// One catalog model: its name and role, size and languages, what it is
+/// good at, and its state on the right: download, progress with cancel,
+/// use and delete, or in use. Mirrors Hex's model picker list
+/// (`rune_ui/picker/list.rs`), compacted for a settings card.
+fn model_row(s: &State, model: &'static crate::transcription::SpeechModel) -> El {
+    let engine = &s.snapshot.transcription;
+    let state = engine.models.iter().find(|m| m.id == model.id);
+    let downloaded = state.is_some_and(|m| m.downloaded);
+    let progress = state.and_then(|m| m.progress);
+    let selected = s.preferences.value.transcription.model == model.id;
+    let size = model_size(model.bytes);
+    let languages = if model.id == "parakeet-v3" {
+        super::locale::format(
+            "{count} European languages",
+            &[("count", model.languages.to_string())],
+        )
+    } else {
+        super::locale::format(
+            "{count} languages",
+            &[("count", model.languages.to_string())],
+        )
+    };
+    let mut copy = col()
+        .grow(1.0)
+        .shrink()
+        .min_w(0.0)
+        .gap(3.0)
+        .child(
+            row()
+                .gap(8.0)
+                .center_y()
+                .child(title(model.title, 13.0))
+                .child(label(
+                    super::locale::tr(model.role),
+                    11.0,
+                    if selected { MINT } else { MUTED },
+                )),
+        )
+        .child(label(format!("{size} · {languages}"), 11.0, MUTED))
+        .child(label(super::locale::tr(model.detail), 11.0, INK.alpha(0.7)).wrap());
+    if let Some(credit) = model.attribution {
+        copy = copy.child(label(super::locale::tr(credit), 10.0, MUTED).wrap());
+    }
+    if let Some(error) = state.and_then(|m| m.error.as_deref()) {
+        copy = copy.child(label(super::locale::tr(error), 11.0, DANGER).wrap());
+    }
+    let id = model.id;
+    let mut actions = row().gap(8.0).center_y();
+    if let Some(percent) = progress {
+        let fraction = percent.min(100) as f32 / 100.0;
+        actions = actions
+            .child(
+                col()
+                    .w(120.0)
+                    .gap(5.0)
+                    .child(
+                        row()
+                            .gap(4.0)
+                            .child(label(format!("{percent}%"), 11.0, INK))
+                            .child(label(
+                                super::locale::format("of {size}", &[("size", size.clone())]),
+                                11.0,
+                                MUTED,
+                            )),
+                    )
+                    .child(
+                        el().w_full()
+                            .h(5.0)
+                            .radius(999.0)
+                            .fill(Color::WHITE.alpha(0.08))
+                            .child(
+                                el().w_frac(fraction)
+                                    .h_full()
+                                    .radius(999.0)
+                                    .fill(MINT)
+                                    .motion(rune::tok::motion::SNAPPY),
+                            ),
+                    ),
+            )
+            .child(
+                el().size(26.0, 26.0)
+                    .center()
+                    .radius(8.0)
+                    .role("button")
+                    .label(super::locale::tr("Cancel download"))
+                    .help(super::locale::tr("Cancel download"))
+                    .hover(Color::WHITE.alpha(0.08))
+                    .on_press(move |s: &mut State| speech_action(s, id, "cancel"))
+                    .child(icon(&glyphs::CLOSE, 14.0).color(MUTED)),
+            );
+    } else if selected {
+        // The selected model downloads with the first voice message, so it never
+        // needs a download button of its own.
+        let mut status = row()
+            .gap(7.0)
+            .center_y()
+            .child(
+                el().size(7.0, 7.0)
+                    .radius(4.0)
+                    .fill(if downloaded { MINT } else { MUTED }),
+            )
+            .child(label(super::locale::tr("In use"), 12.0, INK));
+        if !downloaded {
+            status = status.help(super::locale::tr(
+                "Downloads with the first voice message to transcribe",
+            ));
+        }
+        actions = actions.child(status);
+    } else if downloaded {
+        if s.preferences.speech_delete == Some(id) {
+            actions = actions.child(model_button(
+                super::locale::format("Delete {size}?", &[("size", size.clone())]),
+                DANGER,
+                move |s: &mut State| speech_action(s, id, "delete"),
+            ));
+        } else {
+            actions = actions.child(
+                el().size(28.0, 28.0)
+                    .center()
+                    .radius(8.0)
+                    .role("button")
+                    .label(super::locale::tr("Delete"))
+                    .help(super::locale::tr("Delete this model from this computer"))
+                    .hover(Color::WHITE.alpha(0.08))
+                    .on_press(move |s: &mut State| s.preferences.speech_delete = Some(id))
+                    .child(icon(&TRASH, 15.0).color(MUTED)),
+            );
+        }
+        actions = actions.child(model_button(
+            super::locale::tr("Use"),
+            MINT,
+            move |s: &mut State| speech_action(s, id, "choose"),
+        ));
+    } else {
+        let name = super::locale::format("Download {size}", &[("size", size.clone())]);
+        actions = actions.child(
+            row()
+                .h(28.0)
+                .px(11.0)
+                .gap(5.0)
+                .center()
+                .radius(8.0)
+                .fill(Color::WHITE.alpha(0.04))
+                .border(1.0, CONTROL_BORDER)
+                .role("button")
+                .label(name.clone())
+                .hover(Color::WHITE.alpha(0.08))
+                .press(Color::WHITE.alpha(0.12))
+                .motion(rune::tok::motion::SNAPPY)
+                .on_press(move |s: &mut State| speech_action(s, id, "choose"))
+                .child(icon(&DOWNLOAD, 13.0).color(MINT))
+                .child(label(name, 11.0, MINT).font(super::locale::style(11.0, 600.0))),
+        );
+    }
+    row()
+        .key(format!("speech-model-{id}"))
+        .w_full()
+        .py(10.0)
+        .gap(14.0)
+        .center_y()
+        .child(copy)
+        .child(actions)
+}
+
 fn retention_label(days: u32) -> &'static str {
     match days {
         0 => "Never delete",
@@ -381,6 +640,7 @@ pub(super) fn view(s: &State) -> El {
         Page::Appearance,
         Page::Notifications,
         Page::Privacy,
+        Page::Transcription,
         Page::Storage,
         Page::Mcp,
         Page::Debug,
@@ -535,8 +795,8 @@ pub(super) fn view(s: &State) -> El {
                     "Report this device as online while the app window is in use.",
                     p.privacy.show_online,
                     |p| p.privacy.show_online = !p.privacy.show_online,
-                ))
-                .child(title(super::locale::tr("WhatsApp account"), 17.0));
+                ));
+            body = body.child(title(super::locale::tr("WhatsApp account"), 17.0));
             if s.preferences.privacy_pending {
                 body = body.child(label(super::locale::tr("Loading…"), 12.0, MUTED));
             }
@@ -596,6 +856,49 @@ pub(super) fn view(s: &State) -> El {
                     s.request_preference("privacy", json!({}));
                 },
             ));
+        }
+        Page::Transcription => {
+            body = body
+                .child(section(
+                    "Transcription",
+                    "Voice messages are converted to text on this computer. Audio never leaves your device.",
+                ))
+                .child(toggle(
+                    s,
+                    "Transcribe voice messages",
+                    "Convert voice messages on screen and new ones you receive to text. The speech model downloads the first time.",
+                    p.transcription.enabled,
+                    |p| p.transcription.enabled = !p.transcription.enabled,
+                ));
+            if p.transcription.enabled {
+                let mut models = col()
+                    .gap(4.0)
+                    .child(title(super::locale::tr("Speech model"), 13.0))
+                    .child(
+                        label(
+                            super::locale::tr("Larger models understand more but transcribe more slowly. A model you choose downloads first; the current one keeps working until it is ready. Only the model in use is kept on this computer."),
+                            11.0,
+                            MUTED,
+                        )
+                        .wrap(),
+                    );
+                for (index, model) in crate::transcription::MODELS.iter().enumerate() {
+                    if index > 0 {
+                        models = models.child(el().w_full().h(1.0).fill(BORDER));
+                    }
+                    models = models.child(model_row(s, model));
+                }
+                if let Some(status) = transcription_status(s) {
+                    models = models.child(label(status, 11.0, MUTED).wrap());
+                }
+                body = body.child(card(models)).child(toggle(
+                    s,
+                    "Show re-transcribe button",
+                    "Add a button to transcribed voice messages to transcribe them again with the selected model.",
+                    p.transcription.retranscribe,
+                    |p| p.transcription.retranscribe = !p.transcription.retranscribe,
+                ));
+            }
         }
         Page::Storage => {
             body = body.child(section(

@@ -76,8 +76,7 @@ impl Archive {
             }
             let cutoff = now_ms - i64::from(days) * DAY_MS;
             let candidates: Vec<Candidate> = self
-                .backend
-                .shared()
+                .sql()
                 .read(move |conn| {
                     // Unsent uploads have no server copy yet; keep their bytes.
                     diesel::sql_query(
@@ -118,8 +117,7 @@ impl Archive {
             }
             report.items += evict.len() as u64;
             report.bytes += evict.iter().map(|item| item.3.max(0) as u64).sum::<u64>();
-            self.backend
-                .shared()
+            self.sql()
                 .run(move |conn| {
                     conn.transaction::<_, diesel::result::Error, _>(|conn| {
                         for (chat, sender, id, _) in evict {
@@ -148,8 +146,7 @@ impl Archive {
                 })
                 .await?;
         }
-        self.backend
-            .shared()
+        self.sql()
             .run(move |conn| {
                 diesel::sql_query(
                     "DELETE FROM brazap_media_usage WHERE account=? AND NOT EXISTS \

@@ -43,6 +43,8 @@ pub(super) struct Panel {
     player: Option<playback::Player>,
     last_status: Option<playback::Status>,
     error: Option<String>,
+    /// Send this voice message as view once.
+    view_once: bool,
 }
 
 impl State {
@@ -90,6 +92,7 @@ impl State {
                     player: None,
                     last_status: None,
                     error: None,
+                    view_once: false,
                 });
             }
             Err(error) => {
@@ -175,6 +178,7 @@ impl State {
                 duration_seconds: note.duration_seconds,
                 waveform: note.waveform.clone(),
                 reply_to: recording.reply.clone(),
+                view_once: recording.view_once,
             };
             if self
                 .tx
@@ -480,21 +484,40 @@ fn panel(s: &State) -> El {
         .child(
             row()
                 .w_full()
-                .h(38.0)
-                .center()
-                .gap(7.0)
-                .radius(19.0)
-                .fill(MINT.alpha(if can_send { 1.0 } else { 0.25 }))
-                .role("button")
-                .label(locale::tr("Send voice message"))
-                .help(locale::tr("Send voice message"))
-                .on_press(move |s: &mut State| {
-                    if can_send {
-                        s.send_recording();
-                    }
-                })
-                .child(icon(&SEND, 16.0).color(Color::BLACK))
-                .child(label(locale::tr("Send"), 12.0, Color::BLACK)),
+                .gap(8.0)
+                .center_y()
+                .child(view_once_toggle(
+                    recording.view_once,
+                    !recording.sending,
+                    38.0,
+                    "View once",
+                    |s| {
+                        if let Some(recording) = &mut s.recording
+                            && !recording.sending
+                        {
+                            recording.view_once = !recording.view_once;
+                        }
+                    },
+                ))
+                .child(
+                    row()
+                        .grow(1.0)
+                        .h(38.0)
+                        .center()
+                        .gap(7.0)
+                        .radius(19.0)
+                        .fill(MINT.alpha(if can_send { 1.0 } else { 0.25 }))
+                        .role("button")
+                        .label(locale::tr("Send voice message"))
+                        .help(locale::tr("Send voice message"))
+                        .on_press(move |s: &mut State| {
+                            if can_send {
+                                s.send_recording();
+                            }
+                        })
+                        .child(icon(&SEND, 16.0).color(Color::BLACK))
+                        .child(label(locale::tr("Send"), 12.0, Color::BLACK)),
+                ),
         );
     if let Some(error) = recording.error.as_ref().or_else(|| {
         recording

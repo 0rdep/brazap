@@ -11,6 +11,7 @@ pub mod config;
 pub mod content;
 pub(crate) mod demo;
 pub mod diagnostics;
+pub(crate) mod edits;
 pub mod history;
 pub(crate) mod history_prefetch;
 pub(crate) mod identity;
@@ -39,6 +40,7 @@ pub mod stickers;
 pub mod storage;
 pub mod storage_usage;
 pub(crate) mod stories;
+pub mod transcription;
 pub mod updates;
 
 #[cfg(all(target_os = "windows", feature = "desktop"))]

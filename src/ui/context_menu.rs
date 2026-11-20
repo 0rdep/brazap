@@ -293,6 +293,18 @@ fn message_items(s: &State, m: &Message) -> El {
             false,
             move |s, _| s.copy_media(target.clone()),
         ));
+        if m.kind == "audio"
+            && let Some(transcript) = s.transcript(m)
+            && transcript.status == "done"
+            && !transcript.text.trim().is_empty()
+        {
+            let text = transcript.text.clone();
+            body = body.child(item("Copy transcript", true, false, move |s, tx| {
+                s.close_context_menu();
+                s.copy_generation = s.copy_generation.wrapping_add(1);
+                tx.copy(text.clone());
+            }));
+        }
         let target = m.clone();
         body = body.child(item("Download media", true, false, move |s, tx| {
             s.close_context_menu();
@@ -341,10 +353,25 @@ fn message_items(s: &State, m: &Message) -> El {
             s.defer_composer_focus(tx);
         },
     ));
+    // Only your own text messages and captions, within WhatsApp's edit window.
+    if m.edit_blocker(crate::model::now()).is_none() && s.forwarding.is_none() {
+        let target = m.clone();
+        body = body.child(item(
+            "Edit message",
+            s.snapshot.connection.phase == Phase::Connected
+                && s.recording.is_none()
+                && s.attachments.is_none(),
+            false,
+            move |s, tx| {
+                s.close_context_menu();
+                s.begin_edit(target.clone(), tx);
+            },
+        ));
+    }
     let forward = m.clone();
     body.child(item(
         "Forward message",
-        m.actionable(),
+        m.forwardable(),
         false,
         move |s, _| {
             s.close_context_menu();

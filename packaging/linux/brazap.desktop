@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Brazap
+GenericName=WhatsApp Client
+GenericName[pt_BR]=Cliente do WhatsApp
+GenericName[es]=Cliente de WhatsApp
+Comment=Desktop client for WhatsApp
+Comment[pt_BR]=Cliente de desktop para WhatsApp
+Comment[es]=Cliente de escritorio para WhatsApp
+Exec=brazap
+Icon=brazap
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+Keywords=WhatsApp;chat;messages;
+StartupNotify=true
+StartupWMClass=brazap

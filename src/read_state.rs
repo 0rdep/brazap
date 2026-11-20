@@ -44,7 +44,7 @@ impl Archive {
         }
         let account = self.account as i64;
         let aliases = identities.aliases_json(chat);
-        let count: Count = self.backend.shared().read(move |conn| {
+        let count: Count = self.sql().read(move |conn| {
             diesel::sql_query("SELECT COALESCE(SUM(unread),0) AS value FROM brazap_chats WHERE account=? AND jid IN (SELECT value FROM json_each(?))")
                 .bind::<BigInt,_>(account).bind::<Text,_>(aliases).get_result(conn).map_err(db_error)
         }).await?;
@@ -59,7 +59,7 @@ impl Archive {
             message.sender.clone(),
             message.timestamp,
         );
-        let row:Count=self.backend.shared().read(move|conn| {
+        let row:Count=self.sql().read(move|conn| {
             diesel::sql_query("SELECT (EXISTS(SELECT 1 FROM brazap_chat_reads WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND through_timestamp>?) OR EXISTS(SELECT 1 FROM brazap_read_messages WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND id=? AND (sender='' OR sender=?))) AS value")
                 .bind::<BigInt,_>(account).bind::<Text,_>(&aliases).bind::<BigInt,_>(timestamp).bind::<BigInt,_>(account).bind::<Text,_>(&aliases).bind::<Text,_>(id).bind::<Text,_>(sender).get_result(conn).map_err(db_error)
         }).await?;
@@ -108,7 +108,7 @@ impl Archive {
             })
             .collect();
         let account = self.account as i64;
-        let pending=self.backend.shared().run(move|conn| {
+        let pending=self.sql().run(move|conn| {
             conn.transaction::<_,diesel::result::Error,_>(|conn| {
                 let pending:Vec<ReadTarget>=diesel::sql_query("SELECT m.sender,m.id,m.timestamp FROM brazap_messages m WHERE m.account=? AND m.chat IN (SELECT value FROM json_each(?)) AND json_extract(m.payload,'$.from_me')=0 AND json_extract(m.payload,'$.kind')!='protocol' AND NOT EXISTS(SELECT 1 FROM brazap_chat_reads r WHERE r.account=m.account AND r.chat IN (SELECT value FROM json_each(?)) AND m.timestamp<r.through_timestamp) AND NOT EXISTS(SELECT 1 FROM brazap_read_messages r WHERE r.account=m.account AND r.chat IN (SELECT value FROM json_each(?)) AND r.id=m.id AND (r.sender='' OR r.sender=m.sender)) GROUP BY m.id,m.sender ORDER BY m.timestamp DESC,m.id DESC LIMIT 500")
                     .bind::<BigInt,_>(account).bind::<Text,_>(&aliases).bind::<Text,_>(&aliases).bind::<Text,_>(&aliases).load(conn)?;
@@ -162,7 +162,7 @@ impl Archive {
         let account = self.account as i64;
         let aliases = self.identities().await?.aliases_json(chat);
         let ids_json = serde_json::to_string(ids)?;
-        let through:Count=self.backend.shared().read(move|conn| {
+        let through:Count=self.sql().read(move|conn| {
             diesel::sql_query("SELECT COALESCE(MAX(timestamp),0) AS value FROM brazap_messages WHERE account=? AND chat IN (SELECT value FROM json_each(?)) AND id IN (SELECT value FROM json_each(?)) AND json_extract(payload,'$.from_me')=0")
                 .bind::<BigInt,_>(account).bind::<Text,_>(aliases).bind::<Text,_>(ids_json).get_result(conn).map_err(db_error)
         }).await?;
@@ -319,8 +319,7 @@ struct ReadSync {
 impl Archive {
     pub(crate) async fn clear_read_sync(&self) -> Result<()> {
         let account = self.account as i64;
-        self.backend
-            .shared()
+        self.sql()
             .run(move |conn| {
                 diesel::sql_query("DELETE FROM brazap_read_sync WHERE account=?")
                     .bind::<BigInt, _>(account)
@@ -332,15 +331,14 @@ impl Archive {
     }
     async fn pending_read_sync(&self) -> Result<Vec<ReadSync>> {
         let account = self.account as i64;
-        Ok(self.backend.shared().read(move|conn| {
+        Ok(self.sql().read(move|conn| {
             diesel::sql_query("SELECT chat,targets,generation FROM brazap_read_sync WHERE account=? LIMIT 500")
                 .bind::<BigInt,_>(account).load(conn).map_err(db_error)
         }).await?)
     }
     async fn finish_read_sync(&self, job: &ReadSync) -> Result<()> {
         let (account, chat, generation) = (self.account as i64, job.chat.clone(), job.generation);
-        self.backend
-            .shared()
+        self.sql()
             .run(move |conn| {
                 diesel::sql_query(
                     "DELETE FROM brazap_read_sync WHERE account=? AND chat=? AND generation=?",
