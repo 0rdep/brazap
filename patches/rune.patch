@@ -1,0 +1,116 @@
+diff --git a/crates/rune-edit/src/input.rs b/crates/rune-edit/src/input.rs
+index 221f269d..b7067ef3 100644
+--- a/crates/rune-edit/src/input.rs
++++ b/crates/rune-edit/src/input.rs
+@@ -259,6 +259,9 @@ impl TextEdit {
+                 let mut kept = None;
+                 let i = if line || self.is_masked() {
+                     if down { n } else { 0 }
++                } else if m.ctrl && !cfg!(target_os = "macos") {
++                    // Windows/Linux Ctrl+Up/Down moves to the previous/next paragraph start.
++                    self.paragraph_edge(down)
+                 } else if let Some(l) = layout {
+                     match l.move_line(self.display_index(self.focus), down, column.goal()) {
+                         Some((j, x)) => {
+@@ -386,6 +389,16 @@ impl TextEdit {
+         }
+     }
+ 
++    fn paragraph_edge(&self, down: bool) -> usize {
++        let i = self.focus;
++        if down {
++            self.text[i..].find('\n').map_or(self.text.len(), |j| i + j + 1)
++        } else {
++            let start = self.text[..i].rfind('\n').map_or(0, |j| j + 1);
++            if start == i && i > 0 { self.text[..i - 1].rfind('\n').map_or(0, |j| j + 1) } else { start }
++        }
++    }
++
+     fn line_edge(&self, layout: Option<TextFlow<'_>>, end: bool) -> usize {
+         if self.is_masked() {
+             return if end { self.text.len() } else { 0 };
+diff --git a/crates/rune-text/src/fonts/system_fonts.rs b/crates/rune-text/src/fonts/system_fonts.rs
+index 3335a9e5..97e162fb 100644
+--- a/crates/rune-text/src/fonts/system_fonts.rs
++++ b/crates/rune-text/src/fonts/system_fonts.rs
+@@ -257,7 +257,7 @@ fn needs_no_font(ch: char) -> bool {
+ 
+ /// Interned family names: the symbol stack holds `&'static str`s, and the families a process
+ /// can add are the system's few fallback fonts, each named once.
+-fn intern(name: &str) -> &'static str {
++pub(crate) fn intern(name: &str) -> &'static str {
+     static NAMES: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+     let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+     if let Some(n) = names.iter().find(|n| **n == name) {
+@@ -297,7 +297,8 @@ impl TextSystem {
+     fn load_symbol_families(&mut self) {
+         self.fallbacks.symbols = true;
+         self.symbol_families = load_families(&mut self.font_cx.collection, SYMBOL_FONT_FILES, SYMBOL_FAMILIES);
+-        self.emoji = self.symbol_families.iter().copied().find(|f| f.contains("Emoji"));
++        // Keep an emoji family the app registered (`TextSystem::new_local`).
++        self.emoji = self.emoji.or_else(|| self.symbol_families.iter().copied().find(|f| f.contains("Emoji")));
+         #[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+         if self.emoji.is_none()
+             && let Some((family, files)) = fontconfig::emoji()
+diff --git a/crates/rune-text/src/lib.rs b/crates/rune-text/src/lib.rs
+index 63bf4906..08e0c0d6 100644
+--- a/crates/rune-text/src/lib.rs
++++ b/crates/rune-text/src/lib.rs
+@@ -432,8 +432,14 @@ impl TextSystem {
+         #[cfg(target_arch = "wasm32")]
+         let families = if fonts.is_empty() { ("Inter", "IBM Plex Mono") } else { families };
+         let (sans, mono) = families::slots(families.0, families.1);
++        // An emoji family the app registers itself takes precedence over the system's colour
++        // emoji; system fallback still covers what it lacks.
++        let own_emoji = registered.iter().find_map(|&id| {
++            collection.family_name(id).filter(|name| name.contains("Emoji")).map(fonts::system_fonts::intern)
++        });
+         let mut text = TextSystem {
+             font_cx: FontContext { collection, source_cache: SourceCache::default() },
++            emoji: own_emoji,
+             families: (families.0.to_owned(), families.1.to_owned()),
+             sans,
+             mono,
+diff --git a/crates/rune-text/src/segmenter.rs b/crates/rune-text/src/segmenter.rs
+index 0e2510b6..9f9b26b6 100644
+--- a/crates/rune-text/src/segmenter.rs
++++ b/crates/rune-text/src/segmenter.rs
+@@ -80,8 +80,10 @@ pub fn word_ends(text: &str) -> Vec<usize> {
+ 
+ /// A full stop or colon Unicode joins letters across (`MidNumLet`, `MidLetter`) and Chromium
+ /// doesn't; apostrophes, the middle dot (Catalan `l·l`) and the other joiners are left alone.
++/// Unicode also joins letters and digits across a narrow no-break space (`ExtendNumLet`, as in a
++/// pasted `10:30\u{202F}AM`); as whitespace it ends a word.
+ fn splits(c: char) -> bool {
+-    full_stop(c) || matches!(c, ':' | '\u{FE13}' | '\u{FE55}' | '\u{FF1A}')
++    full_stop(c) || matches!(c, ':' | '\u{FE13}' | '\u{FE55}' | '\u{FF1A}' | '\u{202F}')
+ }
+ 
+ fn full_stop(c: char) -> bool {
+diff --git a/crates/rune/src/window/host/create.rs b/crates/rune/src/window/host/create.rs
+index 7560b10f..be7df1e4 100644
+--- a/crates/rune/src/window/host/create.rs
++++ b/crates/rune/src/window/host/create.rs
+@@ -70,7 +70,8 @@ impl Host {
+                 attrs = winit::platform::startup_notify::WindowAttributesExtStartupNotify::with_activation_token(attrs, token);
+             }
+         }
+-        let open_as = if !self.shown && self.options.resizable { self.open_as } else { crate::windows::OpenAs::Normal };
++        // `hide` keeps `open_as` up to date, so a window made again reopens as it hid.
++        let open_as = if self.options.resizable { self.open_as } else { crate::windows::OpenAs::Normal };
+         // Windows maximizes it once cloaked: maximizing shows a window.
+         #[cfg(not(target_os = "windows"))]
+         {
+diff --git a/crates/rune/src/window/host/lifecycle.rs b/crates/rune/src/window/host/lifecycle.rs
+index 4dec5676..4649b00c 100644
+--- a/crates/rune/src/window/host/lifecycle.rs
++++ b/crates/rune/src/window/host/lifecycle.rs
+@@ -576,6 +576,8 @@ impl Host {
+     pub(in crate::window) fn hide(&mut self, event_loop: &ActiveEventLoop) {
+         self.rest_step(RestEvent::Unseen);
+         self.stop_showing();
++        // A window made again (released, or unmapped on Wayland) reopens maximized as it hid.
++        if let Some(w) = &self.win { self.open_as = self.open_as.maximized(w.is_maximized()); }
+         self.wind_down();
+         let launcher = self.launcher();
+         if self.release_gpu && !launcher {

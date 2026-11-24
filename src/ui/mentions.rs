@@ -54,7 +54,7 @@ impl State {
         if !chat.ends_with("@g.us")
             || !edit.focused
             || edit.anchor != edit.focus
-            || edit.preedit.is_some()
+            || edit.preedit().is_some()
             || (key == chat && self.editing.is_some())
         {
             return None;

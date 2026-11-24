@@ -4,7 +4,7 @@ set -euo pipefail
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_root"
 
-# Build from the pinned upstream source plus Brazap's small GPU-memory patch.
+# Build from the pinned upstream source plus Brazap's small Rune patch.
 # This does not modify the read-only references used for source consultation.
 "$project_root/scripts/prepare-rune"
 

@@ -3,7 +3,7 @@ set -euo pipefail
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source_dir="$project_root/.build-deps/rune"
-patch_file="$project_root/patches/rune-low-memory.patch"
+patch_file="$project_root/patches/rune.patch"
 revision="$(tr -d '\r\n' < "$project_root/patches/rune.rev")"
 origin='https://github.com/anomalyco/rune'
 patch_hash="$(git hash-object "$patch_file")"
@@ -19,6 +19,19 @@ while IFS= read -r dependency; do
         exit 1
     fi
 done < <(grep -E '^(rune|rune-kit|procwatch) = ' "$project_root/Cargo.toml")
+
+# Cargo does not inherit Rune's [patch.crates-io]; .cargo/config.toml repeats it.
+check_crates_io_patches() {
+    local table='/^\[patch\.crates-io\]/,/^\[/{/^[A-Za-z0-9_-]+ = /p}'
+    local upstream local_table
+    upstream="$(sed -nE "$table" "$source_dir/Cargo.toml" | cut -d' ' -f1 | sort)"
+    local_table="$(sed -nE "$table" "$project_root/.cargo/config.toml" | cut -d' ' -f1 | sort)"
+    if [[ "$upstream" != "$local_table" ]]; then
+        echo "Update [patch.crates-io] in .cargo/config.toml to match Rune's root Cargo.toml:" >&2
+        echo "$upstream" >&2
+        exit 1
+    fi
+}
 
 if [[ ! -d "$source_dir/.git" ]]; then
     if [[ -e "$source_dir" ]]; then
@@ -47,6 +60,7 @@ if [[ -f "$stamp" ]]; then
         exit 1
     fi
     if [[ "$old_revision" == "$revision" && "$old_patch" == "$patch_hash" ]]; then
+        check_crates_io_patches
         exit 0
     fi
     git -C "$source_dir" apply --reverse "$stamp.patch"
@@ -64,3 +78,4 @@ git -C "$source_dir" apply "$patch_file"
 cp "$patch_file" "$stamp.patch"
 new_diff="$(git -C "$source_dir" diff --binary HEAD | git hash-object --stdin)"
 printf '%s %s %s\n' "$revision" "$patch_hash" "$new_diff" > "$stamp"
+check_crates_io_patches

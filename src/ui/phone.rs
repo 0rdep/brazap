@@ -116,7 +116,7 @@ impl State {
     }
 
     pub(super) fn format_phone_input(&mut self) {
-        if self.phone.preedit.is_some() {
+        if self.phone.preedit().is_some() {
             return;
         }
         let mut raw = self.phone.text.clone();
@@ -314,7 +314,7 @@ pub(super) fn input(s: &State, layer: &mut Vec<El>) -> El {
             })
             .on_key(|s: &mut State, event, tx| {
                 let choices = s.phone_country.filtered();
-                if s.phone_country.search.preedit.is_some() {
+                if s.phone_country.search.preedit().is_some() {
                     return false;
                 }
                 match event.key {

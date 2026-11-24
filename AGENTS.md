@@ -38,7 +38,7 @@ server is opt-in: disabled by default (Settings → MCP or `BRAZAP_MCP=1`).
 ## Patched Rune builds
 
 - Use `./scripts/cargo` or `./scripts/build-windows`; they prepare the small,
-  reproducible Rune GPU-memory patch described in `patches/README.md`.
+  reproducible Rune patch described in `patches/README.md`.
 - The user authorized carrying this patch for Brazap builds. It is applied to
   the ignored `.build-deps/rune` build checkout, never `.references/rune`.
 - Keep `patches/rune.rev` synchronized with the manifest's upstream Rune pins.
