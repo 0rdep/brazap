@@ -246,6 +246,8 @@ impl Service {
             }
             bursts.insert(canonical, Instant::now());
         }
+        let language = self.settings.read().await.appearance.language.clone();
+        let translate = |text: &str| crate::ui::call_notification_text(text, &language);
         let title = if message.chat.ends_with("@g.us") {
             self.archive
                 .chats()
@@ -253,21 +255,25 @@ impl Service {
                 .into_iter()
                 .find(|chat| chat.jid == message.chat)
                 .map(|chat| chat.name)
-                .unwrap_or_else(|| "Group message".into())
+                .unwrap_or_else(|| translate("Group message"))
         } else {
             message.sender_name.clone()
         };
         let preview = if message.chat.ends_with("@g.us") {
-            format!("{}: {}", message.sender_name, message.preview())
+            format!(
+                "{}: {}",
+                message.sender_name,
+                message.preview_with(&translate)
+            )
         } else {
-            message.preview()
+            message.preview_with(&translate)
         };
         let options = self.settings.read().await.notifications.clone();
         if options.enabled {
             let (title, preview) = if options.preview {
                 (title, preview)
             } else {
-                ("Brazap".into(), "New message".into())
+                ("Brazap".into(), translate("New message"))
             };
             crate::windows_integration::notify(title, preview, message.chat, options.sound);
         }

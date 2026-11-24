@@ -30,7 +30,7 @@ LEFT JOIN brazap_messages m ON m.rowid=(
     -- account for every chat. Keep this lookup bounded to one chat's timeline.
     SELECT latest.rowid FROM brazap_messages latest INDEXED BY brazap_messages_timeline
     WHERE latest.account=c.account AND latest.chat=c.jid
-      AND json_extract(latest.payload,'$.kind')!='protocol'
+      AND json_extract(latest.payload,'$.kind') NOT IN ('protocol','album')
     ORDER BY latest.timestamp DESC,latest.id DESC,latest.sender DESC LIMIT 1
 )
 WHERE c.account=? AND c.jid!='status@broadcast' AND (m.rowid IS NOT NULL OR NOT EXISTS(

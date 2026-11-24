@@ -268,12 +268,19 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
                 )
                 .await?,
         )?),
-        "send_message" => Ok(json!({"message":service.send_text_with_id(
+        "send_message" => Ok(json!({"message":service.send_text_mentioning(
             text_arg(&args,"chat")?.into(), text_arg(&args,"text")?.into(),
             args.get("reply_to").filter(|v|!v.is_null()).map(|v|serde_json::from_value(v.clone())).transpose()?,
             args.get("message_id").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(crate::outbox::new_id),
             args.get("timestamp").and_then(Value::as_i64),
+            args.get("mentions").filter(|v|!v.is_null()).map(|v|serde_json::from_value(v.clone())).transpose()?.unwrap_or_default(),
+            args.get("mention_everyone").and_then(Value::as_bool).unwrap_or(false),
         ).await?})),
+        "group_members" => Ok(serde_json::to_value(
+            service
+                .group_members(text_arg(&args, "chat")?.into())
+                .await?,
+        )?),
         "edit_message" => Ok(json!({"message":service
             .edit_message(
                 text_arg(&args, "chat")?.into(),
@@ -311,11 +318,22 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
             Ok(json!({"message":service.send_voice(serde_json::from_value(args)?).await?}))
         }
         "send_attachment" => Ok(
-            json!({"message":service.send_attachment(text_arg(&args,"chat")?.into(),text_arg(&args,"path")?.into(),text_arg(&args,"kind")?.into(),args.get("caption").and_then(Value::as_str).unwrap_or("").into(),args.get("view_once").and_then(Value::as_bool).unwrap_or(false)).await?}),
+            json!({"message":service.send_attachment(text_arg(&args,"chat")?.into(),text_arg(&args,"path")?.into(),text_arg(&args,"kind")?.into(),args.get("caption").and_then(Value::as_str).unwrap_or("").into(),args.get("view_once").and_then(Value::as_bool).unwrap_or(false),args.get("mentions").filter(|v|!v.is_null()).map(|v|serde_json::from_value(v.clone())).transpose()?.unwrap_or_default(),args.get("mention_everyone").and_then(Value::as_bool).unwrap_or(false)).await?}),
         ),
         "save_attachment" => {
             service
                 .save_attachment(
+                    text_arg(&args, "chat")?.into(),
+                    text_arg(&args, "sender")?.into(),
+                    text_arg(&args, "id")?.into(),
+                    text_arg(&args, "path")?.into(),
+                )
+                .await?;
+            Ok(json!({"saved":true}))
+        }
+        "save_sticker_sound" => {
+            service
+                .save_sticker_sound(
                     text_arg(&args, "chat")?.into(),
                     text_arg(&args, "sender")?.into(),
                     text_arg(&args, "id")?.into(),
@@ -375,6 +393,12 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
         "open_chat" => {
             let (chat, text) = service.open_address(text_arg(&args, "address")?).await?;
             Ok(json!({"chat":chat,"text":text}))
+        }
+        // Read-only and unlisted: what WhatsApp reports about each address of a chat.
+        "diagnose_contact" => {
+            service
+                .diagnose_contact(text_arg(&args, "chat")?.into())
+                .await
         }
         _ => bail!("Unknown tool: {name}"),
     }
@@ -495,6 +519,13 @@ pub(crate) fn tools() -> Value {
             true,
         ),
         (
+            "group_members",
+            "List a group's members who can be tagged with @: their JID, name and phone number.",
+            json!({"chat":{"type":"string"}}),
+            vec!["chat"],
+            true,
+        ),
+        (
             "search",
             "Search locally saved chat names, phone numbers, filenames, and message contents. Pass chat to search one conversation, or kind to search one kind of conversation; pass next as cursor to load older matches.",
             json!({"query":{"type":"string","minLength":1},"chat":{"type":"string"},"kind":{"type":"string","enum":["chats","groups","communities","channels","lists"]},"cursor":{"type":"object","properties":{"timestamp":{"type":"integer"},"id":{"type":"string"},"sender":{"type":"string"}},"required":["timestamp","id","sender"]}}),
@@ -517,8 +548,8 @@ pub(crate) fn tools() -> Value {
         ),
         (
             "send_message",
-            "Send a WhatsApp text message to the exact chat JID. Reuse message_id to retry a failed send without changing its identity.",
-            json!({"chat":{"type":"string"},"text":{"type":"string","minLength":1},"message_id":{"type":"string","maxLength":80},"reply_to":{"type":"object","properties":{"timestamp":{"type":"integer"},"id":{"type":"string"},"sender":{"type":"string"}},"required":["timestamp","id","sender"]}}),
+            "Send a WhatsApp text message to the exact chat JID. Reuse message_id to retry a failed send without changing its identity. To tag group members, write @<number> for each (the part of their JID before @) and list their JIDs in mentions; group_members lists who can be tagged.",
+            json!({"chat":{"type":"string"},"text":{"type":"string","minLength":1},"mentions":{"type":"array","items":{"type":"string"}},"mention_everyone":{"type":"boolean","description":"Tag everyone in the group; write @all in the text"},"message_id":{"type":"string","maxLength":80},"reply_to":{"type":"object","properties":{"timestamp":{"type":"integer"},"id":{"type":"string"},"sender":{"type":"string"}},"required":["timestamp","id","sender"]}}),
             vec!["chat", "text"],
             false,
         ),

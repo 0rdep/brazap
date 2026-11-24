@@ -90,6 +90,11 @@ const AUDIO: Icon = Icon {
     view: 24.0,
     body: r#"<rect x="9" y="3" width="6" height="12" rx="3" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M6 10v2a6 6 0 0 0 12 0v-2M12 18v3m-4 0h8" fill="none" stroke="currentColor" stroke-width="1.7"/>"#,
 };
+const MOBILE: Icon = Icon {
+    name: "mobile-phone",
+    view: 24.0,
+    body: r#"<rect x="7" y="3" width="10" height="18" rx="2.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M11 18h2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>"#,
+};
 const CHECK: Icon = Icon {
     name: "sent",
     view: 24.0,
@@ -345,7 +350,7 @@ pub(super) fn brand(s: &State, show_name: bool) -> El {
         .clip_soft(0.0);
     if show_name {
         name = name.child(
-            title(super::locale::tr("brazap"), 21.0)
+            title(super::locale::tr("brazap"), 17.0)
                 .key("brand-name")
                 .w_full()
                 .truncate()
@@ -360,9 +365,9 @@ pub(super) fn brand(s: &State, show_name: bool) -> El {
         .gap(if show_name { 8.0 } else { 0.0 })
         .center_y()
         .child(
-            logo(s, 40.0)
+            logo(s, 30.0)
                 .key("brand-logo")
-                .min_w(40.0)
+                .min_w(30.0)
                 .matched(BRAND_HERO)
                 .motion(motion::REFLOW),
         )
@@ -968,6 +973,24 @@ fn timeline_row(s: &State, index: usize) -> El {
         return row;
     }
     let message = &s.timeline[index - 1];
+    // An album shows in its first item's bubble; its other items have no row,
+    // nor does the album message itself.
+    if message.kind == "album" {
+        return el().w_full();
+    }
+    // Stickers sent in a row show together in the first one's bubble.
+    if message.kind == "sticker"
+        && media::sticker_row_range(s, index - 1).is_some_and(|range| range.start != index - 1)
+    {
+        return el().w_full();
+    }
+    if message.album.is_some()
+        && s.timeline[..index - 1]
+            .iter()
+            .any(|earlier| media::same_album(earlier, message))
+    {
+        return el().w_full();
+    }
     let mut row = col().w_full().pb(14.0).gap(12.0);
     if index == 1
         || super::times::day(message.timestamp)
@@ -1156,7 +1179,11 @@ fn message_bubble(s: &State, message: &Message) -> El {
     }
     if message.kind == "view_once" {
         bubble = bubble.child(view_once_content(message, mine));
-    } else if matches!(message.kind.as_str(), "image" | "video" | "sticker") {
+    } else if message.album.is_some() && matches!(message.kind.as_str(), "image" | "video") {
+        bubble = bubble.child(media::album(s, message));
+    } else if message.kind == "sticker" {
+        bubble = bubble.child(media::sticker_row(s, message));
+    } else if matches!(message.kind.as_str(), "image" | "video") {
         bubble = bubble.child(media::thumbnail(s, message));
     } else if message.kind == "audio" {
         bubble = bubble.child(super::audio::view(s, message, width - 26.0));
@@ -1201,8 +1228,22 @@ fn message_bubble(s: &State, message: &Message) -> El {
                 ),
         );
     }
-    // Text follows the attachment, so captions sit under their media.
-    if !message.is_call() && !message.text.is_empty() {
+    // WhatsApp did not send this message to linked devices; say where to read it.
+    if message.kind == "placeholder" {
+        bubble = bubble.child(
+            row()
+                .gap(8.0)
+                .center_y()
+                .child(icon(&MOBILE, 16.0).color(MUTED))
+                .child(
+                    label(super::locale::tr(&message.text), 13.0, MUTED)
+                        .wrap()
+                        .grow(1.0)
+                        .min_w(0.0),
+                ),
+        );
+    } else if !message.is_call() && !message.text.is_empty() {
+        // Text follows the attachment, so captions sit under their media.
         let context = message.clone();
         bubble = bubble.child(
             super::links::message_text(message, 14.0)
@@ -1279,16 +1320,20 @@ fn composer(s: &State, layer: &mut Vec<El>) -> El {
     }
     let recording = s.recording.is_some();
     let enabled = s.snapshot.connection.phase == Phase::Connected && !s.busy && !recording;
+    let (spans, strikes) =
+        super::mentions::field_spans(s, s.selected.as_deref().unwrap_or_default(), &s.draft.text);
     let edit = rune::text_input(&s.draft, super::locale::style(13.0, 450.0))
         .key("composer-edit")
         .w_full()
         .wrap_anywhere()
         .color(INK)
         .placeholder(super::locale::tr("Write a message…"), MUTED)
-        .caret(INK, kit().selection());
+        .caret(INK, kit().selection())
+        .spans(spans)
+        .strikes(strikes);
     let edit = if enabled {
         edit.on_edit(|s: &mut State| &mut s.draft)
-            .on_input_key(super::message_enter)
+            .on_input_key(super::mentions::composer_key)
             .on_input_paste(|s: &mut State, content, _| s.paste_attachments(content))
             .on_submit(|s: &mut State, _| s.send())
     } else {
@@ -1332,7 +1377,8 @@ fn composer(s: &State, layer: &mut Vec<El>) -> El {
             s.attachments_open = !s.attachments_open;
         }
     });
-    let mut menu = col().w(250.0).gap(4.0);
+    // At least this wide, and wider when a language needs it: the text never overflows.
+    let mut menu = col().min_w(super::locale::scale(250.0)).gap(4.0);
     for (glyph, name, description, kind) in [
         (
             &STICKER,
@@ -1388,6 +1434,13 @@ fn composer(s: &State, layer: &mut Vec<El>) -> El {
         .fill(Color::WHITE.alpha(0.018))
         .border(1.0, CONTROL_BORDER)
         .instant_changes();
+    if let Some(list) = s
+        .selected
+        .as_deref()
+        .and_then(|chat| super::mentions::popup_for(s, chat))
+    {
+        content = content.child(list);
+    }
     if let Some(edit) = actions::edit_banner(s) {
         content = content.child(edit);
     } else if let Some(reply) = actions::reply_banner(s) {

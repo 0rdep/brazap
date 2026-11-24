@@ -38,6 +38,8 @@ enum Command {
     Load(String, Arc<[u8]>, Pixels, u32),
     Active(Vec<String>),
     Remove(String),
+    /// Show the animation from its first frame again.
+    Restart(String),
     Stop,
 }
 struct Handle {
@@ -73,6 +75,12 @@ impl Drop for Player {
     }
 }
 impl Player {
+    /// Plays `key` from its first frame, as a sticker's sound starts over.
+    pub(super) fn restart(&self, key: &str) {
+        if self.handles.contains_key(key) {
+            let _ = self.tx.send(Command::Restart(key.to_owned()));
+        }
+    }
     pub(super) fn contains(&self, key: &str) -> bool {
         self.handles.contains_key(key)
     }
@@ -229,6 +237,13 @@ fn worker(rx: mpsc::Receiver<Command>, stats: Arc<Stats>) {
             Some(Command::Stop) => break,
             Some(Command::Remove(key)) => {
                 entries.remove(&key);
+            }
+            Some(Command::Restart(key)) => {
+                if let Some(entry) = entries.get_mut(&key) {
+                    entry.frames = None;
+                    entry.failed = false;
+                    entry.next = Instant::now();
+                }
             }
             Some(Command::Active(keys)) => {
                 active = keys.into_iter().collect();

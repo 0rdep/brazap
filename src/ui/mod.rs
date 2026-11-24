@@ -13,6 +13,7 @@ mod links;
 mod locale;
 mod mcp;
 mod media;
+mod mentions;
 mod phone;
 mod picker;
 mod preferences;
@@ -84,6 +85,7 @@ enum Command {
     Update,
     Call(&'static str, Value),
     Search(search::Request),
+    Members(String),
     Stickers(bool),
     RememberEmoji(String),
     Jump(Message, u64),
@@ -140,6 +142,7 @@ enum Event {
     SnapshotFailed(String),
     Update(Result<crate::updates::UpdateState, String>),
     Search(search::Request, Result<SearchResults, String>),
+    Members(String, Result<Vec<crate::model::Member>, String>),
     Stickers(bool, Result<Value, String>),
     Jump(Message, u64, Result<MessagePage, String>),
     Gallery(String, String, Result<MediaPage, String>),
@@ -244,6 +247,19 @@ pub(super) struct State {
     phone_country: phone::Picker,
     drafts: HashMap<String, String>,
     pending_sends: HashMap<String, (Message, Option<MessageCursor>)>,
+    /// Each group's members for `@` mentions, asked for once per session.
+    members: HashMap<String, Vec<crate::model::Member>>,
+    members_pending: HashSet<String>,
+    /// The highlighted member while typing a mention, the mention it belongs to,
+    /// and one closed with Esc (by its `@` position).
+    mention_index: usize,
+    mention_seen: Option<(usize, String)>,
+    mention_dismissed: Option<usize>,
+    /// The `@Name` tags picked in each chat's draft and whom they name.
+    draft_mentions: HashMap<String, Vec<(String, crate::model::Member)>>,
+    /// The sticker whose sound is on (chat, sender, ID): it plays with the
+    /// animation and both start over together.
+    sticker_sound: Option<(String, String, String)>,
     phone_mode: bool,
     details: bool,
     gallery: Vec<Message>,
@@ -402,6 +418,13 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         phone_country: phone::Picker::default(),
         drafts: HashMap::new(),
         pending_sends: HashMap::new(),
+        members: HashMap::new(),
+        members_pending: HashSet::new(),
+        mention_index: 0,
+        mention_seen: None,
+        mention_dismissed: None,
+        draft_mentions: HashMap::new(),
+        sticker_sound: None,
         phone_mode: false,
         details: false,
         gallery: Vec::new(),
@@ -770,6 +793,13 @@ async fn worker(
                         assets.spawn(async move {if let Err(error)=remote.call("prepare_media",json!({"chat":chat,"items":items})).await{log::debug!("Could not prepare media: {error}");}});
                         continue;
                     }
+                    Some(Command::Members(chat))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=remote.call("group_members",json!({"chat":chat})).await.and_then(|v|Ok(serde_json::from_value(v)?)).map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Members(chat,result));
+                        });continue;
+                    }
                     Some(Command::Search(request))=>{
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
                         assets.spawn(async move {
@@ -819,7 +849,9 @@ async fn worker(
                             let result=async {
                                 let suffix=match message.mime.as_deref(){Some("audio/mpeg")=>".mp3",Some("audio/mp4")=>".m4a",Some("audio/wav")=>".wav",_=>".ogg"};
                                 let file=tempfile::Builder::new().prefix("brazap-audio-").suffix(suffix).tempfile()?.into_temp_path();
-                                remote.call("save_attachment",json!({"chat":message.chat,"sender":message.sender,"id":message.id,"path":file.to_string_lossy()})).await?;
+                                // A sticker with sound plays the audio inside the sticker.
+                                let method=if message.kind=="sticker" {"save_sticker_sound"} else {"save_attachment"};
+                                remote.call(method,json!({"chat":message.chat,"sender":message.sender,"id":message.id,"path":file.to_string_lossy()})).await?;
                                 tokio::task::spawn_blocking(move||crate::playback::prepare_audio(file)).await?
                             }.await.map_err(|e|format!("{e:#}"));
                             emit(&events,&wake,Event::Audio(generation,result));
@@ -837,7 +869,7 @@ async fn worker(
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
                         assets.spawn(async move {
                             for upload in uploads {
-                                let result=remote.call("send_attachment",json!({"chat":chat,"path":upload.path,"kind":upload.kind,"caption":upload.caption,"view_once":upload.view_once})).await
+                                let result=remote.call("send_attachment",json!({"chat":chat,"path":upload.path,"kind":upload.kind,"caption":upload.caption,"view_once":upload.view_once,"mentions":upload.mentions,"mention_everyone":upload.mention_everyone})).await
                                     .and_then(|value|Ok(serde_json::from_value(value["message"].clone())?))
                                     .map_err(|e|format!("{e:#}"));
                                 let failed=result.is_err();
@@ -905,7 +937,7 @@ async fn worker(
                     Some(Command::Send(message,reply))=>{
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
                         assets.spawn(async move {
-                            let result=remote.call("send_message",json!({"chat":message.chat,"text":message.text,"reply_to":reply,"message_id":message.id,"timestamp":message.timestamp})).await
+                            let result=remote.call("send_message",json!({"chat":message.chat,"text":message.text,"reply_to":reply,"message_id":message.id,"timestamp":message.timestamp,"mentions":message.mentions.iter().map(|m|m.jid.as_str()).collect::<Vec<_>>(),"mention_everyone":message.mentions_everyone})).await
                                 .and_then(|v|Ok(serde_json::from_value(v["message"].clone())?)).map_err(|e|format!("{e:#}"));
                             emit(&events,&wake,Event::Sent(message.id,result));
                         });
@@ -1040,6 +1072,7 @@ async fn worker(
 
 fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
     locale::configure(&state.preferences.value.appearance);
+    state.poll_mentions();
     // Notices stay for a few seconds once shown; "Creating sticker…" stays until it is done.
     if state.sticker_jobs == 0
         && let Some((_, expiry)) = &mut state.notice
@@ -1331,6 +1364,16 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
                     changed = true;
                 }
             }
+            Event::Members(chat, result) => {
+                state.members_pending.remove(&chat);
+                match result {
+                    Ok(members) => {
+                        state.members.insert(chat, members);
+                    }
+                    Err(error) => log::debug!("Group members unavailable: {error}"),
+                }
+                changed = true;
+            }
             Event::Asset(key, result) => {
                 state.image_pending.remove(&key);
                 match result {
@@ -1407,8 +1450,14 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
                             if let Some(wake) = state.wake.lock().ok().and_then(|w| w.waker.clone())
                             {
                                 let player = video::Player::new_audio(file, wake);
-                                player.set_rate(state.voice_rate);
+                                let sticker = voice.message.kind == "sticker";
+                                // A sticker's sound keeps its own pace, from its first frame.
+                                player.set_rate(if sticker { 1.0 } else { state.voice_rate });
                                 voice.player = Some(player);
+                                if sticker {
+                                    let message = voice.message.clone();
+                                    state.restart_sticker(&message);
+                                }
                             }
                         }
                         Err(error) => voice.error = Some(error),
@@ -1570,6 +1619,26 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
         let _ = state.tx.send(Command::Diagnostics);
         tx.wake_after(Duration::from_secs(1));
     }
+    // A sticker with its sound on loops: sound and animation start over together.
+    let sticker_loop = state.voice.as_ref().and_then(|voice| {
+        let player = voice.player.as_ref()?;
+        let status = player.status();
+        (status.ended
+            && status.error.is_none()
+            && !voice.last_status.as_ref().is_some_and(|s| s.ended)
+            && state.sticker_sound_on(&voice.message))
+        .then(|| voice.message.clone())
+    });
+    if let Some(message) = sticker_loop {
+        if let Some(player) = state.voice.as_ref().and_then(|v| v.player.as_ref()) {
+            player.seek(0.0);
+            player.toggle();
+        }
+        state.restart_sticker(&message);
+        if let Some(voice) = &mut state.voice {
+            voice.last_status = None;
+        }
+    }
     if let Some(voice) = &mut state.voice
         && let Some(player) = &voice.player
     {
@@ -1578,6 +1647,8 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
             && status.error.is_none()
             && !voice.last_status.as_ref().is_some_and(|s| s.ended)
             && state.story.is_none()
+            // A sticker's sound plays once; it does not start the next voice message.
+            && voice.message.kind != "sticker"
         {
             let _ = state.tx.send(Command::NextAudio(
                 state.voice_generation,
@@ -2255,13 +2326,17 @@ impl State {
         }
         if let Some(chat) = self.selected.clone() {
             let reply = self.reply.take();
+            let draft = self.draft.text.clone();
+            let (text, mentions, mentions_everyone) = self.outgoing_text(&chat, &draft);
             let message = Message {
                 id: crate::outbox::new_id(),
                 chat: chat.clone(),
                 sender: "self".into(),
                 from_me: true,
                 timestamp: crate::model::now(),
-                text: self.draft.text.clone(),
+                text,
+                mentions,
+                mentions_everyone,
                 kind: "text".into(),
                 status: "sending".into(),
                 quote: reply.as_ref().map(|r| crate::model::Quote {
@@ -2461,6 +2536,12 @@ fn on_key(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
             s.attachments_open = false;
             return true;
         }
+    }
+    if s.viewer.is_some()
+        && matches!(event.key, rune::Key::Left | rune::Key::Right)
+        && s.step_viewer(event.key == rune::Key::Right)
+    {
+        return true;
     }
     if let Some(video) = &s.video {
         match &event.key {
@@ -2858,6 +2939,12 @@ impl State {
     }
 
     fn close_viewer(&mut self) {
+        // A sticker's sound stops with the preview that played it.
+        if let Some(viewer) = &self.viewer
+            && self.sticker_sound_on(viewer)
+        {
+            self.stop_voice();
+        }
         self.viewer_generation = self.viewer_generation.wrapping_add(1);
         self.viewer = None;
         self.viewer_zoom = media::Zoom::default();
@@ -2890,7 +2977,12 @@ impl State {
         let key = request.key();
         self.image_failures.remove(&key);
         self.request_asset(key, request);
+        // Opening a sticker with sound plays it, as phones do.
+        let sound = message.sticker_sound.then(|| message.clone());
         self.viewer = Some(message);
+        if let Some(sticker) = sound {
+            self.toggle_sticker_sound(sticker);
+        }
     }
 }
 

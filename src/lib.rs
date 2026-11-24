@@ -22,6 +22,7 @@ pub mod mcp;
 #[cfg(feature = "desktop")]
 pub mod media_convert;
 pub(crate) mod media_recovery;
+pub(crate) mod members;
 pub mod message_actions;
 pub mod model;
 pub mod notifications;

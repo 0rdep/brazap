@@ -65,7 +65,7 @@ impl Archive {
         let (rows, calls)=self.sql().read(move |conn| {
             let mut rows=Vec::new();
             for source in sources {
-            rows.extend(diesel::sql_query(format!("{select} WHERE m.account=? AND {scope} AND json_extract(m.payload,'$.kind')!='protocol' AND (m.timestamp,m.id,m.sender)<(?,?,?) ORDER BY m.timestamp DESC,m.id DESC,m.sender DESC LIMIT ?"))
+            rows.extend(diesel::sql_query(format!("{select} WHERE m.account=? AND {scope} AND json_extract(m.payload,'$.kind') NOT IN ('protocol','album') AND (m.timestamp,m.id,m.sender)<(?,?,?) ORDER BY m.timestamp DESC,m.id DESC,m.sender DESC LIMIT ?"))
                 .bind::<BigInt,_>(account).bind::<Text,_>(source).bind::<Text,_>(&aliases).bind::<BigInt,_>(cursor.timestamp).bind::<Text,_>(&cursor.id).bind::<Text,_>(&cursor.sender).bind::<BigInt,_>((limit+1) as i64).load::<MessageRow>(conn).map_err(db_error)?);
             }
             let calls = timeline_calls(conn, account, &aliases, &cursor, limit + 1, false).map_err(db_error)?;
@@ -107,7 +107,7 @@ impl Archive {
         let (rows, calls) = self.sql().read(move |conn| {
             let mut rows = Vec::new();
             for source in sources {
-                rows.extend(diesel::sql_query(format!("{select} WHERE m.account=? AND {scope} AND json_extract(m.payload,'$.kind')!='protocol' AND (m.timestamp,m.id,m.sender)>(?,?,?) ORDER BY m.timestamp,m.id,m.sender LIMIT ?"))
+                rows.extend(diesel::sql_query(format!("{select} WHERE m.account=? AND {scope} AND json_extract(m.payload,'$.kind') NOT IN ('protocol','album') AND (m.timestamp,m.id,m.sender)>(?,?,?) ORDER BY m.timestamp,m.id,m.sender LIMIT ?"))
                     .bind::<BigInt,_>(account).bind::<Text,_>(source).bind::<Text,_>(&aliases)
                     .bind::<BigInt,_>(cursor.timestamp).bind::<Text,_>(&cursor.id).bind::<Text,_>(&cursor.sender)
                     .bind::<BigInt,_>((limit+1) as i64).load::<MessageRow>(conn).map_err(db_error)?);
@@ -193,7 +193,7 @@ impl Archive {
         let (rows, calls)=self.sql().read(move |conn| {
             let mut rows=Vec::new();
             for source in sources {
-                rows.extend(diesel::sql_query(format!("{select} WHERE m.account=? AND {scope} AND json_extract(m.payload,'$.kind')!='protocol' AND (m.timestamp,m.id,m.sender)>=(?,?,?) ORDER BY m.timestamp,m.id,m.sender LIMIT 52"))
+                rows.extend(diesel::sql_query(format!("{select} WHERE m.account=? AND {scope} AND json_extract(m.payload,'$.kind') NOT IN ('protocol','album') AND (m.timestamp,m.id,m.sender)>=(?,?,?) ORDER BY m.timestamp,m.id,m.sender LIMIT 52"))
                     .bind::<BigInt,_>(account).bind::<Text,_>(source).bind::<Text,_>(&aliases).bind::<BigInt,_>(pivot.timestamp).bind::<Text,_>(&pivot.id).bind::<Text,_>(&pivot.sender).load::<MessageRow>(conn).map_err(db_error)?);
             }
             let calls = timeline_calls(conn, account, &aliases, &pivot.cursor(), 52, true).map_err(db_error)?;
@@ -239,7 +239,28 @@ impl Archive {
                 " AND json_extract(payload,'$.kind') IN ('image','video','audio','unsupported')",
             )
             .await?;
-        Ok(all || media || edits || view_once)
+        // Stickers with sound arrive wrapped and were shown as unsupported.
+        let audio_stickers = self
+            .reproject(
+                "message_audio_stickers_v1",
+                " AND json_extract(payload,'$.kind')='unsupported'",
+            )
+            .await?;
+        // Albums were shown as unsupported and their photos and videos one by one;
+        // texts that tag everyone did not know it.
+        let albums = self
+            .reproject(
+                "message_albums_v1",
+                " AND json_extract(payload,'$.kind') IN ('unsupported','image','video')",
+            )
+            .await?;
+        let everyone = self
+            .reproject(
+                "message_everyone_v1",
+                " AND instr(json_extract(payload,'$.text'),'@all')>0",
+            )
+            .await?;
+        Ok(all || media || edits || view_once || audio_stickers || albums || everyone)
     }
 
     async fn reproject(&self, marker: &'static str, only: &'static str) -> Result<bool> {

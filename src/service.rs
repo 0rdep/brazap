@@ -403,11 +403,17 @@ impl Service {
         // shows their verified name, which usync reports with the account.
         let unnamed: Vec<(whatsapp_rust::Jid, Vec<String>)> = chats
             .iter()
+            // usync answers phone numbers and LIDs only; a hosted business address
+            // (@hosted.lid) leaves the whole query unanswered.
             .filter(|chat| {
-                !chat.jid.ends_with("@g.us")
-                    && !chat.jid.ends_with("@newsletter")
-                    && !chat.jid.ends_with("@broadcast")
-                    && !crate::storage::meaningful_name(&chat.jid, &chat.name)
+                // Listed chats show the phone number when they have no name, and a
+                // number is not a name even when the address is a LID.
+                let phone_only = chat
+                    .name
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '(' | ')' | ' '));
+                (chat.jid.ends_with("@s.whatsapp.net") || chat.jid.ends_with("@lid"))
+                    && (phone_only || !crate::storage::meaningful_name(&chat.jid, &chat.name))
             })
             .filter_map(|chat| {
                 let mut aliases = chat.aliases.0.clone();
@@ -418,33 +424,57 @@ impl Service {
         // Once a day at most: unknown numbers stay unnamed and usync is rate limited.
         let checked = self
             .archive
-            .preference("business_names_checked_at".into())
+            .preference("business_names_checked_v4_at".into())
             .await?
             .and_then(|at| at.parse::<i64>().ok())
             .unwrap_or(0);
-        let unnamed = if now() - checked >= 24 * 3600 && !unnamed.is_empty() {
-            self.archive
-                .set_preference("business_names_checked_at".into(), now().to_string())
-                .await?;
+        let unnamed = if now() - checked >= 24 * 3600 {
             unnamed
         } else {
             Vec::new()
         };
+        let mut complete = true;
+        let (mut asked, mut answered, mut businesses, mut named) = (0, 0, 0, 0);
         for entries in unnamed.chunks(50) {
             let batch: Vec<_> = entries.iter().map(|(jid, _)| jid.clone()).collect();
-            let found = match tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                client.contacts().get_user_info(&batch),
-            )
-            .await
-            {
-                Ok(Ok(found)) => found,
-                Ok(Err(error)) => {
-                    log::debug!("Business names refresh: {error}");
-                    break;
+            asked += batch.len();
+            // One failed batch must not skip the others.
+            let lookup = |batch: Vec<whatsapp_rust::Jid>| {
+                let client = client.clone();
+                async move {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(20),
+                        client.contacts().get_user_info(&batch),
+                    )
+                    .await
+                    {
+                        Ok(Ok(found)) => Ok(found),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(_) => Err("timed out".to_owned()),
+                    }
                 }
-                Err(_) => break,
             };
+            let found = match lookup(batch.clone()).await {
+                Ok(found) => found,
+                Err(error) => {
+                    // One address the server does not answer stalls the whole query;
+                    // ask for each alone so the others still get their names.
+                    log::warn!(
+                        "Business names: a lookup of {} chats failed ({error}); asking for each",
+                        batch.len()
+                    );
+                    let mut found = std::collections::HashMap::new();
+                    for jid in &batch {
+                        match lookup(vec![jid.clone()]).await {
+                            Ok(one) => found.extend(one),
+                            Err(_) => complete = false,
+                        }
+                    }
+                    found
+                }
+            };
+            answered += found.len();
+            businesses += found.values().filter(|i| i.is_business).count();
             for (jid, aliases) in entries {
                 let info = found.get(jid).or_else(|| {
                     found
@@ -457,11 +487,23 @@ impl Service {
                     .map(str::trim)
                     .filter(|name| !name.is_empty());
                 if let Some(name) = name {
+                    named += 1;
                     self.archive
                         .name_unnamed_chat(aliases.clone(), name.to_owned())
                         .await?;
                 }
             }
+        }
+        // A failed lookup is retried at the next connection, not a day later.
+        if asked > 0 && complete {
+            self.archive
+                .set_preference("business_names_checked_v4_at".into(), now().to_string())
+                .await?;
+        }
+        if asked > 0 {
+            log::info!(
+                "Business names: asked about {asked} unnamed chats, {answered} answered, {businesses} businesses, {named} named"
+            );
         }
         for chat in chats.iter().filter(|chat| {
             chat.jid.ends_with("@newsletter")
@@ -1389,9 +1431,18 @@ impl Service {
         kind: String,
         caption: String,
         view_once: bool,
+        mentions: Vec<String>,
+        mention_everyone: bool,
     ) -> Result<Message> {
         self.archive.allow_chat(&chat).await?;
         ensure!(caption.len() <= 65_536, "Message is too long");
+        ensure!(
+            mentions.len() <= 1024
+                && mentions
+                    .iter()
+                    .all(|jid| jid.parse::<whatsapp_rust::Jid>().is_ok()),
+            "Invalid mention"
+        );
         ensure!(
             kind != "audio" || caption.trim().is_empty(),
             "Audio files do not support captions."
@@ -1480,6 +1531,8 @@ impl Service {
                     .with_caption(caption),
             ),
         };
+        let mut message = message;
+        crate::content::tag_caption(&mut message, mentions, mention_everyone);
         // Like WhatsApp, keep no copy of view-once media after sending it.
         let (message, media) = if view_once {
             (crate::content::into_view_once(message)?, None)
@@ -1651,6 +1704,34 @@ impl Service {
         Ok(())
     }
 
+    /// Saves the sound of a sticker with sound. It is fetched each time it is played
+    /// and never replaces the sticker image kept for the message.
+    pub async fn save_sticker_sound(
+        &self,
+        chat: String,
+        sender: String,
+        id: String,
+        path: String,
+    ) -> Result<()> {
+        let proto = self
+            .archive
+            .raw_message(chat.clone(), sender.clone(), id.clone())
+            .await?;
+        let audio = crate::content::sticker_audio(&proto).context("This sticker has no sound")?;
+        let view = Message {
+            chat,
+            sender,
+            id,
+            kind: "audio".into(),
+            mime: audio.mimetype.clone(),
+            ..Default::default()
+        };
+        let client = self.connected().await?;
+        let bytes = crate::media_recovery::download(&client, &view, &audio).await?;
+        tokio::fs::write(path, bytes).await?;
+        Ok(())
+    }
+
     pub async fn shutdown(&self) {
         self.stop_calls().await;
         self.stopping.store(true, Ordering::Relaxed);
@@ -1662,6 +1743,52 @@ impl Service {
             }
         }
         self.restart.notify_one();
+    }
+}
+
+impl Service {
+    /// Asks WhatsApp about each address of a chat separately and reports the raw
+    /// answers, to find where a name shown on phones comes from.
+    pub(crate) async fn diagnose_contact(&self, chat: String) -> Result<serde_json::Value> {
+        let client = self.connected().await?;
+        let identities = self.archive.identities().await?;
+        let mut report = Vec::new();
+        for alias in identities.aliases(&chat) {
+            let Ok(jid) = alias.parse::<whatsapp_rust::Jid>() else {
+                continue;
+            };
+            let answer = match tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                client.contacts().get_user_info(std::slice::from_ref(&jid)),
+            )
+            .await
+            {
+                Ok(Ok(found)) => serde_json::json!(found
+                    .iter()
+                    .map(|(key, info)| serde_json::json!({
+                        "key": key.to_string(),
+                        "jid": info.jid.to_string(),
+                        "pn": info.pn_jid.as_ref().map(ToString::to_string),
+                        "lid": info.lid.as_ref().map(ToString::to_string),
+                        "is_business": info.is_business,
+                        "business_error": info.business_error.as_ref().map(|e| format!("{e:?}")),
+                        "verified_name": info.verified_name.as_ref().map(|v| serde_json::json!({
+                            "name": v.name,
+                            "serial": v.serial,
+                            "issuer": v.issuer,
+                            "has_certificate": v.certificate.is_some(),
+                        })),
+                        "picture_id": info.picture_id,
+                        "username": info.username.as_ref().map(ToString::to_string),
+                        "status_error": info.status_error.as_ref().map(|e| format!("{e:?}")),
+                    }))
+                    .collect::<Vec<_>>()),
+                Ok(Err(error)) => serde_json::json!({ "error": error.to_string() }),
+                Err(_) => serde_json::json!({ "error": "timed out" }),
+            };
+            report.push(serde_json::json!({ "address": alias, "answer": answer }));
+        }
+        Ok(serde_json::json!({ "chat": chat, "addresses": report }))
     }
 }
 

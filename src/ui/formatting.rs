@@ -30,6 +30,48 @@ impl Formatted {
 
 /// Format `source`, leaving `protected` byte ranges (links, mentions) untouched.
 pub(super) fn format(source: &str, protected: &[Range<usize>]) -> Formatted {
+    let (drop, styles) = analyze(source, protected);
+    let chars: Vec<(usize, char)> = source.char_indices().collect();
+    let mut text = String::with_capacity(source.len());
+    let mut map = vec![0; source.len() + 1];
+    for (i, c) in &chars {
+        for slot in &mut map[*i..*i + c.len_utf8()] {
+            *slot = text.len();
+        }
+        if !drop[*i] {
+            text.push(*c);
+        }
+    }
+    map[source.len()] = text.len();
+    let styles = styles
+        .into_iter()
+        .map(|(range, style)| (map[range.start]..map[range.end], style))
+        .filter(|(range, _)| range.start < range.end)
+        .collect();
+    Formatted { text, styles, map }
+}
+
+/// The styles and markers of `source` in its own byte positions, for an editor
+/// that keeps the markers visible: (marker ranges, styled content ranges).
+pub(super) fn in_place(
+    source: &str,
+    protected: &[Range<usize>],
+) -> (Vec<Range<usize>>, Vec<(Range<usize>, Style)>) {
+    let (drop, styles) = analyze(source, protected);
+    let mut markers: Vec<Range<usize>> = Vec::new();
+    for (i, dropped) in drop.iter().enumerate() {
+        if *dropped {
+            match markers.last_mut() {
+                Some(last) if last.end == i => last.end = i + 1,
+                _ => markers.push(i..i + 1),
+            }
+        }
+    }
+    (markers, styles)
+}
+
+/// Which bytes are formatting markers, and the styled ranges between them.
+fn analyze(source: &str, protected: &[Range<usize>]) -> (Vec<bool>, Vec<(Range<usize>, Style)>) {
     let chars: Vec<(usize, char)> = source.char_indices().collect();
     let mut drop = vec![false; source.len()];
     // Characters no marker may pair across or inside.
@@ -84,23 +126,8 @@ pub(super) fn format(source: &str, protected: &[Range<usize>]) -> Formatted {
 
     inline(&chars, &blocked, 0, chars.len(), &mut drop, &mut styles);
 
-    let mut text = String::with_capacity(source.len());
-    let mut map = vec![0; source.len() + 1];
-    for (i, c) in &chars {
-        for slot in &mut map[*i..*i + c.len_utf8()] {
-            *slot = text.len();
-        }
-        if !drop[*i] {
-            text.push(*c);
-        }
-    }
-    map[source.len()] = text.len();
-    let styles = styles
-        .into_iter()
-        .map(|(range, style)| (map[range.start]..map[range.end], style))
-        .filter(|(range, _)| range.start < range.end)
-        .collect();
-    Formatted { text, styles, map }
+    inline(&chars, &blocked, 0, chars.len(), &mut drop, &mut styles);
+    (drop, styles)
 }
 
 /// The shown text alone, for one-line previews.

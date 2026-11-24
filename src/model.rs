@@ -202,6 +202,16 @@ pub struct Message {
     pub reaction_update: Option<ReactionUpdate>,
     #[serde(default)]
     pub duration_seconds: Option<u32>,
+    /// For a photo or video sent in an album: the album's message ID. The album
+    /// itself is a message of kind "album" that is not shown on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album: Option<String>,
+    /// Tags everyone in the group (`@all`, shown in the app's language).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mentions_everyone: bool,
+    /// A sticker that plays a sound when opened.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sticker_sound: bool,
     #[serde(default)]
     pub waveform: Vec<u8>,
     /// People tagged with `@number` in the text. Only `jid` is stored; the
@@ -259,6 +269,18 @@ pub struct Mention {
     /// The connected WhatsApp account itself.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub me: bool,
+}
+
+/// A group member who can be mentioned.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Member {
+    /// The address the group uses for this person.
+    pub jid: String,
+    /// Contact name; empty when unknown.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub phone: String,
 }
 
 impl Mention {
@@ -382,7 +404,7 @@ impl Message {
         self.actionable() && self.kind != "view_once"
     }
     pub fn visible(&self) -> bool {
-        self.kind != "protocol"
+        self.kind != "protocol" && self.kind != "album"
     }
     /// Show an edit's text in place of the original body or caption.
     pub fn apply_edit(&mut self, edit: &EditUpdate, edited_at: Option<i64>) {
@@ -424,10 +446,24 @@ impl Message {
     pub fn actionable(&self) -> bool {
         !matches!(
             self.kind.as_str(),
-            "protocol" | "placeholder" | "unsupported" | "call" | "voice_call" | "video_call"
+            "protocol"
+                | "album"
+                | "placeholder"
+                | "unsupported"
+                | "call"
+                | "voice_call"
+                | "video_call"
         )
     }
     pub fn preview(&self) -> String {
+        self.preview_with(&|text| text.to_owned())
+    }
+    /// The preview with its fixed wording ("Photo", "Sticker"…) passed through
+    /// `translate`; what people wrote stays as it is.
+    pub fn preview_with(&self, translate: &dyn Fn(&str) -> String) -> String {
+        if self.kind == "placeholder" {
+            return translate(&self.text);
+        }
         let name = self
             .file_name
             .as_deref()
@@ -457,11 +493,17 @@ impl Message {
                 format!("{name} · {}", self.text)
             }
         } else if !self.text.trim().is_empty() {
-            self.text.clone()
+            if self.mentions_everyone {
+                // `@all` tags everyone; it reads in the app's language.
+                self.text
+                    .replace("@all", &format!("@{}", translate("everyone_tag")))
+            } else {
+                self.text.clone()
+            }
         } else if !self.title.is_empty() {
             self.title.clone()
         } else {
-            fallback.into()
+            translate(fallback)
         };
         body.split_whitespace()
             .collect::<Vec<_>>()

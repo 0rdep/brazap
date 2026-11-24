@@ -145,6 +145,8 @@ impl Service {
             Some(CHAT.into()),
             message_id,
             None,
+            Vec::new(),
+            false,
         )
         .await
     }

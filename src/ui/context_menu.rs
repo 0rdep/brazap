@@ -109,7 +109,10 @@ fn item(
 
 fn chat_items(s: &State, c: &Chat) -> El {
     let enabled = !s.busy && s.snapshot.connection.phase == Phase::Connected;
-    let mut body = col().w(222.0).gap(2.0).padding(6.0);
+    let mut body = col()
+        .min_w(super::locale::scale(222.0))
+        .gap(2.0)
+        .padding(6.0);
     for (action, active, yes, no) in [
         ("pin", c.pinned, "Pin chat", "Unpin chat"),
         (
@@ -170,7 +173,10 @@ fn chat_items(s: &State, c: &Chat) -> El {
 }
 
 fn profile_items(jid: &str, name: &str) -> El {
-    let mut body = col().w(222.0).gap(2.0).padding(6.0);
+    let mut body = col()
+        .min_w(super::locale::scale(222.0))
+        .gap(2.0)
+        .padding(6.0);
     let target = jid.to_owned();
     body = body.child(item("Copy image", true, false, move |s, _| {
         s.close_context_menu();
@@ -269,7 +275,10 @@ impl State {
 }
 
 fn message_items(s: &State, m: &Message) -> El {
-    let mut body = col().w(222.0).gap(2.0).padding(6.0);
+    let mut body = col()
+        .min_w(super::locale::scale(222.0))
+        .gap(2.0)
+        .padding(6.0);
     if !m.text.is_empty() {
         let text = m.text.clone();
         body = body.child(item("Copy text", true, false, move |s, tx| {

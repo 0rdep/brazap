@@ -22,6 +22,7 @@ pub(super) struct Voice {
 
 impl State {
     pub(super) fn stop_voice(&mut self) {
+        self.sticker_sound = None;
         self.voice_generation = self.voice_generation.wrapping_add(1);
         self.voice = None;
         self.voice_next_tick = None;
@@ -29,6 +30,52 @@ impl State {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
     }
+    pub(super) fn sticker_sound_on(&self, message: &Message) -> bool {
+        self.sticker_sound
+            .as_ref()
+            .is_some_and(|(chat, sender, id)| {
+                *chat == message.chat && *sender == message.sender && *id == message.id
+            })
+    }
+
+    /// Turns a sticker's sound on or off. While on, its sound plays with the
+    /// animation, from the first frame, and both loop together.
+    pub(super) fn toggle_sticker_sound(&mut self, message: Message) {
+        if self.sticker_sound_on(&message) {
+            self.stop_voice();
+            return;
+        }
+        self.stop_voice();
+        self.sticker_sound = Some((
+            message.chat.clone(),
+            message.sender.clone(),
+            message.id.clone(),
+        ));
+        let _ = self
+            .tx
+            .send(Command::Audio(self.voice_generation, message.clone()));
+        self.voice = Some(Voice {
+            message,
+            player: None,
+            error: None,
+            last_status: None,
+        });
+    }
+
+    /// Shows a sticker's animation from its first frame, in the chat and the preview.
+    pub(super) fn restart_sticker(&self, message: &Message) {
+        self.animations
+            .restart(&super::media::thumbnail_key(message));
+        self.animations.restart(
+            &crate::assets::AssetRequest::Image {
+                chat: message.chat.clone(),
+                sender: message.sender.clone(),
+                id: message.id.clone(),
+            }
+            .key(),
+        );
+    }
+
     pub(super) fn play_voice(&mut self, message: Message) {
         if let Some(voice) = &self.voice
             && voice.message.id == message.id

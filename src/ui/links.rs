@@ -66,19 +66,39 @@ pub(super) fn expand_mentions(
 /// "@me" and does nothing.
 pub(super) fn message_text(message: &Message, size: f32) -> El {
     let group = message.chat.ends_with("@g.us");
-    let (text, tags) = expand_mentions(&message.text, &message.mentions);
+    // `@all` tags everyone; show it as phones do, in the app's language.
+    let everyone = format!("@{}", super::locale::tr("everyone_tag"));
+    let body = if message.mentions_everyone {
+        super::mentions::replace_tag(&message.text, super::mentions::EVERYONE_TOKEN, &everyone)
+    } else {
+        message.text.clone()
+    };
+    let (text, tags) = expand_mentions(&body, &message.mentions);
     // Links and names keep their characters; WhatsApp markers around them still apply.
     let mut protected: Vec<_> = crate::links::detect(&text)
         .into_iter()
         .map(|(range, _)| range)
         .collect();
     protected.extend(tags.iter().map(|(range, _)| range.clone()));
+    let mut everyone_tags = Vec::new();
+    if message.mentions_everyone {
+        let mut from = 0;
+        while let Some(i) = text[from..].find(&everyone).map(|i| i + from) {
+            everyone_tags.push(i..i + everyone.len());
+            from = i + everyone.len();
+        }
+    }
+    protected.extend(everyone_tags.iter().cloned());
     let formatted = super::formatting::format(&text, &protected);
     let tags: Vec<_> = tags
         .into_iter()
         .map(|(range, index)| (formatted.map(&range), index))
         .collect();
-    let spans = tags.iter().map(|(range, _)| range.clone()).collect();
+    let spans = tags
+        .iter()
+        .map(|(range, _)| range.clone())
+        .chain(everyone_tags.iter().map(|range| formatted.map(range)))
+        .collect();
     let targets = tags
         .into_iter()
         .filter_map(|(range, index)| {

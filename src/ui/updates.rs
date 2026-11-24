@@ -38,13 +38,17 @@ pub(super) fn prompt(s: &State, labeled: bool) -> Option<El> {
         .center()
         .fill(MINT.alpha(0.12))
         .border(1.0, MINT.alpha(0.28))
-        .hover(MINT.alpha(0.2))
-        .motion(rune::tok::motion::SNAPPY)
         .child(glyph);
+    // The whole tile takes the pointer, like the other rail items.
     let mut button = col()
         .key("sidebar-update")
         .gap(3.0)
+        .py(4.0)
         .items_center()
+        .radius(12.0)
+        .fill(rune::Color::TRANSPARENT)
+        .hover(MINT.alpha(0.08))
+        .cursor(rune::Cursor::Pointer)
         .role(if downloading && !ready {
             "status"
         } else {
@@ -65,11 +69,12 @@ pub(super) fn prompt(s: &State, labeled: bool) -> Option<El> {
             locale::tr(action)
         })
         .child(mark);
-    if !small {
+    if small {
+        button = button.w(48.0);
+    } else {
         // One short word under the icon; the tooltip has the details.
         button = button
             .w_full()
-            .pb(4.0)
             .child(label(locale::tr("Update"), 10.5, MINT));
     }
     if ready {

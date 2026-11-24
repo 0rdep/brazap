@@ -1,6 +1,6 @@
 //! The local attachment draft. Clipboard reads, file drops, preparation and sending are
 //! separate: nothing reaches WhatsApp until the user confirms this preview.
-use std::{io::Write, path::PathBuf};
+use std::{collections::HashMap, io::Write, path::PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use rune::{
@@ -40,6 +40,12 @@ pub(super) struct Item {
     error: Option<String>,
 }
 
+impl Item {
+    pub(super) fn id(&self) -> u64 {
+        self.id
+    }
+}
+
 pub(super) struct Panel {
     pub chat: String,
     generation: u64,
@@ -77,6 +83,9 @@ pub(super) struct Upload {
     pub kind: String,
     pub caption: String,
     pub view_once: bool,
+    /// Members tagged in the caption, and whether it tags everyone.
+    pub mentions: Vec<String>,
+    pub mention_everyone: bool,
 }
 
 fn classify(path: &std::path::Path, document: bool) -> &'static str {
@@ -391,6 +400,25 @@ impl State {
     }
 
     pub(super) fn send_attachments(&mut self) {
+        // Captions as sent: picked `@Name` tags become WhatsApp's mentions.
+        let captions: Vec<(u64, String)> = self
+            .attachments
+            .as_ref()
+            .map(|panel| {
+                panel
+                    .items
+                    .iter()
+                    .map(|item| (item.id, item.caption.text.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut tagged = HashMap::new();
+        for (id, text) in captions {
+            tagged.insert(
+                id,
+                self.outgoing_text(&super::mentions::caption_key(id), &text),
+            );
+        }
         let Some(panel) = &mut self.attachments else {
             return;
         };
@@ -411,12 +439,17 @@ impl State {
                 return;
             }
             item.error = None;
+            let (caption, mentions, mention_everyone) = tagged
+                .remove(&item.id)
+                .unwrap_or_else(|| (item.caption.text.clone(), Vec::new(), false));
             uploads.push(Upload {
                 id: item.id,
                 path: prepared.path.to_string_lossy().into_owned(),
                 kind: prepared.kind.into(),
-                caption: item.caption.text.clone(),
+                caption,
                 view_once,
+                mentions: mentions.into_iter().map(|m| m.jid).collect(),
+                mention_everyone,
             });
         }
         panel.total = uploads.len();
@@ -690,13 +723,20 @@ pub(super) fn modal(s: &State) -> Option<(El, Vec<El>)> {
             );
         } else {
             let id = item.id;
+            let key = super::mentions::caption_key(id);
+            let (spans, strikes) = super::mentions::field_spans(s, &key, &item.caption.text);
+            if let Some(list) = super::mentions::popup_for(s, &key) {
+                body = body.child(list);
+            }
             let edit = rune::text_input(&item.caption, locale::style(13.0, 450.0))
                 .key(format!("attachment-caption-{id}"))
                 .w_full()
                 .wrap_anywhere()
                 .color(INK)
                 .placeholder(locale::tr("Add a caption…"), MUTED)
-                .caret(INK, kit().selection());
+                .caret(INK, kit().selection())
+                .spans(spans)
+                .strikes(strikes);
             let edit = if !panel.caption_available() {
                 edit
             } else {
@@ -713,7 +753,7 @@ pub(super) fn modal(s: &State) -> Option<(El, Vec<El>)> {
                         .unwrap()
                         .caption
                 })
-                .on_input_key(super::message_enter)
+                .on_input_key(super::mentions::composer_key)
                 .on_submit(|s: &mut State, _| s.send_attachments())
                 .on_input_paste(|s: &mut State, content, _| s.paste_attachments(content))
             };

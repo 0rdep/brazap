@@ -24,6 +24,7 @@ const BACK: Icon = Icon {
     body: r#"<path d="M19 12H5m6-6-6 6 6 6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
+pub(super) const GROUP_ICON: Icon = GROUP;
 const GROUP: Icon = Icon {
     name: "group",
     view: 24.0,
@@ -132,14 +133,24 @@ pub(super) fn layout(s: &State, _cx: &mut Cx<State>, layer: &mut Vec<El>) -> El 
             sidebar_open,
         ))
         .child(body("compact-content", compact(s), 68.0, !sidebar_open));
-    let contents = col().w_full().child(controls(s)).child(panes);
-    let branding = row()
+    let contents = col().w_full().pt(4.0).child(panes);
+    // The logo and the sidebar toggle share one compact row; collapsed, the toggle
+    // takes the logo's place so it never moves vertically.
+    let mut branding = row()
         .key("sidebar-brand")
         .w_full()
-        .h(40.0)
-        .px(14.0)
-        .center_y()
-        .child(brand(s, sidebar_open));
+        .h(36.0)
+        .px(if sidebar_open { 10.0 } else { 0.0 })
+        .gap(8.0)
+        .center_y();
+    if sidebar_open {
+        branding = branding
+            .child(brand(s, true).grow(1.0).min_w(0.0))
+            .child(sidebar_toggle(true));
+    } else {
+        // Collapsed, the logo stays on top and the toggle opens the rail below it.
+        branding = branding.justify_center().child(brand(s, false));
+    }
     let sidebar = col()
         .key("sidebar-shell")
         .w(if sidebar_open {
@@ -148,7 +159,7 @@ pub(super) fn layout(s: &State, _cx: &mut Cx<State>, layer: &mut Vec<El>) -> El 
             68.0
         })
         .h_full()
-        .gap(12.0)
+        .gap(8.0)
         .child(branding)
         .child(panel(contents).clip_rounded(22.0).grow(1.0).min_h(0.0));
     let main = if s.preferences.open {
@@ -199,48 +210,18 @@ pub(super) fn layout(s: &State, _cx: &mut Cx<State>, layer: &mut Vec<El>) -> El 
     body.child(panel(main).key("main-panel").grow(1.0).min_w(0.0).h_full())
 }
 
-fn controls(s: &State) -> El {
-    let open = s.sidebar.is_open();
-    let mut header = row()
-        .key("sidebar-controls")
-        .w_full()
-        .h(56.0)
-        .px(16.0)
-        .pt(16.0)
-        .gap(10.0)
-        .center_y()
-        .justify_end();
-    if open {
-        let heading = if s.section == Section::Status {
-            "Status"
-        } else if s.section == Section::Calls {
-            "Call history"
-        } else if s.show_archived {
-            "Archived"
+fn sidebar_toggle(open: bool) -> El {
+    icon_button(
+        if open { &COLLAPSE } else { &EXPAND },
+        if open {
+            "Collapse sidebar"
         } else {
-            Screen::current(s).label().1
-        };
-        header = header.child(
-            title(super::locale::tr(heading), 15.0)
-                .key("sidebar-heading")
-                .grow(1.0)
-                .min_w(0.0)
-                .truncate(),
-        );
-    }
-    header.child(
-        icon_button(
-            if open { &COLLAPSE } else { &EXPAND },
-            if open {
-                "Collapse sidebar"
-            } else {
-                "Expand sidebar"
-            },
-            |s, _| s.sidebar.toggle(),
-        )
-        .key("sidebar-toggle")
-        .motion(rune::tok::motion::GLIDE),
+            "Expand sidebar"
+        },
+        |s, _| s.sidebar.toggle(),
     )
+    .key("sidebar-toggle")
+    .motion(rune::tok::motion::GLIDE)
 }
 
 /// One rail entry: an icon, with its label under it while the sidebar is open.
@@ -266,33 +247,37 @@ pub(super) fn rail_item(
         );
     }
     let name = super::locale::tr(name);
-    // A square indicator around the icon only, whatever the label's width.
-    let mark = el()
-        .size(36.0, 36.0)
-        .radius(10.0)
-        .center()
+    let mark = el().size(30.0, 26.0).center().child(glyph);
+    // The selected screen fills its whole tile, icon and label; the tile takes the
+    // pointer and the press.
+    let item = col()
+        .key(format!("rail-{key}"))
+        .gap(2.0)
+        .py(6.0)
+        .items_center()
+        .radius(12.0)
         .fill(if selected {
-            MINT.alpha(0.14)
+            MINT.alpha(0.13)
         } else {
             Color::TRANSPARENT
         })
-        .hover(Color::WHITE.alpha(0.06))
+        .hover(if selected {
+            MINT.alpha(0.17)
+        } else {
+            Color::WHITE.alpha(0.045)
+        })
         .motion(rune::tok::motion::GLIDE)
-        .child(glyph);
-    let item = col()
-        .key(format!("rail-{key}"))
-        .gap(3.0)
-        .items_center()
+        .cursor(rune::Cursor::Pointer)
         .role("tab")
         .label(name.clone())
         .child(mark);
     if labeled {
         // No truncation or wrapping: the rail widens to its longest label.
         item.w_full()
-            .pb(4.0)
+            .px(8.0)
             .child(label(name, 10.5, if selected { INK } else { MUTED }))
     } else {
-        item.help(name)
+        item.w(48.0).help(name)
     }
 }
 
@@ -330,28 +315,28 @@ fn navigation(s: &State, screen: Screen, labeled: bool) -> El {
 
 /// Every screen, always shown, then the update prompt and Settings at the bottom.
 fn rail(s: &State, labeled: bool) -> El {
-    let mut rail = col()
-        .key("sidebar-rail")
-        .h_full()
-        .pt(10.0)
-        .pb(14.0)
-        .gap(4.0);
-    rail = if labeled {
-        rail.px(8.0).items_stretch()
-    } else {
-        rail.items_center()
+    let column = |key: &str| {
+        let column = col().key(key).w_full().gap(4.0);
+        if labeled {
+            column.items_stretch()
+        } else {
+            column.items_center()
+        }
     };
+    // The screens scroll on short windows; the update action and Settings stay
+    // pinned at the bottom.
+    let mut screens = column("rail-screens");
     for (i, screen) in Screen::EVERY.into_iter().enumerate() {
         if i == 5 {
-            rail = rail.child(el().w(24.0).h(1.0).my(4.0).self_center().fill(BORDER));
+            screens = screens.child(el().w(24.0).h(1.0).my(4.0).self_center().fill(BORDER));
         }
-        rail = rail.child(navigation(s, screen, labeled));
+        screens = screens.child(navigation(s, screen, labeled));
     }
-    rail = rail.child(el().grow(1.0));
+    let mut bottom = column("rail-bottom").pt(6.0);
     if let Some(update) = super::updates::prompt(s, labeled) {
-        rail = rail.child(update);
+        bottom = bottom.child(update);
     }
-    rail.child(
+    bottom = bottom.child(
         rail_item(
             "settings",
             &super::preferences::SETTINGS,
@@ -361,11 +346,36 @@ fn rail(s: &State, labeled: bool) -> El {
             labeled,
         )
         .on_press(|s: &mut State| s.open_preferences()),
-    )
+    );
+    let rail = col()
+        .key("sidebar-rail")
+        .h_full()
+        .pt(10.0)
+        .pb(14.0)
+        .child(
+            col()
+                .key("rail-scroll")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .scroll_edge_fade(10.0)
+                .child(screens),
+        )
+        .child(bottom);
+    if labeled { rail.px(8.0) } else { rail.w(56.0) }
 }
 
 fn compact(s: &State) -> El {
-    col().w_full().h_full().items_center().child(rail(s, false))
+    col()
+        .w_full()
+        .h_full()
+        .pt(10.0)
+        .items_center()
+        .child(sidebar_toggle(false))
+        .child(rail(s, false).grow(1.0).min_h(0.0))
 }
 
 fn search_input(s: &State) -> El {
@@ -864,7 +874,7 @@ fn chat_row(s: &State, chat: &Chat) -> El {
     }
     preview = preview.child(
         label(
-            if is_call || chat.preview_kind == "view_once" {
+            if is_call || matches!(chat.preview_kind.as_str(), "view_once" | "placeholder") {
                 super::locale::tr(&chat.preview)
             } else {
                 // Previews read like the message: WhatsApp's *markers* are not shown.

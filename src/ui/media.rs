@@ -115,6 +115,45 @@ const MUTED_SOUND: rune::Icon = rune::Icon {
     body: r#"<path d="M3 9h4l5-4v14l-5-4H3Zm13 0 6 6m0-6-6 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>"#,
 };
 
+const PREVIOUS: rune::Icon = rune::Icon {
+    name: "album-previous",
+    view: 24.0,
+    body: r#"<path d="m15 5-7 7 7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+const NEXT: rune::Icon = rune::Icon {
+    name: "album-next",
+    view: 24.0,
+    body: r#"<path d="m9 5 7 7-7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
+impl State {
+    /// Opens the album item before or after the one in the viewer.
+    pub(super) fn step_viewer(&mut self, forward: bool) -> bool {
+        let Some(current) = self.viewer.clone() else {
+            return false;
+        };
+        let items: Vec<Message> = album_items(self, &current).into_iter().cloned().collect();
+        let Some(at) = items.iter().position(|item| item.id == current.id) else {
+            return false;
+        };
+        let next = if forward {
+            at + 1
+        } else {
+            match at.checked_sub(1) {
+                Some(at) => at,
+                None => return false,
+            }
+        };
+        match items.get(next) {
+            Some(item) => {
+                self.open_image(item.clone());
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 pub(super) fn thumbnail(s: &State, message: &Message) -> El {
     let sticker = message.kind == "sticker";
     let actions = if s.forwarding.is_some() { 37.0 } else { 113.0 };
@@ -149,7 +188,171 @@ pub(super) fn thumbnail(s: &State, message: &Message) -> El {
             },
         ),
     };
-    tile(s, message, w, h, "chat").instant_changes()
+    with_sound_button(
+        s,
+        message,
+        tile(s, message, w, h, "chat").instant_changes(),
+        w,
+        h,
+    )
+}
+
+/// A sticker with sound gets a button to turn its sound on and off.
+fn with_sound_button(s: &State, message: &Message, tile: El, w: f32, h: f32) -> El {
+    if !message.sticker_sound {
+        return tile;
+    }
+    let m = message.clone();
+    let on = s.sticker_sound_on(message);
+    let name = if on {
+        "Mute sticker"
+    } else {
+        "Play sticker sound"
+    };
+    tile.child(
+        el().key(format!("sticker-sound-{}-{}", message.sender, message.id))
+            .absolute(w - 34.0, h - 34.0)
+            .size(30.0, 30.0)
+            .radius(15.0)
+            .center()
+            .fill(rune::Color::BLACK.alpha(if on { 0.7 } else { 0.5 }))
+            .border(1.0, MINT.alpha(if on { 0.6 } else { 0.0 }))
+            .hover(rune::Color::BLACK.alpha(0.75))
+            .cursor(rune::Cursor::Pointer)
+            .role("button")
+            .label(super::locale::tr(name))
+            .help(super::locale::tr(name))
+            .on_press(move |s: &mut State| s.toggle_sticker_sound(m.clone()))
+            .child(
+                icon(if on { &SOUND } else { &MUTED_SOUND }, 16.0).color(if on {
+                    MINT
+                } else {
+                    INK
+                }),
+            ),
+    )
+}
+
+/// Stickers sent one after another share a bubble, up to three side by side.
+const STICKERS_PER_ROW: usize = 3;
+
+fn joins_stickers(previous: &Message, next: &Message) -> bool {
+    previous.kind == "sticker"
+        && next.kind == "sticker"
+        && previous.chat == next.chat
+        && previous.sender == next.sender
+        && previous.from_me == next.from_me
+        && next.quote.is_none()
+        && next.timestamp.abs_diff(previous.timestamp) <= 300
+        && super::times::day(previous.timestamp) == super::times::day(next.timestamp)
+}
+
+/// The timeline range of the sticker row that holds `index`.
+pub(super) fn sticker_row_range(s: &State, index: usize) -> Option<std::ops::Range<usize>> {
+    let timeline = &s.timeline;
+    if timeline.get(index)?.kind != "sticker" {
+        return None;
+    }
+    let mut first = index;
+    while first > 0 && joins_stickers(&timeline[first - 1], &timeline[first]) {
+        first -= 1;
+    }
+    let mut last = index;
+    while last + 1 < timeline.len() && joins_stickers(&timeline[last], &timeline[last + 1]) {
+        last += 1;
+    }
+    let start = first + (index - first) / STICKERS_PER_ROW * STICKERS_PER_ROW;
+    Some(start..(start + STICKERS_PER_ROW).min(last + 1))
+}
+
+/// The stickers of a row, side by side; a single sticker keeps its usual size.
+pub(super) fn sticker_row(s: &State, message: &Message) -> El {
+    let index = s
+        .timeline
+        .iter()
+        .position(|m| m.id == message.id && m.sender == message.sender && m.chat == message.chat);
+    let range = index.and_then(|index| sticker_row_range(s, index));
+    match range {
+        Some(range) if range.len() > 1 => {
+            let side = 128.0;
+            let mut stickers = row().gap(6.0);
+            for item in &s.timeline[range] {
+                stickers = stickers.child(with_sound_button(
+                    s,
+                    item,
+                    tile(s, item, side, side, "chat").instant_changes(),
+                    side,
+                    side,
+                ));
+            }
+            stickers
+        }
+        _ => thumbnail(s, message),
+    }
+}
+
+/// Whether two messages are items of the same album.
+pub(super) fn same_album(a: &Message, b: &Message) -> bool {
+    a.album.is_some() && a.album == b.album && a.chat == b.chat && a.sender == b.sender
+}
+
+/// An album's items in timeline order.
+pub(super) fn album_items<'a>(s: &'a State, message: &Message) -> Vec<&'a Message> {
+    s.timeline
+        .iter()
+        .filter(|m| same_album(m, message) && matches!(m.kind.as_str(), "image" | "video"))
+        .collect()
+}
+
+/// Photos and videos sent together, as phones show them: two side by side,
+/// three as a pair over a wide one, four or more as a grid whose last tile
+/// counts the rest. Each opens the viewer, which steps through the album.
+pub(super) fn album(s: &State, message: &Message) -> El {
+    let items = album_items(s, message);
+    if items.len() < 2 {
+        return thumbnail(s, message);
+    }
+    let gap = 3.0;
+    let cell = 136.0;
+    let pair = |a: &Message, b: &Message, h: f32| {
+        row()
+            .gap(gap)
+            .child(tile(s, a, cell, h, "album"))
+            .child(tile(s, b, cell, h, "album"))
+    };
+    let grid = col()
+        .key(format!(
+            "album-{}",
+            message.album.as_deref().unwrap_or_default()
+        ))
+        .gap(gap);
+    match items.as_slice() {
+        [a, b] => grid.child(pair(a, b, cell * 1.35)),
+        [a, b, c] => {
+            grid.child(pair(a, b, cell))
+                .child(tile(s, c, cell * 2.0 + gap, cell, "album"))
+        }
+        [a, b, c, d, rest @ ..] => {
+            let mut last = tile(s, d, cell, cell, "album");
+            if !rest.is_empty() {
+                last = last.child(
+                    el().absolute(0.0, 0.0)
+                        .size(cell, cell)
+                        .radius(10.0)
+                        .center()
+                        .fill(rune::Color::BLACK.alpha(0.55))
+                        .child(title(format!("+{}", rest.len()), 26.0)),
+                );
+            }
+            grid.child(pair(a, b, cell)).child(
+                row()
+                    .gap(gap)
+                    .child(tile(s, c, cell, cell, "album"))
+                    .child(last),
+            )
+        }
+        _ => thumbnail(s, message),
+    }
 }
 
 pub(super) fn tile(s: &State, message: &Message, w: f32, h: f32, scope: &str) -> El {
@@ -186,10 +389,17 @@ pub(super) fn tile(s: &State, message: &Message, w: f32, h: f32, scope: &str) ->
                 s.open_image(m.clone());
             }
         });
+    // Album tiles are cropped to their cell, as on phones.
+    let fit = if scope == "album" {
+        preview = preview.clip_rounded(10.0);
+        SurfaceFit::Fill
+    } else {
+        SurfaceFit::Fit
+    };
     if let Some(pixels) = s.animations.pixels(&thumbnail_key(message)) {
-        preview = preview.pixels_fit(pixels, SurfaceFit::Fit);
+        preview = preview.pixels_fit(pixels, fit);
     } else if let Some(image) = image {
-        preview = preview.pixels_fit(image.pixels(), SurfaceFit::Fit);
+        preview = preview.pixels_fit(image.pixels(), fit);
     } else {
         preview = preview.child(
             col()
@@ -277,6 +487,25 @@ pub(super) fn viewer(s: &State) -> Option<El> {
     .key();
     let image = s.images.get(&key).filter(|image| image.error().is_none());
     let save = m.clone();
+    let mut header = row()
+        .gap(10.0)
+        .center_y()
+        .child(title(super::locale::tr("Image preview"), 16.0))
+        .child(el().grow(1.0));
+    // An album's photos and videos are browsed in place: ←/→ or these buttons.
+    let items = album_items(s, m);
+    if items.len() > 1
+        && let Some(at) = items.iter().position(|item| item.id == m.id)
+    {
+        header = header
+            .child(icon_button(&PREVIOUS, "Previous · ←", |s, _| {
+                s.step_viewer(false);
+            }))
+            .child(label(format!("{} / {}", at + 1, items.len()), 12.0, MUTED))
+            .child(icon_button(&NEXT, "Next · →", |s, _| {
+                s.step_viewer(true);
+            }));
+    }
     let mut content = col()
         .w_full()
         .h_full()
@@ -284,11 +513,7 @@ pub(super) fn viewer(s: &State) -> Option<El> {
         .gap(12.0)
         .on_press(|_: &mut State| {})
         .child(
-            row()
-                .gap(10.0)
-                .center_y()
-                .child(title(super::locale::tr("Image preview"), 16.0))
-                .child(el().grow(1.0))
+            header
                 .child(icon_button(&DOWNLOAD, "Save original", move |s, tx| {
                     save_file(s, tx, save.clone())
                 }))

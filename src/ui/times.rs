@@ -35,8 +35,19 @@ pub(super) fn chat_date(timestamp: i64) -> String {
         super::view::clock(timestamp)
     } else if Some(date) == today.pred_opt() {
         locale::tr("Yesterday")
+    } else if date < today && (today - date).num_days() < 7 {
+        // As WhatsApp does: the weekday within the last week, then a short date,
+        // so the date never crowds the chat's name.
+        locale::tr(&date.format("%A").to_string())
     } else {
-        full_date(date)
+        locale::format(
+            "{day}/{month}/{year}",
+            &[
+                ("day", format!("{:02}", date.day())),
+                ("month", format!("{:02}", date.month())),
+                ("year", date.year().to_string()),
+            ],
+        )
     }
 }
 

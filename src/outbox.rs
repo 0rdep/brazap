@@ -61,7 +61,30 @@ impl Service {
         id: String,
         timestamp: Option<i64>,
     ) -> Result<Message> {
-        self.send_text_with_source(chat, text, reply, None, id, timestamp)
+        self.send_text_with_source(chat, text, reply, None, id, timestamp, Vec::new(), false)
+            .await
+    }
+
+    /// Sends text that tags group members: each `@<number>` in `text` names one
+    /// of `mentions`, which WhatsApp uses to notify them and show their names.
+    pub async fn send_text_mentioning(
+        &self,
+        chat: String,
+        text: String,
+        reply: Option<MessageCursor>,
+        id: String,
+        timestamp: Option<i64>,
+        mentions: Vec<String>,
+        everyone: bool,
+    ) -> Result<Message> {
+        ensure!(
+            mentions.len() <= 1024
+                && mentions
+                    .iter()
+                    .all(|jid| jid.parse::<whatsapp_rust::Jid>().is_ok()),
+            "Invalid mention"
+        );
+        self.send_text_with_source(chat, text, reply, None, id, timestamp, mentions, everyone)
             .await
     }
 
@@ -73,6 +96,8 @@ impl Service {
         source_chat: Option<String>,
         id: String,
         timestamp: Option<i64>,
+        mentions: Vec<String>,
+        everyone: bool,
     ) -> Result<Message> {
         ensure!(
             !text.trim().is_empty() && text.len() <= 65_536,
@@ -124,13 +149,26 @@ impl Service {
                     .raw_message(source.to_owned(), target.sender.clone(), target.id.clone())
                     .await?;
                 let author = self.author(&target.sender).await?;
-                let context = whatsapp_rust::wacore::proto_helpers::build_quote_context_with_info(
-                    target.id,
-                    &author,
-                    &source.parse()?,
-                    &jid,
-                    &crate::content::quotable(&original),
-                );
+                let mut context =
+                    whatsapp_rust::wacore::proto_helpers::build_quote_context_with_info(
+                        target.id,
+                        &author,
+                        &source.parse()?,
+                        &jid,
+                        &crate::content::quotable(&original),
+                    );
+                context.mentioned_jid = mentions;
+                if everyone {
+                    context.non_jid_mentions = Some(1);
+                }
+                wa::Message::text_with_context(text, context)
+            } else if !mentions.is_empty() || everyone {
+                let mut context = wa::ContextInfo::default();
+                context.mentioned_jid = mentions;
+                // As WhatsApp sends `@all`: the text tag and bit 1 of nonJidMentions.
+                if everyone {
+                    context.non_jid_mentions = Some(1);
+                }
                 wa::Message::text_with_context(text, context)
             } else {
                 wa::Message::text(text)

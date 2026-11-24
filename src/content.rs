@@ -253,8 +253,63 @@ fn template(view: &mut Message, t: &wa::message::TemplateMessage) {
     }
 }
 
+/// Tags group members (and everyone, as `@all` does) in a photo, video or
+/// document caption, the way a text message tags them.
+pub fn tag_caption(message: &mut wa::Message, mentions: Vec<String>, everyone: bool) {
+    if mentions.is_empty() && !everyone {
+        return;
+    }
+    let context = if let Some(m) = message.image_message.as_option_mut() {
+        &mut m.context_info
+    } else if let Some(m) = message.video_message.as_option_mut() {
+        &mut m.context_info
+    } else if let Some(m) = message.document_message.as_option_mut() {
+        &mut m.context_info
+    } else {
+        return;
+    };
+    let mut info = context.as_option().cloned().unwrap_or_default();
+    info.mentioned_jid = mentions;
+    if everyone {
+        info.non_jid_mentions = Some(1);
+    }
+    *context = whatsapp_rust::waproto::buffa::MessageField::some(info);
+}
+
+/// A sticker with sound arrives wrapped (`audioStickerMessage`), carrying its audio
+/// inside the sticker. Read it as the sticker it contains; the archive keeps the
+/// original protobuf.
+pub fn unwrap_audio_sticker(message: &wa::Message) -> Cow<'_, wa::Message> {
+    match message
+        .get_base_message()
+        .audio_sticker_message
+        .as_option()
+        .and_then(|wrapper| wrapper.message.as_option())
+    {
+        Some(inner) => Cow::Owned(inner.clone()),
+        None => Cow::Borrowed(message),
+    }
+}
+
+/// The audio a sticker with sound plays, when it has one.
+pub fn sticker_audio(message: &wa::Message) -> Option<wa::message::AudioMessage> {
+    use whatsapp_rust::waproto::whatsapp::__buffa::oneof::message::sticker_message::Audio;
+    let message = unwrap_audio_sticker(message);
+    let base = message.get_base_message();
+    match &base.sticker_message.as_option()?.audio {
+        Some(Audio::AudioMessage(audio)) => Some((**audio).clone()),
+        _ => None,
+    }
+}
+
 /// The archive keeps the original protobuf. This is only its user-visible projection.
 pub fn project(view: &mut Message, message: &wa::Message) {
+    if let Some(audio) = sticker_audio(message) {
+        view.sticker_sound = true;
+        view.duration_seconds = audio.seconds;
+    }
+    let message = unwrap_audio_sticker(message);
+    let message = message.as_ref();
     let base = message.get_base_message();
     if let Some(text) = base.extended_text_message.as_option() {
         view.background_argb = text.background_argb;
@@ -285,8 +340,23 @@ pub fn project(view: &mut Message, message: &wa::Message) {
     if project_call(view, message) {
         return;
     }
+    if let Some(association) = message
+        .message_context_info
+        .as_option()
+        .and_then(|info| info.message_association.as_option())
+        .filter(|a| {
+            a.association_type == Some(wa::message_association::AssociationType::MEDIA_ALBUM)
+        })
+    {
+        view.album = association
+            .parent_message_key
+            .as_option()
+            .and_then(|key| key.id.clone());
+    }
     if let Some(context) = base.context_info() {
         view.forwarded = context.is_forwarded.unwrap_or(false);
+        // Bit 1 of nonJidMentions: `@all` tags everyone in the group.
+        view.mentions_everyone = context.non_jid_mentions.is_some_and(|bits| bits & 1 != 0);
         for jid in &context.mentioned_jid {
             if !jid.is_empty() && !view.mentions.iter().any(|m| &m.jid == jid) {
                 view.mentions.push(crate::model::Mention {
@@ -476,6 +546,11 @@ pub fn project(view: &mut Message, message: &wa::Message) {
         view.mime = m.mimetype.clone();
         view.file_name = m.file_name.clone().or_else(|| m.title.clone());
     }
+    if base.album_message.is_set() {
+        // Its photos and videos arrive as their own messages that point back here.
+        view.kind = "album".into();
+        return;
+    }
     if view.kind == "text" && view.text.trim().is_empty() && view.title.is_empty() {
         view.kind = "unsupported".into();
         view.text = "This message type is not supported yet.".into();
@@ -627,6 +702,13 @@ pub(crate) fn quotable(message: &wa::Message) -> Cow<'_, wa::Message> {
 
 /// Expose media from business-message headers through the same download/cache path.
 pub fn media_message(message: &wa::Message) -> Cow<'_, wa::Message> {
+    if let Cow::Owned(inner) = unwrap_audio_sticker(message) {
+        let mut sticker = wa::Message::default();
+        sticker.sticker_message = inner.get_base_message().sticker_message.clone();
+        if sticker.sticker_message.is_set() {
+            return Cow::Owned(sticker);
+        }
+    }
     let base = message.get_base_message();
     macro_rules! wrap {
         ($field:ident,$value:expr) => {{
