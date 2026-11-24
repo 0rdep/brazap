@@ -270,7 +270,7 @@ impl Service {
                 Default::default(),
             )
             .await?;
-        let stored = self.archive.stored_sticker(hash).await?;
+        let stored = self.archive.stored_sticker(hash.clone()).await?;
         let mut proto = wa::Message::decode_from_slice(&stored.encoded)?;
         let sticker = proto
             .sticker_message
@@ -283,8 +283,95 @@ impl Service {
         sticker.file_sha256 = Some(uploaded.file_sha256.to_vec());
         sticker.file_length = Some(uploaded.file_length);
         sticker.context_info = MessageField::default();
+        // A sticker with sound sends its audio inside it, wrapped as WhatsApp does.
+        let proto = match self.archive.sticker_sound(hash).await? {
+            Some((audio, seconds)) => {
+                use whatsapp_rust::media;
+                use whatsapp_rust::waproto::whatsapp::__buffa::oneof::message::sticker_message::Audio;
+                let uploaded = client
+                    .upload(
+                        audio,
+                        whatsapp_rust::download::MediaType::Audio,
+                        Default::default(),
+                    )
+                    .await?;
+                let mut sound = media::audio_message(
+                    uploaded,
+                    media::AudioOptions::default()
+                        .with_mimetype("audio/ogg; codecs=opus")
+                        .with_ptt(false),
+                )
+                .audio_message
+                .into_option()
+                .context("Could not prepare the sticker's sound")?;
+                sound.seconds = Some(seconds);
+                let mut inner = proto;
+                if let Some(sticker) = inner.sticker_message.as_option_mut() {
+                    sticker.audio = Some(Audio::AudioMessage(Box::new(sound)));
+                }
+                let mut wrapper = wa::message::FutureProofMessage::default();
+                wrapper.message = MessageField::some(inner);
+                let mut message = wa::Message::default();
+                message.audio_sticker_message = MessageField::some(wrapper);
+                message
+            }
+            None => proto,
+        };
         self.send_prepared(client, chat.parse()?, proto, Some(bytes))
             .await
+    }
+}
+
+impl crate::storage::Archive {
+    pub(crate) async fn put_sticker_sound(
+        &self,
+        hash: String,
+        audio: Vec<u8>,
+        seconds: u32,
+    ) -> Result<()> {
+        use diesel::sql_types::{BigInt, Binary, Text};
+        let account = self.account as i64;
+        self.sql()
+            .run(move |conn| {
+                diesel::sql_query("INSERT INTO brazap_sticker_sounds(account,hash,audio,seconds) VALUES(?,?,?,?) ON CONFLICT(account,hash) DO UPDATE SET audio=excluded.audio,seconds=excluded.seconds")
+                    .bind::<BigInt, _>(account)
+                    .bind::<Text, _>(hash)
+                    .bind::<Binary, _>(audio)
+                    .bind::<BigInt, _>(i64::from(seconds))
+                    .execute(conn)
+                    .map_err(crate::storage::db_error)?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// The sound kept for a sticker in My stickers, and its length in seconds.
+    pub(crate) async fn sticker_sound(&self, hash: String) -> Result<Option<(Vec<u8>, u32)>> {
+        use diesel::sql_types::{BigInt, Binary, Text};
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = Binary)]
+            audio: Vec<u8>,
+            #[diesel(sql_type = BigInt)]
+            seconds: i64,
+        }
+        let account = self.account as i64;
+        let row: Option<Row> = self
+            .sql()
+            .read(move |conn| {
+                use diesel::prelude::*;
+                diesel::sql_query(
+                    "SELECT audio,seconds FROM brazap_sticker_sounds WHERE account=? AND hash=?",
+                )
+                .bind::<BigInt, _>(account)
+                .bind::<Text, _>(hash)
+                .get_result(conn)
+                .optional()
+                .map_err(crate::storage::db_error)
+            })
+            .await?;
+        Ok(row.map(|row| (row.audio, row.seconds.max(0) as u32)))
     }
 }
 
@@ -438,15 +525,34 @@ impl Service {
         Ok((view, proto, bytes))
     }
 
-    /// Makes a sticker from a photo, video or GIF and adds it to My stickers.
+    /// Makes a sticker from a photo, video or GIF and adds it to My stickers. With
+    /// `sound`, a video's sound plays with it, as WhatsApp's stickers with sound do.
     #[cfg(feature = "desktop")]
-    pub async fn create_sticker(&self, chat: String, sender: String, id: String) -> Result<()> {
+    pub async fn create_sticker(
+        &self,
+        chat: String,
+        sender: String,
+        id: String,
+        sound: bool,
+    ) -> Result<()> {
         let (view, _, bytes) = self.message_media(&chat, &sender, &id).await?;
         let kind = view.kind.clone();
-        let webp = tokio::task::spawn_blocking(move || match kind.as_str() {
-            "image" => crate::media_convert::image_sticker(&bytes),
-            "video" => crate::media_convert::video_sticker(&bytes),
-            _ => anyhow::bail!("Stickers can be made from photos, videos and GIFs"),
+        anyhow::ensure!(
+            !sound || kind == "video",
+            "Only stickers made from a video can have sound"
+        );
+        let (webp, audio) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let webp = match kind.as_str() {
+                "image" => crate::media_convert::image_sticker(&bytes)?,
+                "video" => crate::media_convert::video_sticker(&bytes)?,
+                _ => anyhow::bail!("Stickers can be made from photos, videos and GIFs"),
+            };
+            let audio = if sound {
+                Some(crate::media_convert::video_sound(&bytes)?)
+            } else {
+                None
+            };
+            Ok((webp, audio))
         })
         .await??;
         let animated = crate::media_convert::animated_webp(&webp);
@@ -476,6 +582,11 @@ impl Service {
             sticker.file_length = Some(uploaded.file_length);
         }
         let hash = STANDARD.encode(sticker.file_sha256.as_deref().unwrap_or_default());
+        if let Some((audio, seconds)) = audio {
+            self.archive
+                .put_sticker_sound(hash.clone(), audio, seconds)
+                .await?;
+        }
         if !self.config.demo {
             self.sync_favorite(&hash, &sticker, true).await?;
         }

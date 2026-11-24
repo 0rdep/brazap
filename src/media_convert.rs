@@ -331,3 +331,139 @@ pub fn video_to_gif(mp4: &[u8]) -> Result<Vec<u8>> {
     }
     Ok(gif)
 }
+
+/// The sound of the part of a video an animated sticker shows, as WhatsApp's
+/// stickers with sound carry it: Ogg Opus, mono, 48 kHz. Returns the audio and
+/// its length in seconds.
+pub fn video_sound(mp4: &[u8]) -> Result<(Vec<u8>, u32)> {
+    use symphonia::core::{
+        audio::SampleBuffer,
+        codecs::{CODEC_TYPE_NULL, DecoderOptions},
+        errors::Error as AudioError,
+        formats::FormatOptions,
+        io::MediaSourceStream,
+        meta::MetadataOptions,
+        probe::Hint,
+    };
+    let stream = MediaSourceStream::new(Box::new(Cursor::new(mp4.to_vec())), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("mp4");
+    let mut demux = symphonia::default::get_probe()
+        .format(
+            &hint,
+            stream,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .context("This video could not be read")?
+        .format;
+    let track = demux
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL && t.codec_params.sample_rate.is_some())
+        .context("This video has no sound")?;
+    let id = track.id;
+    let rate = track
+        .codec_params
+        .sample_rate
+        .context("This video has no sound")?;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .context("This video's sound is in an unsupported format")?;
+    let limit = (STICKER_SECONDS * f64::from(rate)) as usize;
+    let mut mono = Vec::with_capacity(limit);
+    while mono.len() < limit {
+        let packet = match demux.next_packet() {
+            Ok(packet) => packet,
+            Err(AudioError::IoError(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(AudioError::ResetRequired) => break,
+            Err(error) => return Err(error).context("This video's sound could not be read"),
+        };
+        if packet.track_id() != id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            // A damaged packet is skipped, as players do.
+            Err(AudioError::DecodeError(_)) => continue,
+            Err(error) => return Err(error).context("This video's sound could not be decoded"),
+        };
+        let spec = *decoded.spec();
+        let channels = spec.channels.count().max(1);
+        let mut samples = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+        samples.copy_interleaved_ref(decoded);
+        for frame in samples.samples().chunks(channels) {
+            mono.push(frame.iter().sum::<f32>() / channels as f32);
+        }
+    }
+    mono.truncate(limit);
+    ensure!(
+        mono.iter().any(|sample| sample.abs() > 1e-4),
+        "This video has no sound"
+    );
+    // Opus runs at 48 kHz; linear resampling is plenty for a sticker's sound.
+    const RATE: u32 = 48_000;
+    let resampled: Vec<f32> = if rate == RATE {
+        mono
+    } else {
+        let length = (mono.len() as u64 * u64::from(RATE) / u64::from(rate)) as usize;
+        (0..length)
+            .map(|i| {
+                let at = i as f64 * f64::from(rate) / f64::from(RATE);
+                let index = at as usize;
+                let next = mono.get(index + 1).copied().unwrap_or(mono[index]);
+                let fraction = (at - index as f64) as f32;
+                mono[index] * (1.0 - fraction) + next * fraction
+            })
+            .collect()
+    };
+    let seconds = (resampled.len() as u64).div_ceil(u64::from(RATE)) as u32;
+    Ok((opus_ogg(&resampled, RATE)?, seconds.max(1)))
+}
+
+/// Mono samples as an Ogg Opus stream, with the headers WhatsApp's audio uses.
+fn opus_ogg(samples: &[f32], rate: u32) -> Result<Vec<u8>> {
+    use ogg::writing::{PacketWriteEndInfo, PacketWriter};
+    const FRAME: usize = 960;
+    let mut encoder = opus::Encoder::new(rate, opus::Channels::Mono, opus::Application::Audio)?;
+    encoder.set_bitrate(opus::Bitrate::Bits(48_000))?;
+    let pre_skip = u16::try_from(encoder.get_lookahead()?)?;
+    let mut writer = PacketWriter::new(Vec::new());
+    let mut head = b"OpusHead\x01\x01".to_vec();
+    head.extend(pre_skip.to_le_bytes());
+    head.extend(rate.to_le_bytes());
+    head.extend([0, 0, 0]);
+    writer.write_packet(head, 1, PacketWriteEndInfo::EndPage, 0)?;
+    let mut tags = b"OpusTags".to_vec();
+    tags.extend(6u32.to_le_bytes());
+    tags.extend(b"Brazap");
+    tags.extend(0u32.to_le_bytes());
+    writer.write_packet(tags, 1, PacketWriteEndInfo::EndPage, 0)?;
+    let end = samples.len() as u64 + u64::from(pre_skip);
+    let frames: Vec<&[f32]> = samples.chunks(FRAME).collect();
+    let mut encoded = 0u64;
+    for (i, chunk) in frames.iter().enumerate() {
+        let mut frame = chunk.to_vec();
+        frame.resize(FRAME, 0.0);
+        let mut packet = vec![0; 4000];
+        let size = encoder.encode_float(&frame, &mut packet)?;
+        packet.truncate(size);
+        encoded += FRAME as u64;
+        let last = i + 1 == frames.len();
+        writer.write_packet(
+            packet,
+            1,
+            if last {
+                PacketWriteEndInfo::EndStream
+            } else {
+                PacketWriteEndInfo::NormalPacket
+            },
+            if last { end } else { encoded },
+        )?;
+    }
+    Ok(writer.into_inner())
+}

@@ -231,6 +231,8 @@ impl Archive {
                     .map_err(db_error)?;
                 conn.batch_execute(include_str!("../migrations/028_announcement_avatars.sql"))
                     .map_err(db_error)?;
+                conn.batch_execute(include_str!("../migrations/029_sticker_sounds.sql"))
+                    .map_err(db_error)?;
                 crate::transcription::upgrade_schema(conn)
             })
             .await?;

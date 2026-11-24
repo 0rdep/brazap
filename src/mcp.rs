@@ -360,6 +360,7 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
                     text_arg(&args, "chat")?.into(),
                     text_arg(&args, "sender")?.into(),
                     text_arg(&args, "id")?.into(),
+                    args.get("sound").and_then(Value::as_bool).unwrap_or(false),
                 )
                 .await?;
             Ok(json!({"created":true}))
@@ -625,8 +626,8 @@ pub(crate) fn tools() -> Value {
         ),
         (
             "create_sticker",
-            "Make a sticker from the photo, video or GIF in a message (videos become animated stickers of up to 8 seconds) and add it to My stickers.",
-            json!({"chat":{"type":"string"},"sender":{"type":"string"},"id":{"type":"string"}}),
+            "Make a sticker from the photo, video or GIF in a message (videos become animated stickers of up to 8 seconds) and add it to My stickers. With sound, a video's sound plays with the sticker.",
+            json!({"chat":{"type":"string"},"sender":{"type":"string"},"id":{"type":"string"},"sound":{"type":"boolean"}}),
             vec!["chat", "sender", "id"],
             false,
         ),

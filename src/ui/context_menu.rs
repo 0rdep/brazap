@@ -246,10 +246,10 @@ impl State {
     }
 
     /// Makes a sticker from a photo, video or GIF and adds it to My stickers.
-    pub(super) fn create_sticker(&mut self, m: &Message) {
+    pub(super) fn create_sticker(&mut self, m: &Message, sound: bool) {
         self.run_sticker_job(
             "create_sticker",
-            json!({"chat":m.chat,"sender":m.sender,"id":m.id}),
+            json!({"chat":m.chat,"sender":m.sender,"id":m.id,"sound":sound}),
             "Sticker added to My stickers",
             Some("Creating sticker…"),
         );
@@ -347,7 +347,20 @@ fn message_items(s: &State, m: &Message) -> El {
             false,
             move |s, _| {
                 s.close_context_menu();
-                s.create_sticker(&target);
+                s.create_sticker(&target, false);
+            },
+        ));
+    }
+    // A video's sound can play with its sticker, as WhatsApp's stickers with sound do.
+    if m.kind == "video" {
+        let target = m.clone();
+        body = body.child(item(
+            "Create sticker with sound",
+            s.sticker_jobs == 0,
+            false,
+            move |s, _| {
+                s.close_context_menu();
+                s.create_sticker(&target, true);
             },
         ));
     }
