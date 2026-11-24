@@ -277,53 +277,142 @@ impl Service {
                     } => Some(group.parse::<whatsapp_rust::Jid>()?),
                     _ => None,
                 };
-                let target = if jid.is_group() {
-                    ProfilePictureTarget::Group(&jid)
-                } else {
-                    ProfilePictureTarget::Contact(&jid)
-                };
-                let lookup = client
-                    .pictures()
-                    .lookup(
-                        ProfilePictureRequest::new(
-                            target,
-                            if matches!(&request, AssetRequest::Profile { .. }) {
-                                ProfilePictureType::Full
-                            } else {
-                                ProfilePictureType::Preview
-                            },
-                        )
-                        .common_gid(common_group.as_ref())
-                        .timeout(Some(Duration::from_secs(8))),
+                let full = matches!(&request, AssetRequest::Profile { .. });
+                let urls: Vec<String> = if jid.is_newsletter() {
+                    // A channel publishes its picture in its metadata as a media path;
+                    // profile-picture lookups do not answer for channels.
+                    match tokio::time::timeout(
+                        Duration::from_secs(10),
+                        client.newsletter().get_metadata(&jid),
                     )
-                    .await;
-                let picture = match lookup {
-                    Ok(outcome) => outcome.into_found(),
-                    Err(error) => {
-                        log::debug!("Avatar lookup unavailable: {error}");
-                        let previous = cached.and_then(|cache| cache.data);
-                        self.archive
-                            .cache_asset(key, "image/png".into(), previous.clone(), 300)
-                            .await?;
-                        return Ok(previous.map(|bytes| Asset {
-                            mime: "image/png".into(),
-                            data: STANDARD.encode(bytes),
-                        }));
+                    .await
+                    {
+                        Ok(Ok(channel)) => {
+                            let path = if full {
+                                channel.picture_url.or(channel.preview_url)
+                            } else {
+                                channel.preview_url.or(channel.picture_url)
+                            };
+                            path.map(|path| {
+                                if path.starts_with("https://") {
+                                    vec![path]
+                                } else {
+                                    ["mmg.whatsapp.net", "pps.whatsapp.net"]
+                                        .iter()
+                                        .map(|host| format!("https://{host}{path}"))
+                                        .collect()
+                                }
+                            })
+                            .unwrap_or_default()
+                        }
+                        result => {
+                            log::debug!("Channel picture unavailable: {result:?}");
+                            let previous = cached.and_then(|cache| cache.data);
+                            self.archive
+                                .cache_asset(key, "image/png".into(), previous.clone(), 300)
+                                .await?;
+                            return Ok(previous.map(|bytes| Asset {
+                                mime: "image/png".into(),
+                                data: STANDARD.encode(bytes),
+                            }));
+                        }
                     }
+                } else {
+                    // A community, and its announcement group (which phones show with
+                    // the community's picture), answer on the community route.
+                    let community = if jid.is_group() {
+                        match self.archive.group_hierarchy(jid.to_string()).await? {
+                            Some((kind, _)) if kind == "community" => Some(jid.clone()),
+                            Some((kind, parent)) if kind == "announcement" => parent.parse().ok(),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let picture_type = if full {
+                        ProfilePictureType::Full
+                    } else {
+                        ProfilePictureType::Preview
+                    };
+                    let request_for = |target| {
+                        ProfilePictureRequest::new(target, picture_type)
+                            .common_gid(common_group.as_ref())
+                            .timeout(Some(Duration::from_secs(8)))
+                    };
+                    let mut found = None;
+                    if let Some(parent) = &community {
+                        let outcome = client
+                            .pictures()
+                            .lookup(request_for(ProfilePictureTarget::Community(parent)))
+                            .await;
+                        if matches!(outcome, Ok(whatsapp_rust::ProfilePictureLookup::Found(_))) {
+                            found = Some(outcome);
+                        }
+                    }
+                    let lookup = match found {
+                        Some(outcome) => outcome,
+                        None => {
+                            client
+                                .pictures()
+                                .lookup(request_for(if jid.is_group() {
+                                    ProfilePictureTarget::Group(&jid)
+                                } else {
+                                    ProfilePictureTarget::Contact(&jid)
+                                }))
+                                .await
+                        }
+                    };
+                    let picture = match lookup {
+                        // A new pairing starts without the privacy tokens that authorize
+                        // contact photos; they return with history sync. Keep the stored
+                        // photo and ask again soon instead of caching "no photo" for a day.
+                        Ok(whatsapp_rust::ProfilePictureLookup::NotAuthorized) => {
+                            let previous = cached.and_then(|cache| cache.data);
+                            self.archive
+                                .cache_asset(key, "image/png".into(), previous.clone(), 3600)
+                                .await?;
+                            return Ok(previous.map(|bytes| Asset {
+                                mime: "image/png".into(),
+                                data: STANDARD.encode(bytes),
+                            }));
+                        }
+                        Ok(outcome) => outcome.into_found(),
+                        Err(error) => {
+                            log::debug!("Avatar lookup unavailable: {error}");
+                            let previous = cached.and_then(|cache| cache.data);
+                            self.archive
+                                .cache_asset(key, "image/png".into(), previous.clone(), 300)
+                                .await?;
+                            return Ok(previous.map(|bytes| Asset {
+                                mime: "image/png".into(),
+                                data: STANDARD.encode(bytes),
+                            }));
+                        }
+                    };
+                    picture.map(|p| vec![p.url]).unwrap_or_default()
                 };
-                if let Some(picture) = picture {
+                if !urls.is_empty() {
                     let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
                         let agent: ureq::Agent = ureq::Agent::config_builder()
                             .timeout_global(Some(Duration::from_secs(10)))
                             .build()
                             .into();
-                        Ok(agent
-                            .get(&picture.url)
-                            .call()?
-                            .body_mut()
-                            .with_config()
-                            .limit(2 * 1024 * 1024)
-                            .read_to_vec()?)
+                        let mut last = None;
+                        for url in &urls {
+                            match agent.get(url).call() {
+                                Ok(mut response) => {
+                                    return Ok(response
+                                        .body_mut()
+                                        .with_config()
+                                        .limit(2 * 1024 * 1024)
+                                        .read_to_vec()?);
+                                }
+                                Err(error) => last = Some(error),
+                            }
+                        }
+                        Err(last
+                            .map(anyhow::Error::from)
+                            .unwrap_or_else(|| anyhow::anyhow!("No picture address")))
                     })
                     .await?;
                     let bytes = match bytes {
@@ -340,17 +429,7 @@ impl Service {
                             }));
                         }
                     };
-                    Some(
-                        resize(
-                            bytes,
-                            if matches!(&request, AssetRequest::Profile { .. }) {
-                                512
-                            } else {
-                                96
-                            },
-                        )
-                        .await?,
-                    )
+                    Some(resize(bytes, if full { 512 } else { 96 }).await?)
                 } else {
                     None
                 }

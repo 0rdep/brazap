@@ -16,6 +16,7 @@ pub(crate) const OWN: &str = "12025550100@s.whatsapp.net";
 const ANA: &str = "12025550107@s.whatsapp.net";
 const LUCAS: &str = "12025550114@s.whatsapp.net";
 const DESIGN: &str = "120363000000001@g.us";
+const COMMUNITY: &str = "120363000000009@g.us";
 
 pub(crate) fn pairing() -> crate::model::Connection {
     crate::model::Connection {
@@ -141,6 +142,33 @@ pub(crate) async fn seed(archive: &Archive) -> Result<()> {
         return Ok(());
     }
     let base = now() - 1200;
+    // "Rust community" is a group of a fictional community, which lists on its own.
+    archive
+        .name_chat(COMMUNITY.into(), "Rust Brasil 🦀".into(), 0, base)
+        .await?;
+    archive
+        .set_group_hierarchy(vec![
+            (
+                COMMUNITY.into(),
+                "community",
+                String::new(),
+                "Rust Brasil 🦀".into(),
+            ),
+            (
+                "120363000000003@g.us".into(),
+                "subgroup",
+                COMMUNITY.into(),
+                "Rust community".into(),
+            ),
+            (DESIGN.into(), "group", String::new(), String::new()),
+            (
+                "120363000000002@g.us".into(),
+                "group",
+                String::new(),
+                String::new(),
+            ),
+        ])
+        .await?;
     for (jid, name) in [
         (ANA, "Ana Martins ✨"),
         (LUCAS, "Lucas Ferreira 👨🏽‍💻"),

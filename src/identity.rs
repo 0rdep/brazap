@@ -47,6 +47,13 @@ struct SourceChat {
     jid: String,
 }
 #[derive(QueryableByName)]
+struct BroadcastOwner {
+    #[diesel(sql_type=Text)]
+    jid: String,
+    #[diesel(sql_type=diesel::sql_types::Nullable<Text>)]
+    owner: Option<String>,
+}
+#[derive(QueryableByName)]
 pub(crate) struct ChatSettings {
     #[diesel(sql_type=Text)]
     jid: String,
@@ -335,7 +342,7 @@ impl Identities {
 impl Archive {
     pub(crate) async fn identities(&self) -> Result<Identities> {
         let account = self.account as i64;
-        let (rows,sources,saved,locks,names)=self.sql().read(move|conn| {
+        let (rows,sources,saved,locks,names,lists)=self.sql().read(move|conn| {
             let rows=diesel::sql_query("SELECT lid,phone_number FROM (SELECT lid,phone_number,updated_at FROM lid_pn_mapping WHERE device_id=? UNION ALL SELECT lid,phone_number,updated_at FROM brazap_identity_links WHERE account=?) ORDER BY updated_at DESC,lid")
                 .bind::<BigInt,_>(account).bind::<BigInt,_>(account).load::<Mapping>(conn).map_err(db_error)?;
             let sources=diesel::sql_query("SELECT jid FROM brazap_chats WHERE account=?")
@@ -346,7 +353,10 @@ impl Archive {
                 .bind::<BigInt,_>(account).load::<Lock>(conn).map_err(db_error)?;
             let names=diesel::sql_query("SELECT jid,name FROM brazap_chats WHERE account=? UNION ALL SELECT jid,name FROM brazap_contacts WHERE account=?")
                 .bind::<BigInt,_>(account).bind::<BigInt,_>(account).load::<SavedContact>(conn).map_err(db_error)?;
-            Ok((rows,sources,saved,locks,names))
+            // Earlier versions stored received broadcast-list messages under the list.
+            let lists=diesel::sql_query("SELECT c.jid,(SELECT m.sender FROM brazap_messages m WHERE m.account=c.account AND m.chat=c.jid AND m.sender!='self' LIMIT 1) AS owner FROM brazap_chats c WHERE c.account=? AND c.jid LIKE '%@broadcast' AND c.jid!='status@broadcast'")
+                .bind::<BigInt,_>(account).load::<BroadcastOwner>(conn).map_err(db_error)?;
+            Ok((rows,sources,saved,locks,names,lists))
         }).await?;
         let mut identities = Identities::default();
         let mut used = HashSet::new();
@@ -366,6 +376,13 @@ impl Archive {
             identities.canonical.insert(pn.clone(), lid.clone());
             identities.canonical.insert(lid.clone(), lid.clone());
             identities.peers.insert(lid.clone(), vec![lid, pn]);
+        }
+        // WhatsApp shows a list's messages in the chat with its owner.
+        for list in lists {
+            if let Some(owner) = list.owner {
+                let owner = identities.canonical(&owner);
+                identities.canonical.insert(list.jid, owner);
+            }
         }
         for source in sources {
             let canonical = identities.canonical(&source.jid);

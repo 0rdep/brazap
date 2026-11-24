@@ -3,7 +3,16 @@ use crate::{assets::AssetRequest, model::Message};
 use rune::{El, Link, Span, SurfaceFit, col, el, row};
 
 pub(super) fn text(value: &str, size: f32) -> El {
-    rich_text(value, size, Vec::new(), Vec::new())
+    let protected: Vec<_> = crate::links::detect(value)
+        .into_iter()
+        .map(|(range, _)| range)
+        .collect();
+    rich_text(
+        &super::formatting::format(value, &protected),
+        size,
+        Vec::new(),
+        Vec::new(),
+    )
 }
 
 const MENTION_SCHEME: &str = "brazap-mention:";
@@ -58,6 +67,17 @@ pub(super) fn expand_mentions(
 pub(super) fn message_text(message: &Message, size: f32) -> El {
     let group = message.chat.ends_with("@g.us");
     let (text, tags) = expand_mentions(&message.text, &message.mentions);
+    // Links and names keep their characters; WhatsApp markers around them still apply.
+    let mut protected: Vec<_> = crate::links::detect(&text)
+        .into_iter()
+        .map(|(range, _)| range)
+        .collect();
+    protected.extend(tags.iter().map(|(range, _)| range.clone()));
+    let formatted = super::formatting::format(&text, &protected);
+    let tags: Vec<_> = tags
+        .into_iter()
+        .map(|(range, index)| (formatted.map(&range), index))
+        .collect();
     let spans = tags.iter().map(|(range, _)| range.clone()).collect();
     let targets = tags
         .into_iter()
@@ -68,7 +88,7 @@ pub(super) fn message_text(message: &Message, size: f32) -> El {
         })
         .collect();
     let mentions = message.mentions.clone();
-    rich_text(&text, size, spans, targets).on_link(move |s: &mut State, url, tx| {
+    rich_text(&formatted, size, spans, targets).on_link(move |s: &mut State, url, tx| {
         if let Some(jid) = url.strip_prefix(MENTION_SCHEME) {
             if let Some(mention) = mentions.iter().find(|m| m.jid == jid) {
                 s.open_mention(mention);
@@ -80,16 +100,35 @@ pub(super) fn message_text(message: &Message, size: f32) -> El {
 }
 
 fn rich_text(
-    value: &str,
+    formatted: &super::formatting::Formatted,
     size: f32,
     highlights: Vec<std::ops::Range<usize>>,
     mut targets: Vec<(std::ops::Range<usize>, String)>,
 ) -> El {
+    use super::formatting::Style;
+    let value = formatted.text.as_str();
     let urls = crate::links::detect(value);
-    let mut spans = highlights
-        .iter()
-        .map(|range| Span::new(range.start, range.end).color(MINT))
-        .collect::<Vec<_>>();
+    let mut strikes = Vec::new();
+    let mut spans = Vec::new();
+    for (range, style) in &formatted.styles {
+        let span = Span::new(range.start, range.end);
+        spans.push(match style {
+            Style::Bold => span.bold(),
+            Style::Italic => span.italic(),
+            Style::Mono => span.mono(),
+            Style::Code => span.mono().bg(INK.alpha(0.1), 2.0),
+            Style::Quote => span.color(INK.alpha(0.68)),
+            Style::Strike => {
+                strikes.push((range.start, range.end, None));
+                continue;
+            }
+        });
+    }
+    spans.extend(
+        highlights
+            .iter()
+            .map(|range| Span::new(range.start, range.end).color(MINT)),
+    );
     spans.extend(
         urls.iter()
             .map(|(range, _)| Span::new(range.start, range.end).color(MINT)),
@@ -99,7 +138,8 @@ fn rich_text(
     let mut body = label(value, size, INK)
         .wrap_anywhere()
         .selectable(true)
-        .spans(spans);
+        .spans(spans)
+        .strikes(strikes);
     for (range, url) in targets {
         body = body.link(Link::new(range, url));
     }

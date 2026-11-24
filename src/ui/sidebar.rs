@@ -13,6 +13,95 @@ const EXPAND: Icon = Icon {
     view: 24.0,
     body: r#"<rect x="3" y="4" width="18" height="16" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M9 4v16m4-12 4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.6"/>"#,
 };
+const ARCHIVE: Icon = Icon {
+    name: "archive",
+    view: 24.0,
+    body: r#"<rect x="3" y="4" width="18" height="5" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M5 9v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9m-9 4h4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+const BACK: Icon = Icon {
+    name: "back",
+    view: 24.0,
+    body: r#"<path d="M19 12H5m6-6-6 6 6 6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
+const GROUP: Icon = Icon {
+    name: "group",
+    view: 24.0,
+    body: r#"<circle cx="9" cy="8" r="3.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3 19c.6-3.3 3-5 6-5s5.4 1.7 6 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M15.5 5.2a3 3 0 0 1 0 5.6M17.5 14.3c1.8.6 3 2.2 3.4 4.7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>"#,
+};
+const CHANNEL: Icon = Icon {
+    name: "channel",
+    view: 24.0,
+    body: r#"<path d="M4 10v4h3l6 4V6L7 10H4Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M16.5 9a4 4 0 0 1 0 6M19 6.5a7.5 7.5 0 0 1 0 11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>"#,
+};
+
+const COMMUNITY: Icon = Icon {
+    name: "community",
+    view: 24.0,
+    body: r#"<circle cx="12" cy="7" r="2.6" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="5.5" cy="16" r="2.4" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="18.5" cy="16" r="2.4" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10.3 9.2 7 13.8m6.7-4.6 3.3 4.6M8 16h8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>"#,
+};
+const BROADCAST: Icon = Icon {
+    name: "broadcast-list",
+    view: 24.0,
+    body: r#"<circle cx="12" cy="12" r="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8.5 8.5a5 5 0 0 0 0 7m7-7a5 5 0 0 1 0 7M5.6 5.6a9 9 0 0 0 0 12.8m12.8-12.8a9 9 0 0 1 0 12.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>"#,
+};
+
+pub(super) use crate::model::ChatKind;
+
+/// A sidebar screen: one kind of conversation, calls or status.
+#[derive(Clone, Copy, PartialEq)]
+enum Screen {
+    Chats(ChatKind),
+    Calls,
+    Status,
+}
+impl Screen {
+    const EVERY: [Self; 7] = [
+        Self::Chats(ChatKind::Chats),
+        Self::Chats(ChatKind::Groups),
+        Self::Chats(ChatKind::Communities),
+        Self::Chats(ChatKind::Channels),
+        Self::Chats(ChatKind::Lists),
+        Self::Calls,
+        Self::Status,
+    ];
+    fn current(s: &State) -> Self {
+        match s.section {
+            Section::Messages => Self::Chats(s.chat_kind),
+            Section::Calls => Self::Calls,
+            Section::Status => Self::Status,
+        }
+    }
+    fn label(self) -> (&'static Icon, &'static str) {
+        match self {
+            Self::Chats(ChatKind::Chats) => (&CHAT, "Chats"),
+            Self::Chats(ChatKind::Groups) => (&GROUP, "Groups"),
+            Self::Chats(ChatKind::Communities) => (&COMMUNITY, "Communities"),
+            Self::Chats(ChatKind::Channels) => (&CHANNEL, "Channels"),
+            Self::Chats(ChatKind::Lists) => (&BROADCAST, "Broadcast lists"),
+            Self::Calls => (&PHONE, "Calls"),
+            Self::Status => (&super::stories::STATUS, "Status"),
+        }
+    }
+    /// The rail's label: one short word, so no language wraps it.
+    fn short(self) -> &'static str {
+        match self {
+            Self::Chats(ChatKind::Lists) => "Lists",
+            screen => screen.label().1,
+        }
+    }
+    /// Unread, unmuted, unarchived conversations wait on another chat screen.
+    fn waiting(self, s: &State) -> bool {
+        let Self::Chats(kind) = self else {
+            return false;
+        };
+        s.snapshot
+            .chats
+            .iter()
+            .any(|c| c.unread > 0 && !c.archived && !c.muted && kind.includes(c))
+    }
+}
+
 pub(super) fn layout(s: &State, _cx: &mut Cx<State>, layer: &mut Vec<El>) -> El {
     let sidebar_open = s.sidebar.is_open();
     // Keep the list at its full width through the transition. Remounting a virtual
@@ -43,11 +132,7 @@ pub(super) fn layout(s: &State, _cx: &mut Cx<State>, layer: &mut Vec<El>) -> El 
             sidebar_open,
         ))
         .child(body("compact-content", compact(s), 68.0, !sidebar_open));
-    let contents = col()
-        .w_full()
-        .child(controls(s))
-        .child(panes)
-        .child(super::preferences::footer(s));
+    let contents = col().w_full().child(controls(s)).child(panes);
     let branding = row()
         .key("sidebar-brand")
         .w_full()
@@ -133,7 +218,7 @@ fn controls(s: &State) -> El {
         } else if s.show_archived {
             "Archived"
         } else {
-            "Chats"
+            Screen::current(s).label().1
         };
         header = header.child(
             title(super::locale::tr(heading), 15.0)
@@ -158,68 +243,129 @@ fn controls(s: &State) -> El {
     )
 }
 
-fn navigation(s: &State, section: Section, small: bool) -> El {
-    let (glyph, name) = match section {
-        Section::Messages => (&CHAT, "Messages"),
-        Section::Calls => (&PHONE, "Calls"),
-        Section::Status => (&super::stories::STATUS, "Status"),
-    };
-    let selected = !s.preferences.open && s.section == section;
-    let mut button = (if small { row() } else { col() })
-        .key(format!(
-            "nav-{name}-{}",
-            if small { "compact" } else { "expanded" }
-        ))
-        .h(super::locale::scale(if small { 38.0 } else { 54.0 }))
-        .gap(4.0)
+/// One rail entry: an icon, with its label under it while the sidebar is open.
+/// Collapsed, the tooltip names it instead.
+pub(super) fn rail_item(
+    key: &str,
+    glyph: &'static Icon,
+    name: &str,
+    selected: bool,
+    waiting: bool,
+    labeled: bool,
+) -> El {
+    let mut glyph = el()
+        .size(19.0, 19.0)
+        .child(icon(glyph, 19.0).color(if selected { MINT } else { MUTED }));
+    if waiting && !selected {
+        glyph = glyph.child(
+            el().key("rail-unread")
+                .absolute(15.0, -2.0)
+                .size(7.0, 7.0)
+                .radius(3.5)
+                .fill(MINT),
+        );
+    }
+    let name = super::locale::tr(name);
+    // A square indicator around the icon only, whatever the label's width.
+    let mark = el()
+        .size(36.0, 36.0)
+        .radius(10.0)
         .center()
-        .radius(11.0)
-        .role("tab")
-        .label(super::locale::tr(name))
-        .help(super::locale::tr(name))
         .fill(if selected {
-            MINT.alpha(0.12)
+            MINT.alpha(0.14)
         } else {
             Color::TRANSPARENT
         })
-        .hover(Color::WHITE.alpha(0.045))
-        .on_press(move |s: &mut State| {
-            s.close_story();
-            s.preferences.open = false;
-            s.section = section;
-            if section == Section::Status {
+        .hover(Color::WHITE.alpha(0.06))
+        .motion(rune::tok::motion::GLIDE)
+        .child(glyph);
+    let item = col()
+        .key(format!("rail-{key}"))
+        .gap(3.0)
+        .items_center()
+        .role("tab")
+        .label(name.clone())
+        .child(mark);
+    if labeled {
+        // No truncation or wrapping: the rail widens to its longest label.
+        item.w_full()
+            .pb(4.0)
+            .child(label(name, 10.5, if selected { INK } else { MUTED }))
+    } else {
+        item.help(name)
+    }
+}
+
+fn navigation(s: &State, screen: Screen, labeled: bool) -> El {
+    let (glyph, _) = screen.label();
+    let selected = !s.preferences.open && Screen::current(s) == screen;
+    rail_item(
+        screen.short(),
+        glyph,
+        screen.short(),
+        selected,
+        screen.waiting(s),
+        labeled,
+    )
+    .on_press(move |s: &mut State| {
+        s.close_story();
+        s.preferences.open = false;
+        s.attachments_open = false;
+        match screen {
+            Screen::Chats(kind) => {
+                s.section = Section::Messages;
+                if s.chat_kind != kind {
+                    s.chat_kind = kind;
+                    s.show_archived = false;
+                }
+            }
+            Screen::Calls => s.section = Section::Calls,
+            Screen::Status => {
+                s.section = Section::Status;
                 s.request_status_avatars();
             }
-            s.attachments_open = false;
-        })
-        .child(icon(glyph, 18.0).color(if selected { MINT } else { MUTED }));
-    if small {
-        button = button.w(40.0);
+        }
+    })
+}
+
+/// Every screen, always shown, then the update prompt and Settings at the bottom.
+fn rail(s: &State, labeled: bool) -> El {
+    let mut rail = col()
+        .key("sidebar-rail")
+        .h_full()
+        .pt(10.0)
+        .pb(14.0)
+        .gap(4.0);
+    rail = if labeled {
+        rail.px(8.0).items_stretch()
     } else {
-        button = button.grow(1.0).min_w(0.0).px(3.0).child(
-            label(
-                super::locale::tr(name),
-                12.0,
-                if selected { INK } else { MUTED },
-            )
-            .truncate(),
-        );
+        rail.items_center()
+    };
+    for (i, screen) in Screen::EVERY.into_iter().enumerate() {
+        if i == 5 {
+            rail = rail.child(el().w(24.0).h(1.0).my(4.0).self_center().fill(BORDER));
+        }
+        rail = rail.child(navigation(s, screen, labeled));
     }
-    button
+    rail = rail.child(el().grow(1.0));
+    if let Some(update) = super::updates::prompt(s, labeled) {
+        rail = rail.child(update);
+    }
+    rail.child(
+        rail_item(
+            "settings",
+            &super::preferences::SETTINGS,
+            "Settings",
+            s.preferences.open,
+            false,
+            labeled,
+        )
+        .on_press(|s: &mut State| s.open_preferences()),
+    )
 }
 
 fn compact(s: &State) -> El {
-    col()
-        .w_full()
-        .h_full()
-        .padding(12.0)
-        .pt(16.0)
-        .gap(16.0)
-        .center_y()
-        .child(navigation(s, Section::Messages, true))
-        .child(navigation(s, Section::Calls, true))
-        .child(navigation(s, Section::Status, true))
-        .child(el().grow(1.0))
+    col().w_full().h_full().items_center().child(rail(s, false))
 }
 
 fn search_input(s: &State) -> El {
@@ -269,13 +415,16 @@ fn search_input(s: &State) -> El {
 }
 
 fn expanded(s: &State) -> El {
-    let mut panel = col().w_full().h_full().padding(16.0).gap(16.0).child(
-        row()
-            .gap(6.0)
-            .child(navigation(s, Section::Messages, false))
-            .child(navigation(s, Section::Calls, false))
-            .child(navigation(s, Section::Status, false)),
-    );
+    row()
+        .w_full()
+        .h_full()
+        .child(rail(s, true))
+        .child(el().w(1.0).h_full().my(14.0).fill(BORDER))
+        .child(list_pane(s).grow(1.0).min_w(0.0))
+}
+
+fn list_pane(s: &State) -> El {
+    let mut panel = col().h_full().padding(14.0).pt(14.0).gap(14.0);
     if s.section == Section::Status {
         return panel.child(super::stories::list(s));
     }
@@ -292,27 +441,10 @@ fn expanded(s: &State) -> El {
             ),
         );
     }
-    let archived = s.snapshot.chats.iter().filter(|c| c.archived).count();
-    if archived > 0 || s.show_archived {
-        panel = panel.child(
-            label(
-                super::locale::tr(
-                    &(if s.show_archived {
-                        "Back to chats".into()
-                    } else {
-                        super::locale::format(
-                            "Archived · {count}",
-                            &[("count", archived.to_string())],
-                        )
-                    }),
-                ),
-                12.0,
-                MUTED,
-            )
-            .role("button")
-            .help(super::locale::tr("Show archived chats"))
-            .on_press(|s: &mut State| s.show_archived = !s.show_archived),
-        );
+    if s.search.edit.text.trim().is_empty() {
+        if let Some(entry) = archive_entry(s) {
+            panel = panel.child(entry);
+        }
     }
     let count = s.visible_chats().len();
     if !s.search.edit.text.trim().is_empty() {
@@ -321,13 +453,26 @@ fn expanded(s: &State) -> El {
     if count == 0 {
         return panel.child(
             label(
-                super::locale::tr("Your chats are syncing from WhatsApp."),
+                super::locale::tr(if s.snapshot.chats.is_empty() {
+                    "Your chats are syncing from WhatsApp."
+                } else {
+                    match s.chat_kind {
+                        ChatKind::Chats => "No chats here yet.",
+                        ChatKind::Groups => "No groups yet.",
+                        ChatKind::Communities => "No communities yet.",
+                        ChatKind::Channels => "No channels yet.",
+                        ChatKind::Lists => "No broadcast lists yet.",
+                    }
+                }),
                 12.0,
                 MUTED,
             )
             .padding(12.0)
             .wrap(),
         );
+    }
+    if s.chat_kind == ChatKind::Communities {
+        return panel.child(communities(s));
     }
     panel.child(
         col()
@@ -366,6 +511,157 @@ fn expanded(s: &State) -> El {
 }
 
 #[derive(Clone)]
+enum CommunityRow {
+    Heading(String),
+    Group(Chat),
+}
+
+/// A community's groups listed together under its name, most recent first.
+fn communities(s: &State) -> El {
+    let mut order: Vec<&str> = Vec::new();
+    let mut groups: std::collections::HashMap<&str, Vec<&Chat>> = Default::default();
+    for chat in s.visible_chats() {
+        if !groups.contains_key(chat.community.as_str()) {
+            order.push(chat.community.as_str());
+        }
+        groups
+            .entry(chat.community.as_str())
+            .or_default()
+            .push(chat);
+    }
+    let mut rows = Vec::new();
+    for community in order {
+        let mut members = groups[community].clone();
+        // Announcements first, then the groups by recent activity.
+        members.sort_by_key(|c| !c.announcement);
+        let name = members
+            .iter()
+            .map(|c| c.community_name.trim())
+            .find(|n| !n.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| super::locale::tr("Community"));
+        rows.push(CommunityRow::Heading(name));
+        rows.extend(members.iter().map(|c| CommunityRow::Group((*c).clone())));
+    }
+    let rows = std::sync::Arc::new(rows);
+    let keys = rows.clone();
+    let avatars = rows.clone();
+    let list = col()
+        .w_full()
+        .growth(GrowthSpec::default())
+        .virtual_rows(
+            rows.len(),
+            super::locale::scale(76.0),
+            move |_: &State, i| match &keys[i] {
+                CommunityRow::Heading(name) => format!("community-{i}-{name}").into(),
+                CommunityRow::Group(chat) => format!("community-chat-{}", chat.jid).into(),
+            },
+            move |s: &State, i| match &rows[i] {
+                CommunityRow::Heading(name) => row()
+                    .w_full()
+                    .gap(8.0)
+                    .px(10.0)
+                    .pt(if i == 0 { 2.0 } else { 14.0 })
+                    .pb(6.0)
+                    .center_y()
+                    .child(icon(&COMMUNITY, 14.0).color(MINT))
+                    .child(
+                        label(name.clone(), 12.0, MINT)
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .truncate(),
+                    ),
+                CommunityRow::Group(chat) => chat_row(s, chat),
+            },
+        )
+        .on_visible_rows(move |s: &mut State, range| {
+            let visible: Vec<_> = avatars
+                [range.start.min(avatars.len())..range.end.min(avatars.len())]
+                .iter()
+                .filter_map(|row| match row {
+                    CommunityRow::Group(chat) => Some((chat.jid.clone(), chat.photo_version)),
+                    CommunityRow::Heading(_) => None,
+                })
+                .collect();
+            for (jid, version) in visible {
+                s.request_avatar(&jid, version);
+            }
+            false
+        });
+    col()
+        .key("community-chats")
+        .grow(1.0)
+        .min_h(0.0)
+        .w_full()
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(list)
+}
+
+/// The way into archived chats, or back out of them.
+fn archive_entry(s: &State) -> Option<El> {
+    let archived: Vec<_> = s
+        .snapshot
+        .chats
+        .iter()
+        .filter(|c| c.archived && s.chat_kind.includes(c))
+        .collect();
+    let back = s.show_archived;
+    if archived.is_empty() && !back {
+        return None;
+    }
+    let name = if back { "Back to chats" } else { "Archived" };
+    let unread = archived.iter().filter(|c| c.unread > 0).count();
+    let mut entry = row()
+        .key("archived-entry")
+        .w_full()
+        .h(super::locale::scale(44.0))
+        .px(8.0)
+        .gap(12.0)
+        .center_y()
+        .radius(12.0)
+        .role("button")
+        .label(super::locale::tr(name))
+        .help(super::locale::tr(if back {
+            "Back to chats"
+        } else {
+            "Show archived chats"
+        }))
+        .hover(Color::WHITE.alpha(0.045))
+        .on_press(|s: &mut State| s.show_archived = !s.show_archived)
+        .child(
+            el().size(32.0, 32.0)
+                .radius(10.0)
+                .center()
+                .fill(MINT.alpha(0.10))
+                .border(1.0, MINT.alpha(0.08))
+                .child(icon(if back { &BACK } else { &ARCHIVE }, 17.0).color(MINT)),
+        )
+        .child(
+            label(super::locale::tr(name), 13.0, INK)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate(),
+        );
+    if !back {
+        entry = entry.child(if unread > 0 {
+            el().min_w(17.0)
+                .h(17.0)
+                .px(3.0)
+                .center()
+                .radius(8.5)
+                .fill(MINT)
+                .help(super::locale::tr("Unread"))
+                .child(label(unread.min(99).to_string(), 9.0, Color::BLACK))
+        } else {
+            label(archived.len().to_string(), 12.0, MUTED)
+        });
+    }
+    Some(entry)
+}
+
+#[derive(Clone)]
 enum SearchRow {
     Heading(&'static str),
     Number(crate::phone_links::PhoneTarget),
@@ -388,7 +684,7 @@ fn search_results(s: &State) -> El {
     }
     let empty = rows.is_empty() && chats.is_empty() && s.search.results.messages.is_empty();
     if !chats.is_empty() {
-        rows.push(SearchRow::Heading("Chats"));
+        rows.push(SearchRow::Heading(Screen::current(s).label().1));
         rows.extend(chats.into_iter().cloned().map(SearchRow::Chat));
     }
     if !s.search.results.messages.is_empty() {
@@ -540,6 +836,18 @@ fn search_message_row(s: &State, index: usize) -> El {
         .on_press(move |s: &mut State| s.jump(hit.clone()))
 }
 
+/// A chat's name; the placeholders for nameless chats follow the UI language.
+/// A community's announcement group reads "Announcements", as on phones.
+pub(super) fn chat_title(chat: &Chat) -> String {
+    if chat.announcement {
+        return super::locale::tr("Announcements");
+    }
+    match chat.name.as_str() {
+        "Unknown contact" | "Unnamed group" | "Broadcast list" => super::locale::tr(&chat.name),
+        name => name.to_owned(),
+    }
+}
+
 fn chat_row(s: &State, chat: &Chat) -> El {
     let selected = s.selected.as_deref() == Some(&chat.jid);
     let jid = chat.jid.clone();
@@ -559,7 +867,8 @@ fn chat_row(s: &State, chat: &Chat) -> El {
             if is_call || chat.preview_kind == "view_once" {
                 super::locale::tr(&chat.preview)
             } else {
-                chat.preview.clone()
+                // Previews read like the message: WhatsApp's *markers* are not shown.
+                super::formatting::plain(&chat.preview)
             },
             11.0,
             MUTED,
@@ -619,7 +928,7 @@ fn chat_row(s: &State, chat: &Chat) -> El {
         })
         .hover(Color::WHITE.alpha(0.035))
         .role("button")
-        .label(&chat.name)
+        .label(chat_title(chat))
         .on_secondary_press(move |s: &mut State, p, _| s.chat_menu(context.clone(), p))
         .on_press_tx(move |s: &mut State, tx| {
             if s.is_current_chat(&jid) {
@@ -640,11 +949,11 @@ fn chat_row(s: &State, chat: &Chat) -> El {
                         .gap(6.0)
                         .center_y()
                         .child(
-                            title(&chat.name, 13.0)
+                            title(chat_title(chat), 13.0)
                                 .grow(1.0)
                                 .min_w(0.0)
                                 .truncate()
-                                .help_when_truncated(&chat.name),
+                                .help_when_truncated(chat_title(chat)),
                         )
                         .child(
                             label(

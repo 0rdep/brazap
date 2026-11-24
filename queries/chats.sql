@@ -10,6 +10,10 @@ SELECT c.jid,'[]' AS aliases,
        COALESCE(m.status,'') AS preview_status,
        COALESCE(json_extract(m.payload,'$.from_me'),0) AS preview_from_me,
        COALESCE(s.pinned,0) AS pinned,COALESCE(s.archived,0) AS archived,
+       COALESCE(h.parent,'') AS community,
+       COALESCE(NULLIF(pc.name,''),NULLIF(ph.subject,''),'') AS community_name,
+       COALESCE(h.kind='community',0) AS is_community,
+       COALESCE(h.kind='announcement',0) AS announcement,
        CASE WHEN s.muted=1 AND (s.mute_until_ms=-1 OR s.mute_until_ms>CAST(strftime('%s','now') AS INTEGER)*1000) THEN 1 ELSE 0 END AS muted
 FROM brazap_chats c
 LEFT JOIN brazap_chat_settings s ON s.account=c.account AND s.jid=c.jid
@@ -18,6 +22,9 @@ LEFT JOIN lid_pn_mapping l ON l.device_id=c.account AND c.jid LIKE '%@lid'
 LEFT JOIN brazap_contacts n ON n.account=c.account AND n.jid=c.jid
 LEFT JOIN brazap_contacts p ON p.account=c.account AND p.jid=l.phone_number || '@s.whatsapp.net'
 LEFT JOIN brazap_assets a ON a.account=c.account AND a.key='avatar:' || c.jid
+LEFT JOIN brazap_group_hierarchy h ON h.account=c.account AND h.jid=c.jid
+LEFT JOIN brazap_group_hierarchy ph ON ph.account=c.account AND ph.jid=h.parent AND h.parent!=''
+LEFT JOIN brazap_chats pc ON pc.account=c.account AND pc.jid=h.parent AND h.parent!=''
 LEFT JOIN brazap_messages m ON m.rowid=(
     -- The global search-order index can otherwise win here and scan the whole
     -- account for every chat. Keep this lookup bounded to one chat's timeline.

@@ -416,19 +416,29 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
         );
     root = root.child(content);
     if let Some((notice, _)) = s.notice.as_ref().filter(|_| s.error.is_none()) {
-        root = root.child(
-            row()
-                .key("notice-banner")
-                .pin(None, None, Some(24.0), Some(18.0))
-                .padding(12.0)
-                .px(16.0)
-                .gap(10.0)
-                .center_y()
-                .radius(14.0)
-                .fill(PANEL)
-                .border(1.0, BORDER)
-                .child(label(super::locale::tr(notice), 13.0, INK)),
-        );
+        let mut toast = row()
+            .key("notice-banner")
+            .pin(None, None, Some(24.0), Some(18.0))
+            .padding(12.0)
+            .px(16.0)
+            .gap(10.0)
+            .center_y()
+            .radius(14.0)
+            .fill(PANEL)
+            .border(1.0, BORDER)
+            .shadow(10.0, 30.0, Color::BLACK.alpha(0.3))
+            .role("status")
+            .label(super::locale::tr(notice))
+            .transition(
+                rune::Transition::offset(0.0, 10.0)
+                    .combined(rune::Transition::opacity())
+                    .springs(rune::tok::motion::pair::SNAP),
+            );
+        // "Creating sticker…" is still working; finished notices get a check.
+        if s.sticker_jobs == 0 {
+            toast = toast.child(icon(&glyphs::CHECK, 15.0).color(MINT));
+        }
+        root = root.child(toast.child(label(super::locale::tr(notice), 13.0, INK)));
     }
     if let Some(error) = &s.error {
         root = root.child(
@@ -660,7 +670,8 @@ fn pairing(s: &State, layer: &mut Vec<El>) -> El {
 
 pub(super) fn conversation(s: &State, jid: &str, layer: &mut Vec<El>) -> El {
     let chat = s.snapshot.current_chat.as_ref().filter(|c| c.jid == jid);
-    let name = chat.map_or("Conversation", |c| c.name.as_str());
+    let name = chat.map_or_else(|| super::locale::tr("Conversation"), sidebar::chat_title);
+    let name = name.as_str();
     let header = row()
         .w_full()
         .h(76.0)
@@ -685,17 +696,24 @@ pub(super) fn conversation(s: &State, jid: &str, layer: &mut Vec<El>) -> El {
                 .min_w(0.0)
                 .gap(4.0)
                 .child(title(name, 16.0).truncate())
-                .child(label(
-                    chat.filter(|c| !c.phone.is_empty())
-                        .map(|c| c.phone.as_str())
-                        .unwrap_or(if jid.ends_with("@g.us") {
-                            "Group conversation"
-                        } else {
-                            "Private conversation"
-                        }),
-                    11.0,
-                    MUTED,
-                )),
+                .child(
+                    label(
+                        match chat {
+                            Some(c) if !c.phone.is_empty() => c.phone.clone(),
+                            // A community's group names its community, as WhatsApp does.
+                            Some(c) if !c.community_name.is_empty() => c.community_name.clone(),
+                            _ => super::locale::tr(match sidebar::ChatKind::of_jid(jid) {
+                                sidebar::ChatKind::Groups => "Group conversation",
+                                sidebar::ChatKind::Channels => "Channel",
+                                sidebar::ChatKind::Lists => "Broadcast list",
+                                _ => "Private conversation",
+                            }),
+                        },
+                        11.0,
+                        MUTED,
+                    )
+                    .truncate(),
+                ),
         );
     let header = if jid.ends_with("@g.us") {
         header

@@ -59,7 +59,6 @@ pub(super) struct Panel {
     pub report: Value,
     pub privacy: BTreeMap<String, String>,
     pub privacy_pending: bool,
-    pub notice: Option<String>,
     pub error: Option<String>,
     pub logout: bool,
     pub logging_out: bool,
@@ -125,8 +124,13 @@ impl State {
             settings: self.preferences.value.clone(),
             ..Default::default()
         };
+        // request_asset skips avatars whose version is recorded as loaded, so
+        // the versions go with the images or a new pairing never loads them.
         self.avatars.clear();
+        self.avatar_versions.clear();
         self.images.clear();
+        self.image_order.clear();
+        self.image_failures.clear();
         self.animations.clear();
         self.update_viewing();
         self.request_preference("logout", json!({}));
@@ -138,7 +142,6 @@ impl State {
             return;
         }
         self.preferences.error = None;
-        self.preferences.notice = None;
         self.sync_floating();
         if !self.preferences.saving {
             self.save_preferences();
@@ -152,7 +155,6 @@ impl State {
     fn preferences_page(&mut self, page: Page) {
         self.preferences.page = page;
         self.preferences.speech_delete = None;
-        self.preferences.notice = None;
         self.preferences.error = None;
         if page == Page::Privacy {
             self.preferences.privacy_pending = true;
@@ -187,7 +189,7 @@ impl State {
                         .max(value["revision"].as_u64().unwrap_or(0));
                     self.snapshot.settings = saved;
                     if !newer {
-                        self.preferences.notice = Some("Saved".into());
+                        self.notice = Some(("Settings saved".into(), None));
                     }
                 }
                 Err(error) => {
@@ -239,6 +241,9 @@ impl State {
                     if let Ok(p) = serde_json::from_value(value) {
                         self.preferences.privacy = p;
                     }
+                    if action == "privacy_set" {
+                        self.notice = Some(("Settings saved".into(), None));
+                    }
                 }
                 "clear" => {
                     self.images.clear();
@@ -248,9 +253,10 @@ impl State {
                     self.image_order.clear();
                     self.image_failures.clear();
                     self.preferences.confirm_cache = false;
-                    self.preferences.notice = Some(
+                    self.notice = Some((
                         "Cache cleared. Saved messages and original attachments were kept.".into(),
-                    );
+                        None,
+                    ));
                     self.request_preference("get", json!({}));
                 }
                 _ => {}
@@ -259,51 +265,6 @@ impl State {
     }
 }
 
-pub(super) fn footer(s: &State) -> El {
-    let small = !s.sidebar.is_open();
-    let item = |glyph: &'static Icon, name: &str, action: fn(&mut State)| {
-        let mut v = row()
-            .key(name)
-            .h(super::locale::scale(38.0))
-            .gap(10.0)
-            .px(10.0)
-            .center_y()
-            .radius(11.0)
-            .role("button")
-            .label(super::locale::tr(name))
-            .help(super::locale::tr(name))
-            .hover(Color::WHITE.alpha(0.05))
-            .on_press(action)
-            .child(icon(glyph, 18.0).color(MUTED));
-        if small {
-            v = v.w(40.0).center();
-        } else {
-            v = v.w_full().child(
-                label(super::locale::tr(name), 12.0, MUTED)
-                    .truncate()
-                    .grow(1.0)
-                    .min_w(0.0),
-            );
-        }
-        v
-    };
-    let mut footer = col()
-        .w_full()
-        .padding(if small { 14.0 } else { 16.0 })
-        .gap(5.0);
-    if small {
-        footer = footer.center_y();
-    }
-    if let Some(update) = super::updates::prompt(s) {
-        footer = footer.child(update);
-    }
-    footer
-        .child(item(&SETTINGS, "Settings", |s| s.open_preferences()))
-        .child(item(&LOGOUT, "Log out", |s| {
-            s.preferences.logout = true;
-            s.preferences.error = None;
-        }))
-}
 /// The selected model's loading state or error, under the model picker.
 fn transcription_status(s: &State) -> Option<String> {
     if !s.preferences.value.transcription.enabled {
@@ -670,6 +631,32 @@ pub(super) fn view(s: &State) -> El {
             .on_press(move |s: &mut State| s.preferences_page(page)),
         );
     }
+    navigation = navigation
+        .child(el().w_full().h(1.0).my(4.0).fill(BORDER))
+        .child(
+            row()
+                .key("settings-logout")
+                .px(12.0)
+                .py(12.0)
+                .gap(8.0)
+                .center_y()
+                .radius(10.0)
+                .role("button")
+                .label(super::locale::tr("Log out"))
+                .help(super::locale::tr("Unlink this device from WhatsApp"))
+                .hover(DANGER.alpha(0.08))
+                .on_press(|s: &mut State| {
+                    s.preferences.logout = true;
+                    s.preferences.error = None;
+                })
+                .child(icon(&LOGOUT, 15.0).color(DANGER))
+                .child(
+                    label(super::locale::tr("Log out"), 12.0, DANGER)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate(),
+                ),
+        );
     let p = &s.preferences.value;
     let mut body = col().w_full().max_w(700.0).padding(24.0).gap(14.0);
     match s.preferences.page {
@@ -849,13 +836,6 @@ pub(super) fn view(s: &State) -> El {
                 }
                 body = body.child(card(line));
             }
-            body = body.child(button(
-                &super::locale::tr("Refresh WhatsApp settings"),
-                |s, _| {
-                    s.preferences.privacy_pending = true;
-                    s.request_preference("privacy", json!({}));
-                },
-            ));
         }
         Page::Transcription => {
             body = body
@@ -1069,9 +1049,6 @@ pub(super) fn view(s: &State) -> El {
                 );
         }
     }
-    if s.preferences.saving {
-        body = body.child(label(super::locale::tr("Saving…"), 11.0, MUTED));
-    }
     if let Some(error) = &s.preferences.error {
         body = body.child(
             label(
@@ -1086,9 +1063,6 @@ pub(super) fn view(s: &State) -> El {
             )
             .wrap(),
         );
-    }
-    if let Some(notice) = &s.preferences.notice {
-        body = body.child(label(super::locale::tr(notice), 11.0, MINT).wrap());
     }
     col()
         .w_full()

@@ -221,6 +221,16 @@ impl Archive {
                     .map_err(db_error)?;
                 conn.batch_execute(include_str!("../migrations/023_call_timeline.sql"))
                     .map_err(db_error)?;
+                conn.batch_execute(include_str!("../migrations/024_avatar_refresh.sql"))
+                    .map_err(db_error)?;
+                conn.batch_execute(include_str!("../migrations/025_business_names.sql"))
+                    .map_err(db_error)?;
+                conn.batch_execute(include_str!("../migrations/026_group_hierarchy.sql"))
+                    .map_err(db_error)?;
+                conn.batch_execute(include_str!("../migrations/027_channel_avatars.sql"))
+                    .map_err(db_error)?;
+                conn.batch_execute(include_str!("../migrations/028_announcement_avatars.sql"))
+                    .map_err(db_error)?;
                 crate::transcription::upgrade_schema(conn)
             })
             .await?;
@@ -340,6 +350,66 @@ impl Archive {
             diesel::sql_query("INSERT INTO brazap_chats(account,jid,name,preview,updated_at,unread) VALUES(?,?,?,'',?,?) ON CONFLICT(account,jid) DO UPDATE SET name=CASE WHEN excluded.name!='' THEN excluded.name ELSE brazap_chats.name END,updated_at=MAX(brazap_chats.updated_at,excluded.updated_at)")
                 .bind::<BigInt,_>(account).bind::<Text,_>(jid).bind::<Text,_>(name)
                 .bind::<BigInt,_>(timestamp).bind::<BigInt,_>(unread).execute(conn).map_err(db_error)?;
+            Ok(())
+        }).await?;
+        Ok(())
+    }
+
+    /// A group's place in a community: its kind and parent, when known.
+    pub async fn group_hierarchy(&self, jid: String) -> Result<Option<(String, String)>> {
+        #[derive(QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = Text)]
+            kind: String,
+            #[diesel(sql_type = Text)]
+            parent: String,
+        }
+        let account = self.account as i64;
+        let row: Option<Row> = self
+            .sql()
+            .read(move |conn| {
+                diesel::sql_query(
+                    "SELECT kind,parent FROM brazap_group_hierarchy WHERE account=? AND jid=?",
+                )
+                .bind::<BigInt, _>(account)
+                .bind::<Text, _>(jid)
+                .get_result(conn)
+                .optional()
+                .map_err(db_error)
+            })
+            .await?;
+        Ok(row.map(|row| (row.kind, row.parent)))
+    }
+
+    /// Replaces the community structure with WhatsApp's current overview.
+    pub async fn set_group_hierarchy(
+        &self,
+        groups: Vec<(String, &'static str, String, String)>,
+    ) -> Result<()> {
+        let account = self.account as i64;
+        self.sql().run(move |conn| {
+            conn.transaction::<_, diesel::result::Error, _>(|conn| {
+                diesel::sql_query("DELETE FROM brazap_group_hierarchy WHERE account=?")
+                    .bind::<BigInt, _>(account).execute(conn)?;
+                for (jid, kind, parent, subject) in &groups {
+                    diesel::sql_query("INSERT INTO brazap_group_hierarchy(account,jid,kind,parent,subject) VALUES(?,?,?,?,?)")
+                        .bind::<BigInt, _>(account).bind::<Text, _>(jid).bind::<Text, _>(*kind)
+                        .bind::<Text, _>(parent).bind::<Text, _>(subject).execute(conn)?;
+                }
+                Ok(())
+            }).map_err(db_error)
+        }).await?;
+        Ok(())
+    }
+
+    /// Names an unnamed chat's existing rows (any of its addresses) without creating one.
+    pub async fn name_unnamed_chat(&self, aliases: Vec<String>, name: String) -> Result<()> {
+        let account = self.account as i64;
+        let aliases = serde_json::to_string(&aliases)?;
+        self.sql().run(move |conn| {
+            diesel::sql_query("UPDATE brazap_chats SET name=? WHERE account=? AND trim(name)='' AND jid IN (SELECT value FROM json_each(?))")
+                .bind::<Text,_>(name).bind::<BigInt,_>(account).bind::<Text,_>(aliases)
+                .execute(conn).map_err(db_error)?;
             Ok(())
         }).await?;
         Ok(())
@@ -603,6 +673,8 @@ pub fn display_identity(jid: &str, name: &str, mapped_phone: &str) -> (String, S
         phone.clone()
     } else if jid.ends_with("@g.us") {
         "Unnamed group".into()
+    } else if jid.ends_with("@broadcast") {
+        "Broadcast list".into()
     } else {
         "Unknown contact".into()
     };

@@ -37,9 +37,11 @@ pub(super) fn avatar(s: &State, jid: &str, name: &str, _version: i64, size: f32)
                 .rev()
                 .collect()
         } else {
+            // Words only: a "-" or "|" between words is not an initial.
             name.split_whitespace()
-                .take(2)
                 .filter_map(|p| p.chars().next())
+                .filter(|c| !c.is_ascii_punctuation())
+                .take(2)
                 .collect()
         };
         base.child(label(initials.to_uppercase(), size * 0.32, MINT))

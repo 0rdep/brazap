@@ -8,6 +8,7 @@ mod context_menu;
 mod details;
 mod diagnostics;
 mod fonts;
+mod formatting;
 mod links;
 mod locale;
 mod mcp;
@@ -252,6 +253,7 @@ pub(super) struct State {
     media_menu: Option<(String, Message)>,
     detached: bool,
     show_archived: bool,
+    chat_kind: sidebar::ChatKind,
     badge: Option<u32>,
     /// A WhatsApp link opened from outside, waiting for the connection.
     pending_link: Option<String>,
@@ -365,7 +367,7 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         diagnostics: diagnostics::Panel::default(),
         section: Section::Messages,
         story: None,
-        sidebar: rune_kit::shell::PaneState::new(305.0).range(260.0, 440.0),
+        sidebar: rune_kit::shell::PaneState::new(360.0).range(320.0, 500.0),
         search: search::Panel::default(),
         chat_search: search::Panel::default(),
         composer_focus_at: None,
@@ -409,6 +411,7 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         media_menu: None,
         detached: false,
         show_archived: false,
+        chat_kind: sidebar::ChatKind::Chats,
         badge: None,
         pending_link: None,
         notice: None,
@@ -770,7 +773,7 @@ async fn worker(
                     Some(Command::Search(request))=>{
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
                         assets.spawn(async move {
-                            let result=remote.call("search",json!({"query":request.query,"chat":request.chat,"cursor":request.cursor})).await.and_then(|v|Ok(serde_json::from_value(v)?)).map_err(|e|format!("{e:#}"));
+                            let result=remote.call("search",json!({"query":request.query,"chat":request.chat,"cursor":request.cursor,"kind":request.kind})).await.and_then(|v|Ok(serde_json::from_value(v)?)).map_err(|e|format!("{e:#}"));
                             emit(&events,&wake,Event::Search(request,result));
                         });continue;
                     }
@@ -2148,6 +2151,14 @@ impl State {
         self.attachments_open = false;
         self.close_viewer();
         self.section = Section::Messages;
+        // A chat opened from search, a notification or a link shows on its own screen.
+        match self.snapshot.chats.iter().find(|c| c.jid == chat) {
+            Some(listed) => {
+                self.chat_kind = sidebar::ChatKind::of(listed);
+                self.show_archived = listed.archived;
+            }
+            None => self.chat_kind = sidebar::ChatKind::of_jid(&chat),
+        }
         self.story = None;
         self.stop_voice();
         let _ = self.tx.send(Command::Select(chat, self.history_generation));
@@ -2510,7 +2521,7 @@ impl State {
             self.snapshot
                 .chats
                 .iter()
-                .filter(|c| c.archived == self.show_archived)
+                .filter(|c| c.archived == self.show_archived && self.chat_kind.includes(c))
                 .collect()
         } else {
             search::matching_chats(self)

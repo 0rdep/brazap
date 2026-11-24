@@ -59,6 +59,7 @@ impl Archive {
         query: String,
         chat: Option<String>,
         before: Option<MessageCursor>,
+        kind: Option<crate::model::ChatKind>,
     ) -> Result<SearchResults> {
         let query = query.trim().to_lowercase();
         if query.is_empty() {
@@ -71,6 +72,9 @@ impl Archive {
         let identities = self.identities().await?;
         if let Some(chat) = &chat {
             all.retain(|c| c.matches_jid(chat));
+        } else if let Some(kind) = kind {
+            // A screen's search stays within its own kind of conversation.
+            all.retain(|c| kind.includes(c));
         }
         let account = self.account as i64;
         let names = if chat.is_none() {

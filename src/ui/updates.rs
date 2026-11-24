@@ -1,5 +1,5 @@
 use super::{Command, State, locale, view::*};
-use rune::{Color, El, Icon, LoopSpec, icon, row};
+use rune::{El, Icon, LoopSpec, col, el, icon};
 
 const UPDATE: Icon = Icon {
     name: "install-update",
@@ -7,7 +7,8 @@ const UPDATE: Icon = Icon {
     body: r#"<path d="M12 16V4m-4 4 4-4 4 4M5 15v5h14v-5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
-pub(super) fn prompt(s: &State) -> Option<El> {
+/// The update action at the bottom of the sidebar rail, above Settings.
+pub(super) fn prompt(s: &State, labeled: bool) -> Option<El> {
     let update = &s.snapshot.updates;
     if !update.newer_than(env!("CARGO_PKG_VERSION")) {
         return None;
@@ -25,21 +26,25 @@ pub(super) fn prompt(s: &State) -> Option<El> {
     } else {
         "Retry update"
     };
-    let small = !s.sidebar.is_open();
+    let small = !labeled;
     let mut glyph = icon(&UPDATE, if small { 19.0 } else { 18.0 }).color(MINT);
     if downloading && !ready {
         glyph = glyph.looping(LoopSpec::rotation(1.6));
     }
-    let mut button = row()
+    // The rail's square, tinted as the one action that needs attention.
+    let mark = el()
+        .size(36.0, 36.0)
+        .radius(10.0)
+        .center()
+        .fill(MINT.alpha(0.12))
+        .border(1.0, MINT.alpha(0.28))
+        .hover(MINT.alpha(0.2))
+        .motion(rune::tok::motion::SNAPPY)
+        .child(glyph);
+    let mut button = col()
         .key("sidebar-update")
-        .w_full()
-        .h(locale::scale(42.0))
-        .px(if small { 0.0 } else { 10.0 })
-        .gap(10.0)
-        .center_y()
-        .radius(11.0)
-        .fill(MINT.alpha(0.1))
-        .border(1.0, MINT.alpha(0.25))
+        .gap(3.0)
+        .items_center()
         .role(if downloading && !ready {
             "status"
         } else {
@@ -59,52 +64,36 @@ pub(super) fn prompt(s: &State) -> Option<El> {
         } else {
             locale::tr(action)
         })
-        .child(glyph);
-    if small {
+        .child(mark);
+    if !small {
+        // One short word under the icon; the tooltip has the details.
         button = button
-            .size(36.0, 36.0)
-            .px(0.0)
-            .center()
-            .fill(Color::WHITE.alpha(0.035))
-            .border(1.0, CONTROL_BORDER)
-            .press(Color::WHITE.alpha(0.09))
-            .motion(rune::tok::motion::SNAPPY);
-    } else {
-        button = button.child(
-            label(locale::tr(action), 12.0, MINT)
-                .grow(1.0)
-                .min_w(0.0)
-                .truncate(),
-        );
+            .w_full()
+            .pb(4.0)
+            .child(label(locale::tr("Update"), 10.5, MINT));
     }
-    let hover = if small {
-        Color::WHITE.alpha(0.05)
-    } else {
-        MINT.alpha(0.08)
-    };
     if ready {
-        button =
-            button.hover(hover).on_press_tx(|s: &mut State, tx| {
-                match crate::updates::install(&s.config) {
-                    Ok(()) => tx.quit(),
-                    Err(error) => {
-                        log::warn!("Could not install update: {error:#}");
-                        s.error = Some("Could not install the update. Try again.".into());
-                    }
+        button = button.on_press_tx(
+            |s: &mut State, tx| match crate::updates::install(&s.config) {
+                Ok(()) => tx.quit(),
+                Err(error) => {
+                    log::warn!("Could not install update: {error:#}");
+                    s.error = Some("Could not install the update. Try again.".into());
                 }
-            });
+            },
+        );
     } else if manual {
         let url = update
             .release_url
             .clone()
             .unwrap_or_else(|| "https://github.com/0rdep/brazap/releases/latest".into());
-        button = button.hover(hover).on_press_tx(move |s: &mut State, tx| {
+        button = button.on_press_tx(move |s: &mut State, tx| {
             if let Err(error) = tx.open_url(&url) {
                 s.error = Some(error.to_string());
             }
         });
     } else if !downloading {
-        button = button.hover(hover).on_press(|s: &mut State| {
+        button = button.on_press(|s: &mut State| {
             s.snapshot.updates.status = "downloading".into();
             let _ = s.tx.send(Command::Update);
         });

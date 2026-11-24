@@ -367,20 +367,100 @@ impl Service {
             .map(|chat| chat.jid.clone())
             .collect();
         let client = self.connected().await?;
-        if !missing.is_empty() {
-            match client.groups().list_participating().await {
-                Ok(groups) => {
-                    for group in groups {
-                        if missing.contains(&group.id.to_string()) {
-                            if let Some(subject) = group.subject.filter(|s| !s.trim().is_empty()) {
-                                self.archive
-                                    .name_chat(group.id.to_string(), subject, 0, 0)
-                                    .await?;
-                            }
-                        }
+        // One overview of every group: missing names, and which groups belong
+        // to a community so communities get their own list.
+        match client.groups().list_participating().await {
+            Ok(groups) => {
+                let mut hierarchy = Vec::with_capacity(groups.len());
+                for group in groups {
+                    let jid = group.id.to_string();
+                    let subject = group.subject.unwrap_or_default().trim().to_owned();
+                    let (kind, parent) = match &group.hierarchy {
+                        whatsapp_rust::GroupHierarchy::Community => ("community", String::new()),
+                        whatsapp_rust::GroupHierarchy::Subgroup { parent, kind } => (
+                            // The community's own announcement group, "Announcements" on phones.
+                            if *kind == whatsapp_rust::SubgroupKind::Announcement {
+                                "announcement"
+                            } else {
+                                "subgroup"
+                            },
+                            parent.to_string(),
+                        ),
+                        _ => ("group", String::new()),
+                    };
+                    if missing.contains(&jid) && !subject.is_empty() {
+                        self.archive
+                            .name_chat(jid.clone(), subject.clone(), 0, 0)
+                            .await?;
                     }
+                    hierarchy.push((jid, kind, parent, subject));
                 }
-                Err(error) => log::debug!("Group names refresh: {error}"),
+                self.archive.set_group_hierarchy(hierarchy).await?;
+            }
+            Err(error) => log::debug!("Group overview refresh: {error}"),
+        }
+        // Businesses that never sent a push name or name certificate: WhatsApp
+        // shows their verified name, which usync reports with the account.
+        let unnamed: Vec<(whatsapp_rust::Jid, Vec<String>)> = chats
+            .iter()
+            .filter(|chat| {
+                !chat.jid.ends_with("@g.us")
+                    && !chat.jid.ends_with("@newsletter")
+                    && !chat.jid.ends_with("@broadcast")
+                    && !crate::storage::meaningful_name(&chat.jid, &chat.name)
+            })
+            .filter_map(|chat| {
+                let mut aliases = chat.aliases.0.clone();
+                aliases.push(chat.jid.clone());
+                Some((chat.jid.parse().ok()?, aliases))
+            })
+            .collect();
+        // Once a day at most: unknown numbers stay unnamed and usync is rate limited.
+        let checked = self
+            .archive
+            .preference("business_names_checked_at".into())
+            .await?
+            .and_then(|at| at.parse::<i64>().ok())
+            .unwrap_or(0);
+        let unnamed = if now() - checked >= 24 * 3600 && !unnamed.is_empty() {
+            self.archive
+                .set_preference("business_names_checked_at".into(), now().to_string())
+                .await?;
+            unnamed
+        } else {
+            Vec::new()
+        };
+        for entries in unnamed.chunks(50) {
+            let batch: Vec<_> = entries.iter().map(|(jid, _)| jid.clone()).collect();
+            let found = match tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                client.contacts().get_user_info(&batch),
+            )
+            .await
+            {
+                Ok(Ok(found)) => found,
+                Ok(Err(error)) => {
+                    log::debug!("Business names refresh: {error}");
+                    break;
+                }
+                Err(_) => break,
+            };
+            for (jid, aliases) in entries {
+                let info = found.get(jid).or_else(|| {
+                    found
+                        .values()
+                        .find(|i| i.lid.as_ref() == Some(jid) || i.pn_jid.as_ref() == Some(jid))
+                });
+                let name = info
+                    .and_then(|i| i.verified_name.as_ref())
+                    .and_then(|v| v.name.as_deref())
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty());
+                if let Some(name) = name {
+                    self.archive
+                        .name_unnamed_chat(aliases.clone(), name.to_owned())
+                        .await?;
+                }
             }
         }
         for chat in chats.iter().filter(|chat| {
@@ -688,7 +768,7 @@ impl Service {
                     .await?;
                 let mut viewed = std::collections::HashSet::new();
                 for inbound in batch.messages.iter() {
-                    let chat = inbound.info.source.chat.to_string();
+                    let chat = conversation(&inbound.info.source).0;
                     if !inbound.info.source.is_from_me
                         && viewed.insert(chat.clone())
                         && self.desktop_viewing(&chat).await
@@ -722,13 +802,10 @@ impl Service {
                     && event.info.source.chat.to_string() != crate::stories::CHAT =>
             {
                 let info = &event.info;
-                let name = if !info.source.is_group && !info.source.is_from_me {
-                    info.push_name.to_string()
-                } else {
-                    String::new()
-                };
+                let (chat, group) = conversation(&info.source);
+                let name = chat_name(info, group);
                 let row = project_message(
-                    info.source.chat.to_string(),
+                    chat,
                     info.source.sender.to_string(),
                     info.id.to_string(),
                     info.source.is_from_me,
@@ -1588,18 +1665,43 @@ impl Service {
     }
 }
 
+/// The conversation a message belongs to, and whether it is a group. A
+/// broadcast list is private to its owner: like WhatsApp, recipients see its
+/// messages in their own chat with the owner, not in an unnamed list chat.
+fn conversation(source: &whatsapp_rust::types::message::MessageSource) -> (String, bool) {
+    match &source.broadcast_list_owner {
+        Some(owner) if !source.is_from_me => (owner.to_non_ad().to_string(), false),
+        _ => (source.chat.to_string(), source.is_group),
+    }
+}
+
+/// The name a private chat is known by: the sender's push name, or the verified
+/// name a business attaches to its messages when it sets no push name.
+fn chat_name(info: &whatsapp_rust::types::message::MessageInfo, group: bool) -> String {
+    if group || info.source.is_from_me {
+        return String::new();
+    }
+    let push = info.push_name.trim();
+    if !push.is_empty() {
+        return push.to_owned();
+    }
+    info.verified_name
+        .as_ref()
+        .and_then(|v| v.name.as_deref())
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_owned()
+}
+
 fn project_inbound(batch: &[InboundMessage]) -> Vec<StoredMessage> {
     batch
         .iter()
         .map(|m| {
             let info = &m.info;
-            let name = if !info.source.is_group && !info.source.is_from_me {
-                info.push_name.to_string()
-            } else {
-                String::new()
-            };
+            let (chat, group) = conversation(&info.source);
+            let name = chat_name(info, group);
             project_message(
-                info.source.chat.to_string(),
+                chat,
                 info.source.sender.to_string(),
                 info.id.to_string(),
                 info.source.is_from_me,

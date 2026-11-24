@@ -232,6 +232,11 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
                         .cloned()
                         .map(serde_json::from_value)
                         .transpose()?,
+                    args.get("kind")
+                        .filter(|v| !v.is_null())
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()?,
                 )
                 .await?,
         )?),
@@ -491,8 +496,8 @@ pub(crate) fn tools() -> Value {
         ),
         (
             "search",
-            "Search locally saved chat names, phone numbers, filenames, and message contents. Pass chat to search one conversation; pass next as cursor to load older matches.",
-            json!({"query":{"type":"string","minLength":1},"chat":{"type":"string"},"cursor":{"type":"object","properties":{"timestamp":{"type":"integer"},"id":{"type":"string"},"sender":{"type":"string"}},"required":["timestamp","id","sender"]}}),
+            "Search locally saved chat names, phone numbers, filenames, and message contents. Pass chat to search one conversation, or kind to search one kind of conversation; pass next as cursor to load older matches.",
+            json!({"query":{"type":"string","minLength":1},"chat":{"type":"string"},"kind":{"type":"string","enum":["chats","groups","communities","channels","lists"]},"cursor":{"type":"object","properties":{"timestamp":{"type":"integer"},"id":{"type":"string"},"sender":{"type":"string"}},"required":["timestamp","id","sender"]}}),
             vec!["query"],
             true,
         ),

@@ -70,6 +70,61 @@ pub struct Chat {
     #[serde(default)]
     #[diesel(sql_type = diesel::sql_types::Bool)]
     pub archived: bool,
+    /// For a community's group: the community's address, else empty.
+    #[serde(default)]
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub community: String,
+    /// The community's name, when known.
+    #[serde(default)]
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub community_name: String,
+    /// A community's announcement group, shown as "Announcements" like on phones.
+    #[serde(default)]
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    pub announcement: bool,
+    /// A community itself: it holds groups, not messages.
+    #[serde(default)]
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    pub is_community: bool,
+}
+
+/// The kinds of conversation, each listed and searched on its own screen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatKind {
+    /// Private chats with people and businesses.
+    #[default]
+    Chats,
+    Groups,
+    /// A community's groups, including its announcement group.
+    Communities,
+    Channels,
+    /// Broadcast lists sent from this account.
+    Lists,
+}
+impl ChatKind {
+    /// By address alone; a community's groups are only known from the chat.
+    pub fn of_jid(jid: &str) -> Self {
+        if jid.ends_with("@g.us") {
+            Self::Groups
+        } else if jid.ends_with("@newsletter") {
+            Self::Channels
+        } else if jid.ends_with("@broadcast") {
+            Self::Lists
+        } else {
+            Self::Chats
+        }
+    }
+    pub fn of(chat: &Chat) -> Self {
+        match Self::of_jid(&chat.jid) {
+            Self::Groups if !chat.community.is_empty() => Self::Communities,
+            kind => kind,
+        }
+    }
+    /// A community itself holds groups, not messages, and lists nowhere.
+    pub fn includes(self, chat: &Chat) -> bool {
+        !chat.is_community && chat.jid != crate::stories::CHAT && Self::of(chat) == self
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

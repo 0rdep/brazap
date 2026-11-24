@@ -265,7 +265,13 @@ pub(super) fn chat_avatar(s: &State, chat: &crate::model::Chat) -> El {
             && u.message.timestamp > crate::model::now() - 86400
     });
     if !unread {
-        return media::avatar(s, &chat.jid, &chat.name, chat.photo_version, 38.0);
+        return media::avatar(
+            s,
+            &chat.jid,
+            &super::sidebar::chat_title(chat),
+            chat.photo_version,
+            38.0,
+        );
     }
     let sender = chat.jid.clone();
     el().size(42.0, 42.0)
@@ -280,7 +286,16 @@ pub(super) fn chat_avatar(s: &State, chat: &crate::model::Chat) -> El {
             &[("name", chat.name.clone())],
         ))
         .on_press(move |s: &mut State| s.open_story(&sender))
-        .child(media::avatar(s, &chat.jid, &chat.name, chat.photo_version, 32.0).clip_rounded(16.0))
+        .child(
+            media::avatar(
+                s,
+                &chat.jid,
+                &super::sidebar::chat_title(chat),
+                chat.photo_version,
+                32.0,
+            )
+            .clip_rounded(16.0),
+        )
 }
 
 pub(super) fn list(s: &State) -> El {

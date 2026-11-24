@@ -10,6 +10,8 @@ const DEBOUNCE: f64 = 0.18;
 pub(super) struct Request {
     pub query: String,
     pub chat: Option<String>,
+    /// The sidebar screen's kind of conversation; `None` inside one chat.
+    pub kind: Option<crate::model::ChatKind>,
     generation: u64,
     pub cursor: Option<MessageCursor>,
 }
@@ -21,6 +23,7 @@ pub(super) struct Panel {
     pub selected: Option<usize>,
     pub error: Option<String>,
     observed: String,
+    observed_kind: Option<crate::model::ChatKind>,
     generation: u64,
     due: Option<f64>,
     in_flight: Option<u64>,
@@ -35,6 +38,7 @@ impl Default for Panel {
             selected: None,
             error: None,
             observed: String::new(),
+            observed_kind: None,
             generation: 0,
             due: None,
             in_flight: None,
@@ -62,11 +66,19 @@ impl Panel {
                 || self.observed != self.edit.text.trim())
     }
 
-    fn tick(&mut self, chat: Option<String>, elapsed: f64, tx: &mut Tx) -> (bool, Option<Request>) {
+    fn tick(
+        &mut self,
+        chat: Option<String>,
+        kind: Option<crate::model::ChatKind>,
+        elapsed: f64,
+        tx: &mut Tx,
+    ) -> (bool, Option<Request>) {
         let query = self.edit.text.trim();
-        let changed = query != self.observed;
+        // Moving to another screen searches that screen's conversations instead.
+        let changed = query != self.observed || kind != self.observed_kind;
         if changed {
             self.observed = query.to_owned();
+            self.observed_kind = kind;
             self.generation = self.generation.wrapping_add(1);
             self.results = Default::default();
             self.selected = None;
@@ -84,6 +96,7 @@ impl Panel {
                 Some(Request {
                     query: self.observed.clone(),
                     chat,
+                    kind,
                     generation: self.generation,
                     cursor: None,
                 }),
@@ -129,14 +142,14 @@ fn same_message(a: &SearchHit, b: &SearchHit) -> bool {
 pub(super) fn poll(s: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
     if s.section == super::Section::Messages {
-        let (update, request) = s.search.tick(None, elapsed, tx);
+        let (update, request) = s.search.tick(None, Some(s.chat_kind), elapsed, tx);
         changed |= update;
         if let Some(request) = request {
             let _ = s.tx.send(Command::Search(request));
         }
     }
     if s.chat_search.open {
-        let (update, request) = s.chat_search.tick(s.selected.clone(), elapsed, tx);
+        let (update, request) = s.chat_search.tick(s.selected.clone(), None, elapsed, tx);
         changed |= update;
         if let Some(request) = request {
             let _ = s.tx.send(Command::Search(request));
@@ -147,7 +160,8 @@ pub(super) fn poll(s: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
 
 /// The phone number or WhatsApp link typed in the sidebar search, when it is one.
 pub(super) fn phone_target(s: &State) -> Option<crate::phone_links::PhoneTarget> {
-    if s.section != super::Section::Messages {
+    // Starting a chat with a number belongs to the private chats screen.
+    if s.section != super::Section::Messages || s.chat_kind != crate::model::ChatKind::Chats {
         return None;
     }
     crate::phone_links::parse(&s.search.edit.text, s.snapshot.region.as_deref())
@@ -168,6 +182,8 @@ pub(super) fn matching_chats(s: &State) -> Vec<&Chat> {
     s.snapshot
         .chats
         .iter()
+        // Each screen finds only its own kind of conversation.
+        .filter(|chat| s.chat_kind.includes(chat))
         .filter(|chat| {
             chat.name.to_lowercase().contains(&query)
                 || (digits.len() >= 3 && chat.phone.contains(&digits))
@@ -270,6 +286,7 @@ impl State {
         let _ = self.tx.send(Command::Search(Request {
             query: self.chat_search.observed.clone(),
             chat: self.selected.clone(),
+            kind: None,
             generation: self.chat_search.generation,
             cursor: Some(cursor),
         }));
