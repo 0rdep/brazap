@@ -482,9 +482,11 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         ..AppSpec::new(window_title, (1180.0, 800.0), unreachable_state, view::view)
     };
     let mut app = App::new(spec)
-        .window_options(rune::WindowOptions {
-            maximized: true,
-            ..Default::default()
+        .maximized(true)
+        // Bounded 4-8 MiB suballocation blocks keep the GPU memory a mostly idle chat window
+        // reserves small. Buffers and textures still grow with their content.
+        .gpu_memory_policy(rune::GpuMemoryPolicy::Manual {
+            block_size: 4 * 1024 * 1024..8 * 1024 * 1024,
         })
         .on_focus(|s, focused, _| {
             s.focused = focused;
@@ -2394,12 +2396,12 @@ fn message_enter(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
     }
     // The IME owns Return while committing a composition. Repeat must not send
     // another message or activate a different control after the first send.
-    if s.draft.preedit.is_some()
+    if s.draft.preedit().is_some()
         || s.attachments.as_ref().is_some_and(|panel| {
             panel
                 .items
                 .iter()
-                .any(|item| item.caption.preedit.is_some())
+                .any(|item| item.caption.preedit().is_some())
         })
     {
         return false;

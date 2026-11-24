@@ -5,6 +5,19 @@ rune = { path = ".build-deps/rune/crates/rune" }
 rune-kit = { path = ".build-deps/rune/crates/rune-kit" }
 procwatch = { path = ".build-deps/rune/crates/procwatch" }
 
+# Rune's own [patch.crates-io] (its root Cargo.toml at the pinned revision): Cargo does
+# not inherit a dependency's patches, so apps that build Rune repeat them. They point at
+# the crates vendored in the same prepared checkout; keep this list in step with Rune's.
+[patch.crates-io]
+wgpu-hal = { path = ".build-deps/rune/vendor/wgpu-hal" }
+naga = { path = ".build-deps/rune/vendor/naga" }
+winit = { path = ".build-deps/rune/vendor/winit" }
+sctk-adwaita = { path = ".build-deps/rune/vendor/sctk-adwaita" }
+parley_engine = { path = ".build-deps/rune/vendor/parley_engine" }
+accesskit_windows = { path = ".build-deps/rune/vendor/accesskit_windows" }
+accesskit_atspi_common = { path = ".build-deps/rune/vendor/accesskit_atspi_common" }
+accesskit_macos = { path = ".build-deps/rune/vendor/accesskit_macos" }
+
 # transcribe.cpp's ggml (voice transcription) must not tune itself for the
 # build machine: release binaries run on other CPUs. x86-64 builds target
 # x86-64-v3 (AVX2, BMI2, FMA, F16C: Haswell, 2013+); Brazap checks those

@@ -26,8 +26,10 @@ Vulkan and desktop portals for native file dialogs.
 ./scripts/cargo build --locked --release
 ```
 
-The wrapper prepares `.build-deps/rune`, applying the tracked GPU-memory patch to
-the exact upstream revision in `patches/rune.rev`. Do not edit this generated
+The wrapper prepares `.build-deps/rune`, applying the tracked Rune patch to
+the exact upstream revision in `patches/rune.rev`. `.cargo/config.toml` points
+Cargo at that checkout, including the crates Rune vendors through its own
+`[patch.crates-io]`. Do not edit this generated
 checkout or use `.references` as build dependencies. See [the patch guide](../patches/README.md).
 
 Appearance changes apply without restarting. Rune receives the bundled Inter and
