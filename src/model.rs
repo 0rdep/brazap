@@ -92,8 +92,10 @@ pub struct Chat {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatKind {
-    /// Private chats with people and businesses.
+    /// Every conversation together, each kind listed as it is on its own screen.
     #[default]
+    All,
+    /// Private chats with people and businesses.
     Chats,
     Groups,
     /// A community's groups, including its announcement group.
@@ -103,7 +105,8 @@ pub enum ChatKind {
     Lists,
 }
 impl ChatKind {
-    /// By address alone; a community's groups are only known from the chat.
+    /// By address alone; a community's groups are only known from the chat. Never
+    /// [`Self::All`].
     pub fn of_jid(jid: &str) -> Self {
         if jid.ends_with("@g.us") {
             Self::Groups
@@ -123,7 +126,9 @@ impl ChatKind {
     }
     /// A community itself holds groups, not messages, and lists nowhere.
     pub fn includes(self, chat: &Chat) -> bool {
-        !chat.is_community && chat.jid != crate::stories::CHAT && Self::of(chat) == self
+        !chat.is_community
+            && chat.jid != crate::stories::CHAT
+            && (self == Self::All || Self::of(chat) == self)
     }
 }
 
@@ -240,6 +245,29 @@ pub struct Message {
     /// empty when WhatsApp only delivered a placeholder. Its bytes are never kept or shown.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub view_once: String,
+    /// For `kind == "contact"`: the shared contact cards.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contacts: Vec<SharedContact>,
+}
+
+/// A contact shared in a message, from its vCard.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SharedContact {
+    pub name: String,
+    /// The WhatsApp Business name, for a business account.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub business: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phones: Vec<SharedPhone>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SharedPhone {
+    /// The number as the vCard writes it.
+    pub number: String,
+    /// Its WhatsApp account (digits) when it has one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub waid: String,
 }
 
 /// New text for an earlier message. Only its author can edit it, so the
@@ -316,6 +344,24 @@ pub struct Quote {
     /// People tagged in the quoted text, found when the message is loaded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mentions: Vec<Mention>,
+    /// What the quoted message is ("image", "video", "sticker", "audio", "file"),
+    /// empty for text.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+}
+
+impl Quote {
+    /// The fixed wording a quoted message without text shows ("Photo"…).
+    pub fn fallback(&self) -> &'static str {
+        match self.kind.as_str() {
+            "image" => "Photo",
+            "video" => "Video",
+            "sticker" => "Sticker",
+            "audio" => "Voice message",
+            "file" => "Document",
+            _ => "Message",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -449,6 +495,7 @@ impl Message {
             "protocol"
                 | "album"
                 | "placeholder"
+                | "pin"
                 | "unsupported"
                 | "call"
                 | "voice_call"
@@ -461,7 +508,7 @@ impl Message {
     /// The preview with its fixed wording ("Photo", "Sticker"…) passed through
     /// `translate`; what people wrote stays as it is.
     pub fn preview_with(&self, translate: &dyn Fn(&str) -> String) -> String {
-        if self.kind == "placeholder" {
+        if self.kind == "placeholder" || self.kind == "pin" {
             return translate(&self.text);
         }
         let name = self

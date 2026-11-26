@@ -72,6 +72,8 @@ struct UiWake {
 enum Command {
     Deselect,
     ManageChat(&'static str, Value),
+    /// A sticker from the picker for a chat: its upload runs beside other work.
+    SendSticker(String, String),
     CopyMedia(u64, Message),
     /// Sticker work that takes seconds: the tool, its arguments and what to say when done.
     Sticker(&'static str, Value, &'static str),
@@ -270,6 +272,12 @@ pub(super) struct State {
     detached: bool,
     show_archived: bool,
     chat_kind: sidebar::ChatKind,
+    /// The kind the open sidebar search is filtered to; it starts at All.
+    search_kind: sidebar::ChatKind,
+    /// The kind chips' sideways scroll: offset and furthest offset.
+    chip_scroll: rune::Live<[f32; 2]>,
+    /// How strongly each edge arrow of the chips shows (0 when nothing is hidden past it).
+    chip_edges: [rune::Live<f32>; 2],
     badge: Option<u32>,
     /// A WhatsApp link opened from outside, waiting for the connection.
     pending_link: Option<String>,
@@ -434,7 +442,10 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         media_menu: None,
         detached: false,
         show_archived: false,
-        chat_kind: sidebar::ChatKind::Chats,
+        chat_kind: sidebar::ChatKind::All,
+        search_kind: sidebar::ChatKind::All,
+        chip_scroll: rune::Live::new([0.0; 2]),
+        chip_edges: [rune::Live::new(0.0), rune::Live::new(0.0)],
         badge: None,
         pending_link: None,
         notice: None,
@@ -685,6 +696,14 @@ async fn worker(
                             emit(&events,&wake,Event::Done(result));
                         });continue;
                     }
+                    Some(Command::SendSticker(chat,hash))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=remote.call("send_sticker",json!({"chat":chat,"hash":hash})).await
+                                .and_then(|v|Ok(serde_json::from_value(v["message"].clone())?)).map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Sent(String::new(),result));
+                        });continue;
+                    }
                     Some(Command::CopyMedia(generation,message))=>{
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();let config=config.clone();
                         assets.spawn(async move {
@@ -932,9 +951,14 @@ async fn worker(
                             }
                         });
                     }
+                    // Nothing here waits on the service: a slow call never holds up the
+                    // snapshot, images or other commands behind it.
                     Some(Command::Tool(name,args))=>{
-                        let result=remote.call(name,args).await.map_err(|e|format!("{e:#}"));
-                        emit(&events,&wake,Event::Done(result));
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=remote.call(name,args).await.map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Done(result));
+                        });continue;
                     }
                     Some(Command::Send(message,reply))=>{
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
@@ -953,16 +977,22 @@ async fn worker(
                         });
                     }
                     Some(Command::Forward(source,destination,targets))=>{
-                        let result=remote.call("forward_messages",json!({"source":source,"destination":destination,"targets":targets})).await.and_then(|v|Ok(serde_json::from_value(v)?)).map_err(|e|format!("{e:#}"));
-                        emit(&events,&wake,Event::Forward(result));
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=remote.call("forward_messages",json!({"source":source,"destination":destination,"targets":targets})).await.and_then(|v|Ok(serde_json::from_value(v)?)).map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Forward(result));
+                        });continue;
                     }
+                    // The opened chat comes back as a selection, which sets `selected`.
                     Some(Command::Open(address))=>{
-                        let result=remote.call("open_chat",json!({"address":address})).await.and_then(|value|{
-                            let chat=value["chat"].as_str().map(str::to_owned).ok_or_else(||anyhow::anyhow!("Missing chat address"))?;
-                            Ok((chat,value["text"].as_str().map(str::to_owned)))
-                        }).map_err(|e|format!("{e:#}"));
-                        if let Ok((chat,_))=&result {selected=Some(chat.clone());}
-                        emit(&events,&wake,Event::Opened(result));
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let result=remote.call("open_chat",json!({"address":address})).await.and_then(|value|{
+                                let chat=value["chat"].as_str().map(str::to_owned).ok_or_else(||anyhow::anyhow!("Missing chat address"))?;
+                                Ok((chat,value["text"].as_str().map(str::to_owned)))
+                            }).map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Opened(result));
+                        });continue;
                     }
                     Some(Command::Newer(chat,cursor,generation))=>{
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
@@ -1544,7 +1574,7 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
                 state.busy = false;
                 match result {
                     Ok((chat, text)) => {
-                        state.search.clear();
+                        state.close_search();
                         state.select(chat.clone());
                         // A link's message becomes the draft, without replacing one already typed.
                         if let Some(text) = text
@@ -1709,6 +1739,9 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
             state.search_focus_at = None;
             if state.chat_search.open {
                 state.focus_chat_search();
+                changed = true;
+            } else if state.search.open {
+                state.search.edit.focused = true;
                 changed = true;
             }
         }
@@ -2081,6 +2114,16 @@ impl State {
         }
     }
 
+    /// Opens a chat with the number of a contact card shared in a message.
+    fn open_shared_contact(&mut self, number: String) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.error = None;
+        let _ = self.tx.send(Command::Open(number));
+    }
+
     /// Opens a WhatsApp link from outside once connected; the number check needs WhatsApp.
     fn open_pending_link(&mut self) {
         let ready = self.config.demo
@@ -2224,12 +2267,17 @@ impl State {
         self.attachments_open = false;
         self.close_viewer();
         self.section = Section::Messages;
-        // A chat opened from search, a notification or a link shows on its own screen.
+        // A chat opened from search, a notification or a link shows on its own screen,
+        // or stays on All, which lists it too.
+        let all = self.chat_kind == sidebar::ChatKind::All;
         match self.snapshot.chats.iter().find(|c| c.jid == chat) {
             Some(listed) => {
-                self.chat_kind = sidebar::ChatKind::of(listed);
+                if !(all && self.chat_kind.includes(listed)) {
+                    self.chat_kind = sidebar::ChatKind::of(listed);
+                }
                 self.show_archived = listed.archived;
             }
+            None if all => {}
             None => self.chat_kind = sidebar::ChatKind::of_jid(&chat),
         }
         self.story = None;
@@ -2251,6 +2299,13 @@ impl State {
         self.chat_search.edit.focused = false;
         self.composer_focus_at = Some(std::time::Instant::now() + Duration::from_millis(16));
         tx.wake_after(Duration::from_millis(16));
+    }
+    /// Sends a sticker without holding up anything else, so several can go out in a row.
+    fn send_sticker(&mut self, chat: String, hash: String) {
+        self.error = None;
+        if self.tx.send(Command::SendSticker(chat, hash)).is_err() {
+            self.error = Some("The local service stopped".into());
+        }
     }
     fn tool(&mut self, name: &'static str, args: Value) {
         self.busy = true;
@@ -2345,7 +2400,15 @@ impl State {
                     chat: None,
                     id: r.id.clone(),
                     sender: r.sender.clone(),
-                    text: r.preview(),
+                    text: if r.text.trim().is_empty() {
+                        r.preview()
+                    } else {
+                        r.text.clone()
+                    },
+                    kind: match r.kind.as_str() {
+                        "image" | "video" | "sticker" | "audio" | "file" => r.kind.clone(),
+                        _ => String::new(),
+                    },
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2457,6 +2520,11 @@ fn on_key(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
         s.open_chat_search(tx);
         return true;
     }
+    if event.is_command('k') && !event.mods.shift && s.authenticated && !state_call_open(s) {
+        s.open_search();
+        tx.wake_after(Duration::from_millis(16));
+        return true;
+    }
     if event.is_command('m') && event.mods.shift {
         s.diagnostics.open = !s.diagnostics.open;
         s.diagnostics.next_sample = 0.0;
@@ -2555,10 +2623,6 @@ fn on_key(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
         }
         return true;
     }
-    if rune_kit::shell::is_sidebar_toggle(event) {
-        s.sidebar.toggle();
-        return true;
-    }
     false
 }
 
@@ -2600,7 +2664,7 @@ impl State {
     }
 
     fn visible_chats(&self) -> Vec<&Chat> {
-        if self.search.edit.text.trim().is_empty() {
+        if !self.searching_chats() || self.search.edit.text.trim().is_empty() {
             self.snapshot
                 .chats
                 .iter()
@@ -2833,6 +2897,13 @@ impl State {
                 );
             }
             self.request_thumbnail(&m);
+            // A reply shows the photo or video it answers, when that is loaded.
+            if let Some(quote) = &m.quote
+                && !quote.kind.is_empty()
+                && let Some(original) = self.timeline.iter().find(|o| o.id == quote.id).cloned()
+            {
+                self.request_thumbnail(&original);
+            }
         }
         self.update_animations();
     }

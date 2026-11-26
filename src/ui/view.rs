@@ -80,6 +80,16 @@ const VIDEO: Icon = Icon {
     view: 24.0,
     body: r#"<rect x="3" y="5" width="12" height="14" rx="3" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="m15 10 6-4v12l-6-4" fill="none" stroke="currentColor" stroke-width="1.7"/>"#,
 };
+const PERSON: Icon = Icon {
+    name: "shared-contact",
+    view: 24.0,
+    body: r#"<circle cx="12" cy="8.5" r="3.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M5 19.5c1.2-3.3 3.8-5 7-5s5.8 1.7 7 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>"#,
+};
+const BUSINESS: Icon = Icon {
+    name: "business-account",
+    view: 24.0,
+    body: r#"<path d="M4 9.5 5.5 4h13L20 9.5M4 9.5c0 1.7 1.3 2.8 2.7 2.8s2.6-1.1 2.6-2.8c0 1.7 1.2 2.8 2.7 2.8s2.7-1.1 2.7-2.8c0 1.7 1.2 2.8 2.6 2.8S20 11.2 20 9.5M5.5 12v8h13v-8M10 20v-4.5h4V20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>"#,
+};
 pub(super) const PHONE: Icon = Icon {
     name: "calls",
     view: 24.0,
@@ -743,7 +753,11 @@ pub(super) fn conversation(s: &State, jid: &str, layer: &mut Vec<El>) -> El {
         .grow(1.0)
         .min_h(0.0)
         .w_full()
-        .scroll(ScrollSpec { stick_bottom: true })
+        // While newer pages are still to load (after a jump), the loaded end is not the
+        // chat's end: sticking to it would follow every appended page down to the bottom.
+        .scroll(ScrollSpec {
+            stick_bottom: !s.has_newer,
+        })
         .scroll_anchor()
         .on_at_bottom(|s: &mut State, at| s.detached = !at)
         .on_layout_tx(|s: &mut State, rect, tx| {
@@ -783,7 +797,17 @@ pub(super) fn conversation(s: &State, jid: &str, layer: &mut Vec<El>) -> El {
                             format!("message-{}-{}", m.sender, m.id).into()
                         }
                     },
-                    |s: &State, i| timeline_row(s, i),
+                    |s: &State, i| {
+                        let row = timeline_row(s, i);
+                        // The history controls never anchor the scroll: anchored to the top one,
+                        // an older page prepended under a reader at the top keeps them at the
+                        // top, which loads the next page, and so on through the whole history.
+                        if i == 0 || i > s.timeline.len() {
+                            row.no_scroll_anchor()
+                        } else {
+                            row
+                        }
+                    },
                 )
                 .on_visible_rows(|s: &mut State, range| {
                     s.visible_media = s
@@ -998,7 +1022,159 @@ fn timeline_row(s: &State, index: usize) -> El {
     {
         row = row.child(row_day(message.timestamp));
     }
+    if message.kind == "pin" {
+        return row.child(pin_note(s, message));
+    }
     row.child(message_bubble(s, message))
+}
+
+/// "Ana pinned a message", centred in the conversation like a day; it leads to the
+/// pinned message and shows its start when it is loaded.
+fn pin_note(s: &State, message: &Message) -> El {
+    let unpin = message.text == "Unpinned a message";
+    let wording = if message.from_me {
+        super::locale::tr(if unpin {
+            "You unpinned a message"
+        } else {
+            "You pinned a message"
+        })
+    } else {
+        let name = crate::storage::display_identity(
+            &message.sender,
+            &message.sender_name,
+            &message.sender_phone,
+        )
+        .0;
+        super::locale::format(
+            if unpin {
+                "{name} unpinned a message"
+            } else {
+                "{name} pinned a message"
+            },
+            &[("name", super::locale::tr(&name))],
+        )
+    };
+    let pinned = message.quote.as_ref().and_then(|quote| {
+        s.timeline
+            .iter()
+            .find(|m| m.chat == message.chat && m.id == quote.id)
+    });
+    let mut note = row()
+        .key(format!("message-{}-{}", message.sender, message.id))
+        .max_w((s.chat_bounds[2] - 80.0).max(160.0))
+        .min_w(0.0)
+        .gap(7.0)
+        .center_y()
+        .px(12.0)
+        .py(6.0)
+        .radius(13.0)
+        .fill(Color::WHITE.alpha(0.055))
+        .border(1.0, BORDER)
+        .child(icon(&super::context_menu::PIN, 13.0).color(MUTED))
+        .child(label(wording, 10.0, MUTED));
+    if let Some(pinned) = pinned {
+        let preview = pinned.preview_with(&super::locale::tr);
+        let line = preview.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        note = note.child(
+            label(format!("“{}”", line.trim()), 10.0, INK.alpha(0.82))
+                .truncate()
+                .min_w(0.0)
+                .shrink(),
+        );
+    }
+    if let Some(quote) = message.quote.clone() {
+        let chat = message.chat.clone();
+        note = note
+            .role("button")
+            .label(wording_label(message))
+            .cursor(rune::Cursor::Pointer)
+            .hover(Color::WHITE.alpha(0.09))
+            .on_press_tx(move |s: &mut State, tx| s.jump_to_quote(&quote, &chat, tx));
+    }
+    row().w_full().center().child(note)
+}
+
+fn wording_label(message: &Message) -> String {
+    super::locale::tr(if message.text == "Unpinned a message" {
+        "Show the unpinned message"
+    } else {
+        "Show the pinned message"
+    })
+}
+
+/// The contact cards shared in a message: who, their number, and a way to write to them.
+fn contact_cards(message: &Message) -> El {
+    let mut cards = col().gap(10.0).min_w(230.0);
+    let single = message.contacts.len() == 1;
+    for (index, card) in message.contacts.iter().enumerate() {
+        let phone = card.phones.first();
+        let mut about = col()
+            .grow(1.0)
+            .min_w(0.0)
+            .gap(3.0)
+            .child(title(&card.name, 14.0).truncate());
+        if !card.business.is_empty() {
+            about = about.child(
+                row()
+                    .gap(5.0)
+                    .center_y()
+                    .child(icon(&BUSINESS, 12.0).color(MINT))
+                    .child(label(super::locale::tr("Business account"), 10.0, MINT)),
+            );
+        }
+        for phone in &card.phones {
+            about = about.child(label(&phone.number, 11.0, MUTED).truncate());
+        }
+        let mut line = row()
+            .key(format!("contact-{}-{}-{index}", message.sender, message.id))
+            .gap(11.0)
+            .center_y()
+            .child(
+                el().size(40.0, 40.0)
+                    .radius(20.0)
+                    .fill(MINT.alpha(0.12))
+                    .center()
+                    .child(icon(&PERSON, 20.0).color(MINT)),
+            )
+            .child(about);
+        let open = phone.map(|phone| {
+            if phone.waid.is_empty() {
+                phone.number.clone()
+            } else {
+                format!("+{}", phone.waid)
+            }
+        });
+        let Some(open) = open else {
+            cards = cards.child(line);
+            continue;
+        };
+        if single {
+            cards = cards.child(line).child(
+                row()
+                    .key(format!("contact-open-{}-{}", message.sender, message.id))
+                    .w_full()
+                    .h(34.0)
+                    .center()
+                    .gap(7.0)
+                    .radius(10.0)
+                    .fill(Color::WHITE.alpha(0.035))
+                    .border(1.0, BORDER)
+                    .hover(Color::WHITE.alpha(0.07))
+                    .cursor(rune::Cursor::Pointer)
+                    .role("button")
+                    .label(super::locale::tr("Open chat"))
+                    .on_press(move |s: &mut State| s.open_shared_contact(open.clone()))
+                    .child(icon(&CHAT, 15.0).color(MINT))
+                    .child(label(super::locale::tr("Open chat"), 12.0, MINT)),
+            );
+        } else {
+            line = line.child(icon_button(&CHAT, "Open chat", move |s, _| {
+                s.open_shared_contact(open.clone())
+            }));
+            cards = cards.child(line);
+        }
+    }
+    cards
 }
 
 pub(super) fn row_day(timestamp: i64) -> El {
@@ -1090,28 +1266,78 @@ fn message_bubble(s: &State, message: &Message) -> El {
         } else {
             crate::storage::display_identity(&quote.sender, "", "").0
         };
-        bubble = bubble.child(
-            col()
+        let original = s.timeline.iter().find(|m| m.id == quote.id);
+        // Quotes stored before they kept a kind learn it from the original.
+        let mut kind = quote.clone();
+        if kind.kind.is_empty()
+            && let Some(original) = original
+            && matches!(
+                original.kind.as_str(),
+                "image" | "video" | "sticker" | "audio" | "file"
+            )
+        {
+            kind.kind = original.kind.clone();
+        }
+        let fallback = kind.fallback();
+        let wording =
+            !kind.kind.is_empty() && (quote.text.trim().is_empty() || quote.text == fallback);
+        let body = if wording {
+            let glyph = match kind.kind.as_str() {
+                "image" => &MEDIA,
+                "video" => &VIDEO,
+                "sticker" => &STICKER,
+                "audio" => &AUDIO,
+                _ => &FILE,
+            };
+            row()
                 .gap(5.0)
-                .padding(10.0)
-                .radius(9.0)
-                .fill(MINT.alpha(0.07))
-                .border(1.0, MINT.alpha(0.18))
-                .role("button")
-                .label(super::locale::tr("Go to replied message"))
-                .help(super::locale::tr("Go to replied message"))
-                .hover(MINT.alpha(0.14))
-                .on_press_tx(move |s: &mut State, tx| s.jump_to_quote(&quoted, &chat, tx))
-                .child(label(name, 11.0, MINT))
-                .child(
-                    label(
-                        super::links::expand_mentions(&quote.text, &quote.mentions).0,
-                        12.0,
-                        MUTED,
-                    )
-                    .truncate(),
-                ),
-        );
+                .center_y()
+                .child(icon(glyph, 13.0).color(MUTED))
+                .child(label(super::locale::tr(fallback), 12.0, MUTED).truncate())
+        } else {
+            row().child(
+                label(
+                    super::links::expand_mentions(&quote.text, &quote.mentions).0,
+                    12.0,
+                    MUTED,
+                )
+                .truncate(),
+            )
+        };
+        let text = col()
+            .gap(5.0)
+            .grow(1.0)
+            .min_w(0.0)
+            .child(label(name, 11.0, MINT))
+            .child(body);
+        let mut card = row()
+            .gap(10.0)
+            .padding(10.0)
+            .radius(9.0)
+            .fill(MINT.alpha(0.07))
+            .border(1.0, MINT.alpha(0.18))
+            .role("button")
+            .label(super::locale::tr("Go to replied message"))
+            .help(super::locale::tr("Go to replied message"))
+            .hover(MINT.alpha(0.14))
+            .on_press_tx(move |s: &mut State, tx| s.jump_to_quote(&quoted, &chat, tx))
+            .child(text);
+        // The photo, video or sticker it answers, as the phone shows it.
+        if let Some(original) =
+            original.filter(|m| matches!(m.kind.as_str(), "image" | "video" | "sticker"))
+            && let Some(image) = s
+                .images
+                .get(&media::thumbnail_key(original))
+                .filter(|image| image.error().is_none())
+        {
+            card = card.child(
+                el().size(40.0, 40.0)
+                    .radius(6.0)
+                    .clip_rounded(6.0)
+                    .pixels_fit(image.pixels(), rune::SurfaceFit::Fill),
+            );
+        }
+        bubble = bubble.child(card);
     }
     if !message.title.is_empty() {
         bubble = bubble.child(title(&message.title, 14.0).wrap_anywhere());
@@ -1177,7 +1403,9 @@ fn message_bubble(s: &State, message: &Message) -> El {
                 ),
         );
     }
-    if message.kind == "view_once" {
+    if !message.contacts.is_empty() {
+        bubble = bubble.child(contact_cards(message));
+    } else if message.kind == "view_once" {
         bubble = bubble.child(view_once_content(message, mine));
     } else if message.album.is_some() && matches!(message.kind.as_str(), "image" | "video") {
         bubble = bubble.child(media::album(s, message));
@@ -1242,7 +1470,7 @@ fn message_bubble(s: &State, message: &Message) -> El {
                         .min_w(0.0),
                 ),
         );
-    } else if !message.is_call() && !message.text.is_empty() {
+    } else if !message.is_call() && !message.text.is_empty() && message.contacts.is_empty() {
         // Text follows the attachment, so captions sit under their media.
         let context = message.clone();
         bubble = bubble.child(

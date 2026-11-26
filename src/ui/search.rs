@@ -141,8 +141,8 @@ fn same_message(a: &SearchHit, b: &SearchHit) -> bool {
 
 pub(super) fn poll(s: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
-    if s.section == super::Section::Messages {
-        let (update, request) = s.search.tick(None, Some(s.chat_kind), elapsed, tx);
+    if s.searching_chats() {
+        let (update, request) = s.search.tick(None, Some(s.search_kind), elapsed, tx);
         changed |= update;
         if let Some(request) = request {
             let _ = s.tx.send(Command::Search(request));
@@ -160,8 +160,13 @@ pub(super) fn poll(s: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
 
 /// The phone number or WhatsApp link typed in the sidebar search, when it is one.
 pub(super) fn phone_target(s: &State) -> Option<crate::phone_links::PhoneTarget> {
-    // Starting a chat with a number belongs to the private chats screen.
-    if s.section != super::Section::Messages || s.chat_kind != crate::model::ChatKind::Chats {
+    // Starting a chat with a number belongs to private chats (and everything).
+    if !s.searching_chats()
+        || !matches!(
+            s.search_kind,
+            crate::model::ChatKind::Chats | crate::model::ChatKind::All
+        )
+    {
         return None;
     }
     crate::phone_links::parse(&s.search.edit.text, s.snapshot.region.as_deref())
@@ -176,27 +181,90 @@ pub(super) fn chat_for_number<'a>(
     s.snapshot.chats.iter().find(|chat| chat.matches_jid(&jid))
 }
 
+/// Lower case without accents, so "fam" finds "Família".
+fn fold(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .map(|c| match c {
+            'á' | 'à' | 'â' | 'ã' | 'ä' | 'å' => 'a',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            'ç' => 'c',
+            'ñ' => 'n',
+            c => c,
+        })
+        .collect()
+}
+
+/// Chats whose names match the search, best first: a name that starts with it, then a
+/// word in the name that does, then the rest, each most recent first.
 pub(super) fn matching_chats(s: &State) -> Vec<&Chat> {
-    let query = s.search.edit.text.trim().to_lowercase();
+    let query = fold(s.search.edit.text.trim());
     let digits: String = query.chars().filter(char::is_ascii_digit).collect();
-    s.snapshot
+    let mut found: Vec<(u8, &Chat)> = s
+        .snapshot
         .chats
         .iter()
-        // Each screen finds only its own kind of conversation.
-        .filter(|chat| s.chat_kind.includes(chat))
-        .filter(|chat| {
-            chat.name.to_lowercase().contains(&query)
-                || (digits.len() >= 3 && chat.phone.contains(&digits))
+        // The search's filter keeps one kind of conversation, or all of them.
+        .filter(|chat| s.search_kind.includes(chat))
+        .filter_map(|chat| {
+            let name = fold(&super::sidebar::chat_title(chat));
+            let rank = if name.starts_with(&query) {
+                0
+            } else if name
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|word| word.starts_with(&query))
+            {
+                1
+            } else if name.contains(&query) {
+                2
+            } else if (digits.len() >= 3 && chat.phone.contains(&digits))
                 || s.search
                     .results
                     .chats
                     .iter()
                     .any(|hit| chat.matches_jid(&hit.jid))
+            {
+                3
+            } else {
+                return None;
+            };
+            Some((rank, chat))
         })
-        .collect()
+        .collect();
+    found.sort_by_key(|(rank, _)| *rank);
+    found.into_iter().map(|(_, chat)| chat).collect()
 }
 
 impl State {
+    /// Whether the sidebar's chat search is open (it lives on the chat screens).
+    pub(super) fn searching_chats(&self) -> bool {
+        self.search.open && self.section == super::Section::Messages && !self.preferences.open
+    }
+
+    /// Opens the sidebar search across every kind of chat; the chips then filter it.
+    pub(super) fn open_search(&mut self) {
+        self.close_story();
+        self.preferences.open = false;
+        self.section = super::Section::Messages;
+        self.search.clear();
+        self.search.open = true;
+        self.search_kind = crate::model::ChatKind::All;
+        self.draft.focused = false;
+        self.chat_search.edit.focused = false;
+        // The field mounts this frame; focus it on the next.
+        self.search_focus_at = Some(std::time::Instant::now() + Duration::from_millis(16));
+    }
+
+    /// Back to the screen the search was opened from.
+    pub(super) fn close_search(&mut self) {
+        self.search.clear();
+        self.search.open = false;
+        self.search.edit.focused = false;
+    }
+
     /// Opens the chat for the number or link in the sidebar search, after WhatsApp
     /// confirms the number has an account.
     pub(super) fn open_number(&mut self) {

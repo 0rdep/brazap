@@ -3,7 +3,7 @@ use crate::{assets::AssetRequest, model::Message, stickers::Sticker};
 use rune::{Color, El, Icon, Image, ScrollSpec, TextEdit, col, el, icon, row};
 use rune_kit::{Placement, TextInput, glyphs};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
@@ -476,16 +476,10 @@ fn view(s: &State) -> El {
                                         .label(description)
                                         .help(description)
                                         .on_press(move |s: &mut State| {
-                                            if s.busy {
-                                                return;
-                                            }
                                             if let Some(chat) = s.selected.clone() {
                                                 s.picker.open = false;
                                                 s.picker.images.clear();
-                                                s.tool(
-                                                    "send_sticker",
-                                                    json!({"chat":chat,"hash":hash}),
-                                                );
+                                                s.send_sticker(chat, hash.clone());
                                             }
                                         });
                                     cell = cell.child(

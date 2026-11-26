@@ -1,5 +1,5 @@
 use super::{Command, State, locale, view::*};
-use rune::{El, Icon, LoopSpec, col, el, icon};
+use rune::{El, Icon, LoopSpec, el, icon};
 
 const UPDATE: Icon = Icon {
     name: "install-update",
@@ -7,8 +7,8 @@ const UPDATE: Icon = Icon {
     body: r#"<path d="M12 16V4m-4 4 4-4 4 4M5 15v5h14v-5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
-/// The update action at the bottom of the sidebar rail, above Settings.
-pub(super) fn prompt(s: &State, labeled: bool) -> Option<El> {
+/// The update action in the sidebar header, beside Settings.
+pub(super) fn prompt(s: &State) -> Option<El> {
     let update = &s.snapshot.updates;
     if !update.newer_than(env!("CARGO_PKG_VERSION")) {
         return None;
@@ -26,28 +26,21 @@ pub(super) fn prompt(s: &State, labeled: bool) -> Option<El> {
     } else {
         "Retry update"
     };
-    let small = !labeled;
-    let mut glyph = icon(&UPDATE, if small { 19.0 } else { 18.0 }).color(MINT);
+    let mut glyph = icon(&UPDATE, 18.0).color(MINT);
     if downloading && !ready {
         glyph = glyph.looping(LoopSpec::rotation(1.6));
     }
-    // The rail's square, tinted as the one action that needs attention.
-    let mark = el()
-        .size(36.0, 36.0)
-        .radius(10.0)
-        .center()
-        .fill(MINT.alpha(0.12))
-        .border(1.0, MINT.alpha(0.28))
-        .child(glyph);
-    // The whole tile takes the pointer, like the other rail items.
-    let mut button = col()
+    // A header button beside Settings, tinted as the one action that needs attention;
+    // the tooltip has the details.
+    let mut button = el()
         .key("sidebar-update")
-        .gap(3.0)
-        .py(4.0)
-        .items_center()
-        .radius(12.0)
-        .fill(rune::Color::TRANSPARENT)
-        .hover(MINT.alpha(0.08))
+        .size(34.0, 34.0)
+        .center()
+        .radius(11.0)
+        .fill(MINT.alpha(0.12))
+        .border(1.0, MINT.alpha(0.32))
+        .hover(MINT.alpha(0.2))
+        .motion(rune::tok::motion::SNAPPY)
         .cursor(rune::Cursor::Pointer)
         .role(if downloading && !ready {
             "status"
@@ -68,15 +61,7 @@ pub(super) fn prompt(s: &State, labeled: bool) -> Option<El> {
         } else {
             locale::tr(action)
         })
-        .child(mark);
-    if small {
-        button = button.w(48.0);
-    } else {
-        // One short word under the icon; the tooltip has the details.
-        button = button
-            .w_full()
-            .child(label(locale::tr("Update"), 10.5, MINT));
-    }
+        .child(glyph);
     if ready {
         button = button.on_press_tx(
             |s: &mut State, tx| match crate::updates::install(&s.config) {

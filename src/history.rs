@@ -260,7 +260,30 @@ impl Archive {
                 " AND instr(json_extract(payload,'$.text'),'@all')>0",
             )
             .await?;
-        Ok(all || media || edits || view_once || audio_stickers || albums || everyone)
+        // Replies kept no kind for what they quote, and a photo without a caption
+        // was quoted with empty text.
+        let quotes = self
+            .reproject(
+                "message_quote_kinds_v1",
+                " AND json_extract(payload,'$.quote') IS NOT NULL",
+            )
+            .await?;
+        // Contacts kept only their name, and pins were shown as unsupported.
+        let cards = self
+            .reproject(
+                "message_contact_cards_v1",
+                " AND json_extract(payload,'$.kind') IN ('contact','unsupported')",
+            )
+            .await?;
+        Ok(all
+            || media
+            || edits
+            || view_once
+            || audio_stickers
+            || albums
+            || everyone
+            || quotes
+            || cards)
     }
 
     async fn reproject(&self, marker: &'static str, only: &'static str) -> Result<bool> {

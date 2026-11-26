@@ -125,8 +125,6 @@ fn analyze(source: &str, protected: &[Range<usize>]) -> (Vec<bool>, Vec<(Range<u
     }
 
     inline(&chars, &blocked, 0, chars.len(), &mut drop, &mut styles);
-
-    inline(&chars, &blocked, 0, chars.len(), &mut drop, &mut styles);
     (drop, styles)
 }
 

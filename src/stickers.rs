@@ -263,15 +263,41 @@ impl Service {
                 .await;
         }
         let client = self.connected().await?;
+        let stored = self.archive.stored_sticker(hash.clone()).await?;
+        let mut proto = wa::Message::decode_from_slice(&stored.encoded)?;
+        proto
+            .sticker_message
+            .as_option_mut()
+            .context("Sticker is unavailable")?
+            .context_info = MessageField::default();
+        // The sticker shows as sending in the chat at once; its upload follows.
+        let staged = self
+            .stage_outgoing(&client, &chat.parse()?, &proto, Some(bytes.clone()))
+            .await?;
+        match self.upload_sticker(&client, hash, bytes, proto).await {
+            Ok(proto) => self.send_staged(client, staged, proto).await,
+            Err(error) => {
+                self.fail_staged(&staged).await?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Uploads a sticker (and its sound, if it has one) and points its message at the upload.
+    async fn upload_sticker(
+        &self,
+        client: &whatsapp_rust::Client,
+        hash: String,
+        bytes: Vec<u8>,
+        mut proto: wa::Message,
+    ) -> Result<wa::Message> {
         let uploaded = client
             .upload(
-                bytes.clone(),
+                bytes,
                 whatsapp_rust::download::MediaType::Sticker,
                 Default::default(),
             )
             .await?;
-        let stored = self.archive.stored_sticker(hash.clone()).await?;
-        let mut proto = wa::Message::decode_from_slice(&stored.encoded)?;
         let sticker = proto
             .sticker_message
             .as_option_mut()
@@ -282,9 +308,8 @@ impl Service {
         sticker.file_enc_sha256 = Some(uploaded.file_enc_sha256.to_vec());
         sticker.file_sha256 = Some(uploaded.file_sha256.to_vec());
         sticker.file_length = Some(uploaded.file_length);
-        sticker.context_info = MessageField::default();
         // A sticker with sound sends its audio inside it, wrapped as WhatsApp does.
-        let proto = match self.archive.sticker_sound(hash).await? {
+        Ok(match self.archive.sticker_sound(hash).await? {
             Some((audio, seconds)) => {
                 use whatsapp_rust::media;
                 use whatsapp_rust::waproto::whatsapp::__buffa::oneof::message::sticker_message::Audio;
@@ -316,9 +341,7 @@ impl Service {
                 message
             }
             None => proto,
-        };
-        self.send_prepared(client, chat.parse()?, proto, Some(bytes))
-            .await
+        })
     }
 }
 

@@ -11,9 +11,10 @@ const MINUS: Icon = Icon {
     body: r#"<path d="M5 12h14" stroke="currentColor" stroke-width="1.8"/>"#,
 };
 pub(super) const SETTINGS: Icon = Icon {
-    name: "settings",
+    name: "settings-gear",
     view: 24.0,
-    body: r#"<path d="m9 3-.7 3-2.6 1L3 6l-2 4 2.5 2L3 15l2 4 3-.5 2 2.5h4l1-3 3-1 2.5 1 2-4-2.5-2V9l-2-4-3 .5L14 3Z" transform="translate(1 0) scale(.9)" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/>"#,
+    // Eight even teeth around the centre.
+    body: r#"<path d="M10.15 4.84 10.42 2.53A9.6 9.6 0 0 1 13.58 2.53L13.85 4.84A7.4 7.4 0 0 1 15.76 5.62L17.57 4.18A9.6 9.6 0 0 1 19.82 6.43L18.38 8.24A7.4 7.4 0 0 1 19.16 10.15L21.47 10.42A9.6 9.6 0 0 1 21.47 13.58L19.16 13.85A7.4 7.4 0 0 1 18.38 15.76L19.82 17.57A9.6 9.6 0 0 1 17.57 19.82L15.76 18.38A7.4 7.4 0 0 1 13.85 19.16L13.58 21.47A9.6 9.6 0 0 1 10.42 21.47L10.15 19.16A7.4 7.4 0 0 1 8.24 18.38L6.43 19.82A9.6 9.6 0 0 1 4.18 17.57L5.62 15.76A7.4 7.4 0 0 1 4.84 13.85L2.53 13.58A9.6 9.6 0 0 1 2.53 10.42L4.84 10.15A7.4 7.4 0 0 1 5.62 8.24L4.18 6.43A9.6 9.6 0 0 1 6.43 4.18L8.24 5.62A7.4 7.4 0 0 1 10.15 4.84Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/>"#,
 };
 pub(super) const LOGOUT: Icon = Icon {
     name: "logout",
@@ -596,7 +597,8 @@ fn set_retention(settings: &mut Settings, kind: &str, days: u32) {
 }
 
 pub(super) fn view(s: &State) -> El {
-    let mut navigation = col().w(154.0).h_full().padding(16.0).gap(8.0);
+    // The pages scroll on a short window; Log out stays pinned under them.
+    let mut pages = col().w_full().gap(8.0);
     for page in [
         Page::Appearance,
         Page::Notifications,
@@ -607,7 +609,7 @@ pub(super) fn view(s: &State) -> El {
         Page::Debug,
         Page::About,
     ] {
-        navigation = navigation.child(
+        pages = pages.child(
             label(
                 super::locale::tr(page.name()),
                 12.0,
@@ -631,7 +633,23 @@ pub(super) fn view(s: &State) -> El {
             .on_press(move |s: &mut State| s.preferences_page(page)),
         );
     }
-    navigation = navigation
+    let navigation = col()
+        .w(super::locale::scale(154.0))
+        .h_full()
+        .padding(16.0)
+        .gap(8.0)
+        .child(
+            col()
+                .key("settings-pages")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .scroll_edge_fade(10.0)
+                .child(pages),
+        )
         .child(el().w_full().h(1.0).my(4.0).fill(BORDER))
         .child(
             row()

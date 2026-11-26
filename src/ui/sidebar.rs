@@ -3,20 +3,22 @@ use crate::model::Chat;
 use rune::{Color, Cx, El, GrowthSpec, Icon, ScrollSpec, col, el, icon, row};
 use rune_kit::{TextInput, glyphs};
 
-const COLLAPSE: Icon = Icon {
-    name: "sidebar-collapse",
-    view: 24.0,
-    body: r#"<rect x="3" y="4" width="18" height="16" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M9 4v16m8-12-4 4 4 4" fill="none" stroke="currentColor" stroke-width="1.6"/>"#,
-};
-const EXPAND: Icon = Icon {
-    name: "sidebar-expand",
-    view: 24.0,
-    body: r#"<rect x="3" y="4" width="18" height="16" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M9 4v16m4-12 4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.6"/>"#,
-};
 const ARCHIVE: Icon = Icon {
     name: "archive",
     view: 24.0,
     body: r#"<rect x="3" y="4" width="18" height="5" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M5 9v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9m-9 4h4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+/// The kind chips' scroll viewport, the same whether they switch tabs or filter a search.
+const CHIPS: &str = "kind-chips";
+const CHEVRON_LEFT: Icon = Icon {
+    name: "chips-chevron-left",
+    view: 24.0,
+    body: r#"<path d="m14.5 6-6 6 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+const CHEVRON_RIGHT: Icon = Icon {
+    name: "chips-chevron-right",
+    view: 24.0,
+    body: r#"<path d="m9.5 6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 const BACK: Icon = Icon {
     name: "back",
@@ -41,6 +43,11 @@ const COMMUNITY: Icon = Icon {
     view: 24.0,
     body: r#"<circle cx="12" cy="7" r="2.6" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="5.5" cy="16" r="2.4" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="18.5" cy="16" r="2.4" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10.3 9.2 7 13.8m6.7-4.6 3.3 4.6M8 16h8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>"#,
 };
+const ALL: Icon = Icon {
+    name: "all-chats",
+    view: 24.0,
+    body: r#"<path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h9A1.5 1.5 0 0 1 16 5.5v6a1.5 1.5 0 0 1-1.5 1.5H9l-4 3v-3.2A1.5 1.5 0 0 1 4 11.5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M19 9h.5A1.5 1.5 0 0 1 21 10.5v6a1.5 1.5 0 0 1-1 1.4V21l-4-3h-4.5a1.5 1.5 0 0 1-1.4-1" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
 const BROADCAST: Icon = Icon {
     name: "broadcast-list",
     view: 24.0,
@@ -57,7 +64,8 @@ enum Screen {
     Status,
 }
 impl Screen {
-    const EVERY: [Self; 7] = [
+    const EVERY: [Self; 8] = [
+        Self::Chats(ChatKind::All),
         Self::Chats(ChatKind::Chats),
         Self::Chats(ChatKind::Groups),
         Self::Chats(ChatKind::Communities),
@@ -75,6 +83,7 @@ impl Screen {
     }
     fn label(self) -> (&'static Icon, &'static str) {
         match self {
+            Self::Chats(ChatKind::All) => (&ALL, "All"),
             Self::Chats(ChatKind::Chats) => (&CHAT, "Chats"),
             Self::Chats(ChatKind::Groups) => (&GROUP, "Groups"),
             Self::Chats(ChatKind::Communities) => (&COMMUNITY, "Communities"),
@@ -104,60 +113,24 @@ impl Screen {
 }
 
 pub(super) fn layout(s: &State, _cx: &mut Cx<State>, layer: &mut Vec<El>) -> El {
-    let sidebar_open = s.sidebar.is_open();
-    // Keep the list at its full width through the transition. Remounting a virtual
-    // list during expansion causes a measurement pass that cuts the width spring.
-    let body = |key, content: El, width, visible| {
-        let pane = el()
-            .key(key)
-            .pin(Some(0.0), Some(0.0), None, Some(0.0))
-            .w(width)
-            .opacity(if visible { 1.0 } else { 0.0 })
-            .opacity_motion(if visible {
-                rune::tok::motion::CSS_ENTER
-            } else {
-                rune::tok::motion::CSS_EXIT
-            })
-            .child(content.w_full().h_full().instant_changes());
-        if visible { pane } else { pane.inert() }
-    };
-    let panes = el()
+    let contents = col()
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .clip_soft(0.0)
-        .child(body(
-            "expanded-content",
-            expanded(s),
-            s.sidebar.width(),
-            sidebar_open,
-        ))
-        .child(body("compact-content", compact(s), 68.0, !sidebar_open));
-    let contents = col().w_full().pt(4.0).child(panes);
-    // The logo and the sidebar toggle share one compact row; collapsed, the toggle
-    // takes the logo's place so it never moves vertically.
-    let mut branding = row()
+        .child(list_pane(s).w_full());
+    let branding = row()
         .key("sidebar-brand")
         .w_full()
         .h(36.0)
-        .px(if sidebar_open { 10.0 } else { 0.0 })
+        .pl(10.0)
+        .pr(4.0)
         .gap(8.0)
-        .center_y();
-    if sidebar_open {
-        branding = branding
-            .child(brand(s, true).grow(1.0).min_w(0.0))
-            .child(sidebar_toggle(true));
-    } else {
-        // Collapsed, the logo stays on top and the toggle opens the rail below it.
-        branding = branding.justify_center().child(brand(s, false));
-    }
+        .center_y()
+        .child(brand(s, true).grow(1.0).min_w(0.0))
+        .child(header_actions(s));
     let sidebar = col()
         .key("sidebar-shell")
-        .w(if sidebar_open {
-            s.sidebar.width()
-        } else {
-            68.0
-        })
+        .w(s.sidebar.width())
         .h_full()
         .gap(8.0)
         .child(branding)
@@ -181,201 +154,369 @@ pub(super) fn layout(s: &State, _cx: &mut Cx<State>, layer: &mut Vec<El>) -> El 
         .gap(0.0)
         .motion(rune::tok::motion::GLIDE)
         .child(sidebar);
-    if s.sidebar.is_open() {
-        body = body.child(
-            el().w(12.0)
-                .h_full()
-                .center()
-                .cursor(rune::Cursor::ResizeColumn)
-                .help(super::locale::tr(
-                    "Drag to resize the sidebar · Double-click to reset",
-                ))
-                .on_drag(|s: &mut State, d, tx| {
-                    if d.phase == rune::Phase::Down {
-                        d.data = s.sidebar.width();
-                    }
-                    if d.cancelled() {
-                        s.sidebar.set_width(d.data);
-                    } else {
-                        s.sidebar.set_width(d.data + d.dx);
-                    }
-                    tx.instant();
-                })
-                .on_double_press(|s: &mut State| s.sidebar.reset_width())
-                .child(el().w(2.0).h(46.0).radius(1.0).fill(BORDER)),
-        );
-    } else {
-        body = body.child(el().w(12.0));
-    }
+    body = body.child(
+        el().w(12.0)
+            .h_full()
+            .center()
+            .cursor(rune::Cursor::ResizeColumn)
+            .help(super::locale::tr(
+                "Drag to resize the sidebar · Double-click to reset",
+            ))
+            .on_drag(|s: &mut State, d, tx| {
+                if d.phase == rune::Phase::Down {
+                    d.data = s.sidebar.width();
+                }
+                if d.cancelled() {
+                    s.sidebar.set_width(d.data);
+                } else {
+                    s.sidebar.set_width(d.data + d.dx);
+                }
+                tx.instant();
+            })
+            .on_double_press(|s: &mut State| s.sidebar.reset_width())
+            .child(el().w(2.0).h(46.0).radius(1.0).fill(BORDER)),
+    );
     body.child(panel(main).key("main-panel").grow(1.0).min_w(0.0).h_full())
 }
 
-fn sidebar_toggle(open: bool) -> El {
-    icon_button(
-        if open { &COLLAPSE } else { &EXPAND },
-        if open {
-            "Collapse sidebar"
-        } else {
-            "Expand sidebar"
-        },
-        |s, _| s.sidebar.toggle(),
-    )
-    .key("sidebar-toggle")
-    .motion(rune::tok::motion::GLIDE)
+/// What choosing `screen` does, from the tabs or the header.
+fn show(s: &mut State, screen: Screen) {
+    if s.search.open {
+        s.close_search();
+    }
+    s.close_story();
+    s.preferences.open = false;
+    s.attachments_open = false;
+    match screen {
+        Screen::Chats(kind) => {
+            s.section = Section::Messages;
+            if s.chat_kind != kind {
+                s.chat_kind = kind;
+                s.show_archived = false;
+            }
+        }
+        Screen::Calls => s.section = Section::Calls,
+        Screen::Status => {
+            s.section = Section::Status;
+            s.request_status_avatars();
+        }
+    }
 }
 
-/// One rail entry: an icon, with its label under it while the sidebar is open.
-/// Collapsed, the tooltip names it instead.
-pub(super) fn rail_item(
+/// One chip per kind of chat above the list, scrolling sideways. They choose the screen,
+/// and while searching they filter the results instead (from "Everything").
+fn kind_chips(s: &State, searching: bool) -> El {
+    let current = if searching {
+        Some(s.search_kind)
+    } else if !s.preferences.open && s.section == Section::Messages {
+        Some(s.chat_kind)
+    } else {
+        None
+    };
+    let mut chips = row()
+        .key("kind-chip-row")
+        .gap(6.0)
+        .pr(10.0)
+        .on_drag(drag_chips());
+    for screen in Screen::EVERY {
+        let Screen::Chats(kind) = screen else {
+            continue;
+        };
+        let (glyph, _) = screen.label();
+        let selected = current == Some(kind);
+        let name = if searching && kind == ChatKind::All {
+            super::locale::tr("Everything")
+        } else {
+            super::locale::tr(screen.short())
+        };
+        let key = format!("chip-{}", screen.short());
+        let mut chip = row()
+            .key(key.clone())
+            .h(30.0)
+            .px(12.0)
+            .gap(6.0)
+            .center_y()
+            .radius(15.0)
+            .fill(if selected {
+                MINT.alpha(0.15)
+            } else {
+                Color::TRANSPARENT
+            })
+            .border(
+                1.0,
+                if selected {
+                    MINT.alpha(0.4)
+                } else {
+                    Color::WHITE.alpha(0.08)
+                },
+            )
+            .hover(if selected {
+                MINT.alpha(0.19)
+            } else {
+                Color::WHITE.alpha(0.05)
+            })
+            .motion(rune::tok::motion::GLIDE)
+            .cursor(rune::Cursor::Pointer)
+            .role("tab")
+            .label(name.clone())
+            .on_press_tx(move |s: &mut State, tx| {
+                if searching {
+                    s.search_kind = kind;
+                } else {
+                    show(s, screen);
+                }
+                // A chip chosen half hidden under an edge slides fully into view.
+                tx.scroll_into_view_in(CHIPS, key.clone());
+            })
+            // Held and dragged, a chip scrolls the row instead of choosing itself.
+            .on_drag(drag_chips());
+        chip = chip
+            .child(icon(glyph, 15.0).color(if selected { MINT } else { MUTED }))
+            .child(label(name, 12.0, if selected { INK } else { MUTED }));
+        if !searching && screen.waiting(s) {
+            chip = chip.child(el().size(6.0, 6.0).radius(3.0).fill(MINT));
+        }
+        chips = chips.child(chip);
+    }
+    let offset = s.chip_scroll.clone();
+    let [left, right] = s.chip_edges.clone();
+    let strip = col()
+        .key(CHIPS)
+        .w_full()
+        .min_w(0.0)
+        .scroll_x()
+        .scroll_edge_fade(18.0)
+        // Clear of the arrow button over each edge.
+        .scroll_margin(34.0)
+        .on_scroll_offset(move |position| {
+            let [x, max] = [position.offset[0], position.max[0]];
+            offset.set([x, max]);
+            // The arrows show while chips are hidden past their edge.
+            left.set((x / 12.0).clamp(0.0, 1.0));
+            right.set(((max - x) / 12.0).clamp(0.0, 1.0));
+        })
+        .child(chips);
+    el().key("kind-chips-frame")
+        .w_full()
+        .min_w(0.0)
+        // A mouse wheel turns the chips sideways; there is nothing to scroll vertically.
+        .on_wheel(move |s: &mut State, wheel, tx| {
+            if wheel.dx != 0.0 || wheel.dy == 0.0 {
+                return false;
+            }
+            let [x, max] = s.chip_scroll.get();
+            tx.scroll_to_instant(CHIPS, (x - wheel.dy).clamp(0.0, max), 0.0);
+            true
+        })
+        .child(strip)
+        .child(chip_arrow(s, false))
+        .child(chip_arrow(s, true))
+}
+
+/// Scrolls the chips with the pointer while a press on them is held and dragged.
+fn drag_chips() -> impl Fn(&mut State, &mut rune::Drag, &mut rune::Tx) {
+    move |s, d, tx| {
+        let [x, max] = s.chip_scroll.get();
+        if d.phase == rune::Phase::Down {
+            d.data = x;
+            return;
+        }
+        let to = if d.cancelled() { d.data } else { d.data - d.dx };
+        tx.scroll_to_instant(CHIPS, to.clamp(0.0, max), 0.0);
+    }
+}
+
+/// The round arrow over an edge of the chips, shown while more chips are hidden past it.
+/// Faded out it takes no presses, so the chip under it stays reachable.
+fn chip_arrow(s: &State, forward: bool) -> El {
+    let name = super::locale::tr(if forward {
+        "Scroll right"
+    } else {
+        "Scroll left"
+    });
+    let (left, right) = if forward {
+        (None, Some(0.0))
+    } else {
+        (Some(0.0), None)
+    };
+    el().key(if forward {
+        "chips-forward"
+    } else {
+        "chips-back"
+    })
+    .pin(left, Some(2.0), right, None)
+    .size(26.0, 26.0)
+    .center()
+    .radius(13.0)
+    .fill(Color {
+        r: 0.03,
+        g: 0.045,
+        b: 0.06,
+        a: 0.96,
+    })
+    .border(1.0, CONTROL_BORDER)
+    .shadow(4.0, 12.0, Color::BLACK.alpha(0.35))
+    .hover(Color {
+        r: 0.06,
+        g: 0.085,
+        b: 0.1,
+        a: 1.0,
+    })
+    .live_opacity(&s.chip_edges[usize::from(forward)])
+    .cursor(rune::Cursor::Pointer)
+    .role("button")
+    .label(name.clone())
+    .on_press_tx(move |s: &mut State, tx| {
+        let [x, max] = s.chip_scroll.get();
+        let step = if forward { 140.0 } else { -140.0 };
+        tx.scroll_to(CHIPS, (x + step).clamp(0.0, max), 0.0);
+    })
+    .child(
+        icon(
+            if forward {
+                &CHEVRON_RIGHT
+            } else {
+                &CHEVRON_LEFT
+            },
+            14.0,
+        )
+        .color(INK),
+    )
+}
+
+/// The chips with the search button beside them. The search opens its field above them,
+/// and the same chips then filter the results; they keep their place and scroll throughout.
+fn list_header(s: &State, searching: bool) -> El {
+    // The field's slot grows from nothing to its height as the field fades in, pushing the
+    // chips and the list down with it, and shrinks back as the field fades out.
+    let mut slot = col().key("search-slot").w_full().clip_rounded(0.0);
+    if searching {
+        slot = slot.child(search_field(s).pb(10.0));
+    }
+    let header = col().key("list-header").w_full().child(slot);
+    let mut bar = row()
+        .key("chips-bar")
+        .w_full()
+        .gap(6.0)
+        .center_y()
+        .child(kind_chips(s, searching).grow(1.0).min_w(0.0));
+    if !searching && (s.section == Section::Messages || s.preferences.open) {
+        bar = bar.child(
+            el().key("open-search")
+                .size(32.0, 32.0)
+                .center()
+                .radius(16.0)
+                .fill(Color::WHITE.alpha(0.035))
+                .border(1.0, CONTROL_BORDER)
+                .hover(Color::WHITE.alpha(0.07))
+                .cursor(rune::Cursor::Pointer)
+                .role("button")
+                .label(super::locale::tr("Search chats and messages"))
+                .help(super::locale::tr("Search chats and messages (Ctrl+K)"))
+                .on_press(|s: &mut State| s.open_search())
+                .transition(
+                    rune::Transition::scale(0.6)
+                        .allow_small_scale()
+                        .hold_layout()
+                        .springs(rune::tok::motion::pair::SNAP),
+                )
+                .child(icon(&glyphs::SEARCH, 15.0).color(MUTED)),
+        );
+    }
+    header.child(bar)
+}
+
+/// The search field with its back button. It fades in growing from the search button's corner
+/// as its slot opens, and fades out as the slot closes.
+fn search_field(s: &State) -> El {
+    let back = el()
+        .key("close-search")
+        .size(34.0, 34.0)
+        .center()
+        .radius(10.0)
+        .role("button")
+        .label(super::locale::tr("Close search"))
+        .help(super::locale::tr("Close search"))
+        .hover(Color::WHITE.alpha(0.06))
+        .cursor(rune::Cursor::Pointer)
+        .on_press(|s: &mut State| s.close_search())
+        .child(icon(&BACK, 18.0).color(MUTED));
+    row()
+        .key("search-field")
+        .w_full()
+        .gap(4.0)
+        .center_y()
+        .transition(rune::Transition::scale_anchor(
+            0.94,
+            rune::Vec2::new(1.0, 1.0),
+        ))
+        .child(back)
+        .child(search_input(s).grow(1.0).min_w(0.0))
+}
+
+/// A header button beside the logo; a selected screen is tinted.
+fn header_button(
     key: &str,
     glyph: &'static Icon,
     name: &str,
     selected: bool,
-    waiting: bool,
-    labeled: bool,
+    action: impl Fn(&mut State) + 'static,
 ) -> El {
-    let mut glyph = el()
-        .size(19.0, 19.0)
-        .child(icon(glyph, 19.0).color(if selected { MINT } else { MUTED }));
-    if waiting && !selected {
-        glyph = glyph.child(
-            el().key("rail-unread")
-                .absolute(15.0, -2.0)
-                .size(7.0, 7.0)
-                .radius(3.5)
-                .fill(MINT),
-        );
-    }
-    let name = super::locale::tr(name);
-    let mark = el().size(30.0, 26.0).center().child(glyph);
-    // The selected screen fills its whole tile, icon and label; the tile takes the
-    // pointer and the press.
-    let item = col()
-        .key(format!("rail-{key}"))
-        .gap(2.0)
-        .py(6.0)
-        .items_center()
-        .radius(12.0)
+    el().key(format!("header-{key}"))
+        .size(34.0, 34.0)
+        .center()
+        .radius(11.0)
         .fill(if selected {
-            MINT.alpha(0.13)
+            MINT.alpha(0.15)
         } else {
-            Color::TRANSPARENT
+            Color::WHITE.alpha(0.035)
         })
+        .border(
+            1.0,
+            if selected {
+                MINT.alpha(0.35)
+            } else {
+                CONTROL_BORDER
+            },
+        )
         .hover(if selected {
-            MINT.alpha(0.17)
+            MINT.alpha(0.19)
         } else {
-            Color::WHITE.alpha(0.045)
+            Color::WHITE.alpha(0.06)
         })
-        .motion(rune::tok::motion::GLIDE)
+        .motion(rune::tok::motion::SNAPPY)
         .cursor(rune::Cursor::Pointer)
-        .role("tab")
-        .label(name.clone())
-        .child(mark);
-    if labeled {
-        // No truncation or wrapping: the rail widens to its longest label.
-        item.w_full()
-            .px(8.0)
-            .child(label(name, 10.5, if selected { INK } else { MUTED }))
-    } else {
-        item.w(48.0).help(name)
-    }
+        .role("button")
+        .label(super::locale::tr(name))
+        .help(super::locale::tr(name))
+        .on_press(action)
+        .child(icon(glyph, 18.0).color(if selected { MINT } else { MUTED }))
 }
 
-fn navigation(s: &State, screen: Screen, labeled: bool) -> El {
-    let (glyph, _) = screen.label();
-    let selected = !s.preferences.open && Screen::current(s) == screen;
-    rail_item(
-        screen.short(),
-        glyph,
-        screen.short(),
-        selected,
-        screen.waiting(s),
-        labeled,
-    )
-    .on_press(move |s: &mut State| {
-        s.close_story();
-        s.preferences.open = false;
-        s.attachments_open = false;
-        match screen {
-            Screen::Chats(kind) => {
-                s.section = Section::Messages;
-                if s.chat_kind != kind {
-                    s.chat_kind = kind;
-                    s.show_archived = false;
-                }
-            }
-            Screen::Calls => s.section = Section::Calls,
-            Screen::Status => {
-                s.section = Section::Status;
-                s.request_status_avatars();
-            }
-        }
-    })
-}
-
-/// Every screen, always shown, then the update prompt and Settings at the bottom.
-fn rail(s: &State, labeled: bool) -> El {
-    let column = |key: &str| {
-        let column = col().key(key).w_full().gap(4.0);
-        if labeled {
-            column.items_stretch()
-        } else {
-            column.items_center()
-        }
-    };
-    // The screens scroll on short windows; the update action and Settings stay
-    // pinned at the bottom.
-    let mut screens = column("rail-screens");
-    for (i, screen) in Screen::EVERY.into_iter().enumerate() {
-        if i == 5 {
-            screens = screens.child(el().w(24.0).h(1.0).my(4.0).self_center().fill(BORDER));
-        }
-        screens = screens.child(navigation(s, screen, labeled));
+/// Calls, Status, the update action and Settings, beside the logo.
+fn header_actions(s: &State) -> El {
+    let mut actions = row().gap(6.0).center_y();
+    for screen in [Screen::Calls, Screen::Status] {
+        let (glyph, name) = screen.label();
+        let selected = !s.preferences.open && Screen::current(s) == screen;
+        actions = actions.child(header_button(
+            screen.short(),
+            glyph,
+            name,
+            selected,
+            move |s| show(s, screen),
+        ));
     }
-    let mut bottom = column("rail-bottom").pt(6.0);
-    if let Some(update) = super::updates::prompt(s, labeled) {
-        bottom = bottom.child(update);
+    if let Some(update) = super::updates::prompt(s) {
+        actions = actions.child(update);
     }
-    bottom = bottom.child(
-        rail_item(
-            "settings",
-            &super::preferences::SETTINGS,
-            "Settings",
-            s.preferences.open,
-            false,
-            labeled,
-        )
-        .on_press(|s: &mut State| s.open_preferences()),
-    );
-    let rail = col()
-        .key("sidebar-rail")
-        .h_full()
-        .pt(10.0)
-        .pb(14.0)
-        .child(
-            col()
-                .key("rail-scroll")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .scroll(ScrollSpec {
-                    stick_bottom: false,
-                })
-                .scroll_edge_fade(10.0)
-                .child(screens),
-        )
-        .child(bottom);
-    if labeled { rail.px(8.0) } else { rail.w(56.0) }
-}
-
-fn compact(s: &State) -> El {
-    col()
-        .w_full()
-        .h_full()
-        .pt(10.0)
-        .items_center()
-        .child(sidebar_toggle(false))
-        .child(rail(s, false).grow(1.0).min_h(0.0))
+    actions.child(header_button(
+        "settings",
+        &super::preferences::SETTINGS,
+        "Settings",
+        s.preferences.open,
+        |s| s.open_preferences(),
+    ))
 }
 
 fn search_input(s: &State) -> El {
@@ -390,6 +531,10 @@ fn search_input(s: &State) -> El {
         .height(super::locale::scale(38.0))
         .on_edit(|s: &mut State| &mut s.search.edit)
         .on_key(|s: &mut State, event, _| {
+            if event.key == rune::Key::Escape && s.search.open {
+                s.close_search();
+                return true;
+            }
             // Enter opens a typed number when no existing chat already matches it.
             if event.key == rune::Key::Enter
                 && let Some(target) = super::search::phone_target(s)
@@ -424,22 +569,32 @@ fn search_input(s: &State) -> El {
         .press(Color::TRANSPARENT)
 }
 
-fn expanded(s: &State) -> El {
-    row()
+fn list_pane(s: &State) -> El {
+    let searching = s.searching_chats();
+    // The body slides down as the header grows, while what it holds lands at once.
+    let body = col()
+        .key("list-body")
         .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(list_body(s, searching).instant_changes());
+    col()
         .h_full()
-        .child(rail(s, true))
-        .child(el().w(1.0).h_full().my(14.0).fill(BORDER))
-        .child(list_pane(s).grow(1.0).min_w(0.0))
+        .padding(14.0)
+        .pt(14.0)
+        .gap(12.0)
+        .child(list_header(s, searching))
+        .child(body)
 }
 
-fn list_pane(s: &State) -> El {
-    let mut panel = col().h_full().padding(14.0).pt(14.0).gap(14.0);
+/// The chats, stories, calls or search results under the header.
+fn list_body(s: &State, searching: bool) -> El {
+    let mut panel = col().w_full().h_full().gap(12.0);
     if s.section == Section::Status {
         return panel.child(super::stories::list(s));
     }
-    panel = panel.child(search_input(s));
     if s.section == Section::Calls {
+        panel = panel.child(search_input(s));
         return panel.child(
             col().gap(10.0).padding(10.0).child(
                 label(
@@ -451,15 +606,26 @@ fn list_pane(s: &State) -> El {
             ),
         );
     }
-    if s.search.edit.text.trim().is_empty() {
-        if let Some(entry) = archive_entry(s) {
-            panel = panel.child(entry);
+    if searching {
+        if s.search.edit.text.trim().is_empty() {
+            return panel.child(
+                label(
+                    super::locale::tr(
+                        "Search chats, groups, communities, channels, lists and messages.",
+                    ),
+                    12.0,
+                    MUTED,
+                )
+                .padding(10.0)
+                .wrap(),
+            );
         }
-    }
-    let count = s.visible_chats().len();
-    if !s.search.edit.text.trim().is_empty() {
         return panel.child(search_results(s));
     }
+    if let Some(entry) = archive_entry(s) {
+        panel = panel.child(entry);
+    }
+    let count = s.visible_chats().len();
     if count == 0 {
         return panel.child(
             label(
@@ -467,7 +633,7 @@ fn list_pane(s: &State) -> El {
                     "Your chats are syncing from WhatsApp."
                 } else {
                     match s.chat_kind {
-                        ChatKind::Chats => "No chats here yet.",
+                        ChatKind::All | ChatKind::Chats => "No chats here yet.",
                         ChatKind::Groups => "No groups yet.",
                         ChatKind::Communities => "No communities yet.",
                         ChatKind::Channels => "No channels yet.",
@@ -693,9 +859,23 @@ fn search_results(s: &State) -> El {
         }
     }
     let empty = rows.is_empty() && chats.is_empty() && s.search.results.messages.is_empty();
-    if !chats.is_empty() {
-        rows.push(SearchRow::Heading(Screen::current(s).label().1));
-        rows.extend(chats.into_iter().cloned().map(SearchRow::Chat));
+    // Chats whose names match come first, under their kind, then the messages.
+    for screen in Screen::EVERY {
+        let Screen::Chats(kind) = screen else {
+            continue;
+        };
+        if kind == ChatKind::All {
+            continue;
+        }
+        let group: Vec<_> = chats
+            .iter()
+            .filter(|chat| ChatKind::of(chat) == kind)
+            .map(|chat| SearchRow::Chat((*chat).clone()))
+            .collect();
+        if !group.is_empty() {
+            rows.push(SearchRow::Heading(screen.label().1));
+            rows.extend(group);
+        }
     }
     if !s.search.results.messages.is_empty() {
         rows.push(SearchRow::Heading("Messages"));

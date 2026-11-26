@@ -367,31 +367,34 @@ pub fn project(view: &mut Message, message: &wa::Message) {
         }
         if let (Some(id), Some(quoted)) = (&context.stanza_id, context.quoted_message.as_option()) {
             let quoted = quoted.get_base_message();
-            let text = quoted
-                .text_content()
-                .or_else(|| quoted.get_caption())
-                .unwrap_or_else(|| {
-                    if quoted.image_message.is_set() {
-                        "Photo"
-                    } else if quoted.video_message.is_set() {
-                        "Video"
-                    } else if quoted.sticker_message.is_set() {
-                        "Sticker"
-                    } else if quoted.audio_message.is_set() {
-                        "Voice message"
-                    } else if quoted.document_message.is_set() {
-                        "Document"
-                    } else {
-                        "Message"
-                    }
-                });
-            view.quote = Some(crate::model::Quote {
+            let kind = if quoted.image_message.is_set() {
+                "image"
+            } else if quoted.video_message.is_set() {
+                "video"
+            } else if quoted.sticker_message.is_set() {
+                "sticker"
+            } else if quoted.audio_message.is_set() {
+                "audio"
+            } else if quoted.document_message.is_set() {
+                "file"
+            } else {
+                ""
+            };
+            let mut quote = crate::model::Quote {
                 chat: context.remote_jid.clone(),
                 id: id.clone(),
                 sender: context.participant.clone().unwrap_or_default(),
-                text: text.chars().take(280).collect(),
+                kind: kind.into(),
                 ..Default::default()
-            });
+            };
+            // A photo sent without a caption has an empty one, not none.
+            let text = quoted
+                .text_content()
+                .or_else(|| quoted.get_caption())
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or_else(|| quote.fallback());
+            quote.text = text.chars().take(280).collect();
+            view.quote = Some(quote);
         }
     }
     if let Some(reaction) = base.reaction_message.as_option() {
@@ -490,15 +493,42 @@ pub fn project(view: &mut Message, message: &wa::Message) {
         view.text = t.title.clone().unwrap_or_default();
     } else if let Some(t) = base.contact_message.as_option() {
         view.kind = "contact".into();
-        view.text = t.display_name.clone().unwrap_or_else(|| "Contact".into());
+        let card = shared_contact(t);
+        view.text = card.name.clone();
+        view.contacts = vec![card];
     } else if let Some(t) = base.contacts_array_message.as_option() {
         view.kind = "contact".into();
-        view.text = t
+        view.contacts = t.contacts.iter().map(shared_contact).collect();
+        view.text = view
             .contacts
             .iter()
-            .filter_map(|c| c.display_name.as_deref())
+            .map(|c| c.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
+    } else if let Some(t) = base.pin_in_chat_message.as_option() {
+        // "Pinned a message": a note in the conversation that leads to the pinned one.
+        view.kind = "pin".into();
+        let unpin = t.r#type == Some(wa::message::pin_in_chat_message::Type::UNPIN_FOR_ALL);
+        view.text = if unpin {
+            "Unpinned a message"
+        } else {
+            "Pinned a message"
+        }
+        .into();
+        if let Some(key) = t.key.as_option() {
+            // The key is the pinner's view: "from me" is the pinner's own message.
+            let sender = if key.from_me.unwrap_or(false) {
+                view.sender.clone()
+            } else {
+                key.participant.clone().unwrap_or_else(|| view.chat.clone())
+            };
+            view.quote = Some(crate::model::Quote {
+                chat: key.remote_jid.clone(),
+                id: key.id.clone().unwrap_or_default(),
+                sender,
+                ..Default::default()
+            });
+        }
     } else if let Some(t) = base.location_message.as_option() {
         view.kind = "location".into();
         view.text = t
@@ -555,6 +585,70 @@ pub fn project(view: &mut Message, message: &wa::Message) {
         view.kind = "unsupported".into();
         view.text = "This message type is not supported yet.".into();
     }
+}
+
+/// A shared contact card: its name, business name and numbers from the vCard.
+fn shared_contact(message: &wa::message::ContactMessage) -> crate::model::SharedContact {
+    let mut card = crate::model::SharedContact::default();
+    let vcard = message.vcard.as_deref().unwrap_or_default();
+    // Folded lines continue with a space or tab.
+    let mut lines: Vec<String> = Vec::new();
+    for line in vcard.lines() {
+        match (line.strip_prefix([' ', '\t']), lines.last_mut()) {
+            (Some(rest), Some(last)) => last.push_str(rest),
+            _ => lines.push(line.trim_end_matches('\r').to_owned()),
+        }
+    }
+    let mut full_name = String::new();
+    for line in &lines {
+        let Some((property, value)) = line.split_once(':') else {
+            continue;
+        };
+        let mut params = property.split(';');
+        // Apple's "item1.TEL" groups a property with its label.
+        let name = params.next().unwrap_or_default();
+        let name = name.rsplit('.').next().unwrap_or(name).to_ascii_uppercase();
+        let value = value
+            .replace("\\n", " ")
+            .replace("\\,", ",")
+            .replace("\\;", ";")
+            .trim()
+            .to_owned();
+        match name.as_str() {
+            "FN" => full_name = value,
+            "X-WA-BIZ-NAME" => card.business = value,
+            "TEL" => {
+                let waid = params
+                    .filter_map(|p| p.split_once('='))
+                    .find(|(key, _)| key.eq_ignore_ascii_case("waid"))
+                    .map(|(_, id)| id.trim().to_owned())
+                    .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+                    .unwrap_or_default();
+                if !value.is_empty() || !waid.is_empty() {
+                    card.phones.push(crate::model::SharedPhone {
+                        number: if value.is_empty() {
+                            format!("+{waid}")
+                        } else {
+                            value
+                        },
+                        waid,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    card.name = message
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .or_else(|| (!full_name.is_empty()).then_some(full_name))
+        .or_else(|| (!card.business.is_empty()).then(|| card.business.clone()))
+        .or_else(|| card.phones.first().map(|phone| phone.number.clone()))
+        .unwrap_or_else(|| "Contact".into());
+    card
 }
 
 /// The error for any attempt to open, save or forward view-once media.

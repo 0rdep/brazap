@@ -7,6 +7,13 @@ use anyhow::{Context, Result};
 static ALLOCATOR: procwatch::alloc::Counting = procwatch::alloc::Counting::system();
 
 fn main() {
+    // Rune can paint a window's first frame on the CPU before its GPU is ready. On
+    // Windows that frame briefly misses glyphs when the window reopens from the tray;
+    // the GPU path is ready a moment later with complete text. Explicit values win.
+    if std::env::var_os("RUNE_CPU_FIRST").is_none() {
+        // SAFETY: the first statement of main, before any other thread exists.
+        unsafe { std::env::set_var("RUNE_CPU_FIRST", "0") };
+    }
     procwatch::alloc::tag_thread("main/UI");
     if let Err(error) = run() {
         eprintln!("Brazap: {error:#}");

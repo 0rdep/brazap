@@ -50,6 +50,8 @@ pub struct Service {
     pub(crate) history_lock: Mutex<()>,
     pub(crate) desktop: Mutex<crate::notifications::Desktop>,
     media_jobs: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Groups whose name was looked up this session, so each is asked for once.
+    group_names: std::sync::Mutex<std::collections::HashSet<String>>,
     /// The region of the account's own number, once known.
     pub(crate) region: std::sync::Mutex<Option<String>>,
     pub(crate) transcriber: Arc<crate::transcription::Transcriber>,
@@ -133,6 +135,7 @@ impl Service {
             history_lock: Mutex::new(()),
             desktop: Mutex::new(crate::notifications::Desktop::default()),
             media_jobs: std::sync::Mutex::new(std::collections::HashSet::new()),
+            group_names: std::sync::Mutex::new(std::collections::HashSet::new()),
             region: std::sync::Mutex::new(None),
             transcriber: Default::default(),
         }))
@@ -356,7 +359,7 @@ impl Service {
         }
     }
 
-    async fn refresh_chat_names(&self) -> Result<()> {
+    async fn refresh_chat_names(self: &Arc<Self>) -> Result<()> {
         let chats = self.archive.chats().await?;
         let missing: std::collections::HashSet<_> = chats
             .iter()
@@ -394,6 +397,13 @@ impl Service {
                             .await?;
                     }
                     hierarchy.push((jid, kind, parent, subject));
+                }
+                // Groups the overview leaves out (joined since, or answered late) are
+                // asked for one by one.
+                for jid in &missing {
+                    if !hierarchy.iter().any(|(listed, ..)| listed == jid) {
+                        self.name_group(jid);
+                    }
                 }
                 self.archive.set_group_hierarchy(hierarchy).await?;
             }
@@ -811,6 +821,7 @@ impl Service {
                 let mut viewed = std::collections::HashSet::new();
                 for inbound in batch.messages.iter() {
                     let chat = conversation(&inbound.info.source).0;
+                    self.name_group(&chat);
                     if !inbound.info.source.is_from_me
                         && viewed.insert(chat.clone())
                         && self.desktop_viewing(&chat).await
@@ -1090,6 +1101,8 @@ impl Service {
                     .await?;
             }
             Event::GroupUpdate(event) => {
+                // Added to a group, or one created: its messages may come before any name.
+                self.name_group(&event.group_jid.to_string());
                 if let whatsapp_rust::wacore::stanza::groups::GroupNotificationAction::Subject {
                     subject,
                     ..
@@ -1550,11 +1563,22 @@ impl Service {
         message: wa::Message,
         media: Option<Vec<u8>>,
     ) -> Result<Message> {
+        let staged = self.stage_outgoing(&client, &jid, &message, media).await?;
+        self.send_staged(client, staged, message).await
+    }
+
+    /// Shows a message as sending in its chat before its media is uploaded and it is sent.
+    pub(crate) async fn stage_outgoing(
+        &self,
+        client: &Client,
+        jid: &whatsapp_rust::Jid,
+        message: &wa::Message,
+        media: Option<Vec<u8>>,
+    ) -> Result<Message> {
         self.archive.allow_chat(&jid.to_string()).await?;
         let chat = self.archive.canonical_chat(&jid.to_string()).await?;
-        let jid: whatsapp_rust::Jid = chat.parse()?;
         let id = client.generate_message_id();
-        let mut row = outgoing(chat.clone(), id.to_string(), &message);
+        let mut row = outgoing(chat, id.to_string(), message);
         row.view.status = "sending".into();
         let mut view = row.view.clone();
         self.archive.store_messages(vec![row], true).await?;
@@ -1563,8 +1587,42 @@ impl Service {
             view.has_media = true;
         }
         self.changed();
-        let request = whatsapp_rust::SendRequest::new(&jid, message)
-            .with_options(whatsapp_rust::SendOptions::default().with_message_id(id.clone()));
+        Ok(view)
+    }
+
+    /// Marks a staged message failed when it could not be prepared for sending.
+    pub(crate) async fn fail_staged(&self, staged: &Message) -> Result<()> {
+        self.archive
+            .receipt(
+                staged.chat.clone(),
+                vec![staged.id.clone()],
+                "failed".into(),
+            )
+            .await?;
+        self.changed();
+        Ok(())
+    }
+
+    /// Sends a staged message as `message`, which replaces the protobuf it was staged with
+    /// (an upload adds its media location); it keeps its identity and time.
+    pub(crate) async fn send_staged(
+        &self,
+        client: Arc<Client>,
+        staged: Message,
+        message: wa::Message,
+    ) -> Result<Message> {
+        let (chat, id) = (staged.chat.clone(), staged.id.clone());
+        let jid: whatsapp_rust::Jid = chat.parse()?;
+        let mut row = outgoing(chat.clone(), id.clone(), &message);
+        row.view.timestamp = staged.timestamp;
+        row.view.status = staged.status.clone();
+        row.view.has_media = staged.has_media;
+        self.archive.replace_staged(&row).await?;
+        let mut view = row.view;
+        let request = whatsapp_rust::SendRequest::new(&jid, message).with_options(
+            whatsapp_rust::SendOptions::default()
+                .with_message_id(whatsapp_rust::MessageId::new(id.clone())?),
+        );
         match client.send(request).await {
             Ok(_) => {
                 self.archive
@@ -1582,6 +1640,57 @@ impl Service {
                 Err(error.into())
             }
         }
+    }
+
+    /// Looks up a group's name from WhatsApp when the archive has none, once per session.
+    /// A group joined after the connection's overview otherwise stays "Unnamed group".
+    fn name_group(self: &Arc<Self>, chat: &str) {
+        if !chat.ends_with("@g.us")
+            || self.config.demo
+            || !self
+                .group_names
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(chat.to_owned())
+        {
+            return;
+        }
+        let service = self.clone();
+        let chat = chat.to_owned();
+        tokio::spawn(async move {
+            let result = async {
+                if service.archive.chat_named(chat.clone()).await?
+                    || service.archive.allow_chat(&chat).await.is_err()
+                {
+                    return Ok(());
+                }
+                let client = service.connected().await?;
+                let group = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    client.groups().fetch_metadata(&chat.parse()?),
+                )
+                .await??;
+                let subject = group.subject.unwrap_or_default().trim().to_owned();
+                if !subject.is_empty() {
+                    service
+                        .archive
+                        .name_unnamed_chat(vec![chat.clone()], subject)
+                        .await?;
+                    service.changed();
+                }
+                anyhow::Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                log::debug!("Group name lookup: {error:#}");
+                // A later message asks again.
+                service
+                    .group_names
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&chat);
+            }
+        });
     }
 
     fn queue_media(self: &Arc<Self>, message: Message, proto: wa::Message) {

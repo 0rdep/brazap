@@ -404,6 +404,29 @@ impl Archive {
         Ok(())
     }
 
+    /// Whether the chat has a name of its own (not a placeholder or its address).
+    pub async fn chat_named(&self, jid: String) -> Result<bool> {
+        #[derive(QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = Text)]
+            name: String,
+        }
+        let account = self.account as i64;
+        let key = jid.clone();
+        let row: Option<Row> = self
+            .sql()
+            .read(move |conn| {
+                diesel::sql_query("SELECT name FROM brazap_chats WHERE account=? AND jid=?")
+                    .bind::<BigInt, _>(account)
+                    .bind::<Text, _>(key)
+                    .get_result(conn)
+                    .optional()
+                    .map_err(db_error)
+            })
+            .await?;
+        Ok(row.is_some_and(|row| meaningful_name(&jid, &row.name)))
+    }
+
     /// Names an unnamed chat's existing rows (any of its addresses) without creating one.
     pub async fn name_unnamed_chat(&self, aliases: Vec<String>, name: String) -> Result<()> {
         let account = self.account as i64;
@@ -724,6 +747,35 @@ pub fn project_message(
         encoded: message.encode_to_vec(),
         name,
         metadata,
+    }
+}
+
+impl Archive {
+    /// Replaces a staged outgoing message's protobuf and payload with the one it is sent as.
+    pub(crate) async fn replace_staged(&self, row: &StoredMessage) -> Result<()> {
+        let account = self.account as i64;
+        let payload = message_payload(&row.view)?;
+        let (chat, sender, id, encoded) = (
+            row.view.chat.clone(),
+            row.view.sender.clone(),
+            row.view.id.clone(),
+            row.encoded.clone(),
+        );
+        self.sql()
+            .run(move |conn| {
+                diesel::sql_query("UPDATE brazap_messages SET payload=?, encoded=? WHERE account=? AND chat=? AND sender=? AND id=? AND status='sending'")
+                    .bind::<Text, _>(payload)
+                    .bind::<Binary, _>(encoded)
+                    .bind::<BigInt, _>(account)
+                    .bind::<Text, _>(chat)
+                    .bind::<Text, _>(sender)
+                    .bind::<Text, _>(id)
+                    .execute(conn)
+                    .map_err(db_error)?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
     }
 }
 
