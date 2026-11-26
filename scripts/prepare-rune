@@ -22,10 +22,11 @@ done < <(grep -E '^(rune|rune-kit|procwatch) = ' "$project_root/Cargo.toml")
 
 # Cargo does not inherit Rune's [patch.crates-io]; .cargo/config.toml repeats it.
 check_crates_io_patches() {
-    local table='/^\[patch\.crates-io\]/,/^\[/{/^[A-Za-z0-9_-]+ = /p}'
+    # awk, not a sed block: macOS's BSD sed rejects GNU's `{.../p}` form.
+    local table='/^\[patch\.crates-io\]/ {on=1; next} /^\[/ {on=0} on && /^[A-Za-z0-9_-]+ = / {print $1}'
     local upstream local_table
-    upstream="$(sed -nE "$table" "$source_dir/Cargo.toml" | cut -d' ' -f1 | sort)"
-    local_table="$(sed -nE "$table" "$project_root/.cargo/config.toml" | cut -d' ' -f1 | sort)"
+    upstream="$(awk "$table" "$source_dir/Cargo.toml" | sort)"
+    local_table="$(awk "$table" "$project_root/.cargo/config.toml" | sort)"
     if [[ "$upstream" != "$local_table" ]]; then
         echo "Update [patch.crates-io] in .cargo/config.toml to match Rune's root Cargo.toml:" >&2
         echo "$upstream" >&2
