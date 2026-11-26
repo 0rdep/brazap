@@ -14,6 +14,13 @@ fn main() {
         // SAFETY: the first statement of main, before any other thread exists.
         unsafe { std::env::set_var("RUNE_CPU_FIRST", "0") };
     }
+    // Rune reports UI commits slower than this on stderr, which Windows
+    // builds forward to brazap.log (`logging::capture_stderr`): what a slow
+    // machine spent its time on (view, layout, text) and what caused it.
+    if std::env::var_os("RUNE_COMMIT_BUDGET_MS").is_none() {
+        // SAFETY: still before any other thread exists.
+        unsafe { std::env::set_var("RUNE_COMMIT_BUDGET_MS", "50") };
+    }
     procwatch::alloc::tag_thread("main/UI");
     if let Err(error) = run() {
         eprintln!("Brazap: {error:#}");
@@ -188,6 +195,8 @@ fn run() -> Result<()> {
         // Wayland matches windows to packaging/linux/brazap.desktop by this ID.
         #[cfg(target_os = "linux")]
         rune::set_app_id("brazap");
+        #[cfg(target_os = "windows")]
+        brazap::logging::capture_stderr();
         brazap::ui::run(config, initial_chat)
     }
     #[cfg(not(feature = "desktop"))]

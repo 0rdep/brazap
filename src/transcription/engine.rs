@@ -225,11 +225,18 @@ fn pieces(samples: &[f32], max: usize) -> Vec<&[f32]> {
 /// cores, 16 threads), Whisper large-v3 turbo took 13.7 s for 45 s of audio
 /// with 4 threads and 10.4 s with 6 or 8; 12 threads reached 8.3 s, but only
 /// by also taking the hyper-threads the window and the rest of the system use
-/// while a message is transcribed in the background. 4-core CPUs get 2 to 4.
+/// while a message is transcribed in the background. Machines with at most 4
+/// logical processors (a 2-core laptop) get one, so the window keeps a core.
 pub(super) fn threads() -> i32 {
     std::thread::available_parallelism()
-        .map(|n| (n.get() / 2).clamp(1, 8))
-        .unwrap_or(2) as i32
+        .map(|n| {
+            if n.get() <= 4 {
+                1
+            } else {
+                (n.get() / 2).clamp(1, 8)
+            }
+        })
+        .unwrap_or(1) as i32
 }
 
 /// A model file transcribe.cpp could not read, which downloads again; other

@@ -44,15 +44,16 @@ pub(super) fn sync_art(s: &mut State) -> bool {
         return false;
     };
     for bytes in [
-        include_bytes!("../../assets/startup/paper-plane.png").as_slice(),
-        include_bytes!("../../assets/startup/envelope.png").as_slice(),
-        include_bytes!("../../assets/startup/chat-bubble.png").as_slice(),
-        include_bytes!("../../assets/startup/phone.png").as_slice(),
-        include_bytes!("../../assets/startup/voice-note.png").as_slice(),
-        include_bytes!("../../assets/startup/photo.png").as_slice(),
+        include_bytes!(concat!(env!("OUT_DIR"), "/startup-paper-plane.png")).as_slice(),
+        include_bytes!(concat!(env!("OUT_DIR"), "/startup-envelope.png")).as_slice(),
+        include_bytes!(concat!(env!("OUT_DIR"), "/startup-chat-bubble.png")).as_slice(),
+        include_bytes!(concat!(env!("OUT_DIR"), "/startup-phone.png")).as_slice(),
+        include_bytes!(concat!(env!("OUT_DIR"), "/startup-voice-note.png")).as_slice(),
+        include_bytes!(concat!(env!("OUT_DIR"), "/startup-photo.png")).as_slice(),
     ] {
         if let Ok(image) = image::load_from_memory(bytes) {
-            let pixels = image.thumbnail(192, 192).into_rgba8();
+            // build.rs already reduced it to 192 pixels.
+            let pixels = image.into_rgba8();
             s.startup_art
                 .push(cache.rgba(pixels.width(), pixels.height(), pixels.into_raw()));
         }

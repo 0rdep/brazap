@@ -10,5 +10,8 @@ CREATE TABLE IF NOT EXISTS brazap_identity_links (
 INSERT INTO brazap_identity_links(account,lid,phone_number,updated_at)
 SELECT device_id,lid,phone_number,updated_at FROM lid_pn_mapping WHERE true
 ON CONFLICT(account,lid) DO UPDATE SET phone_number=excluded.phone_number,updated_at=excluded.updated_at
-WHERE excluded.updated_at>=brazap_identity_links.updated_at;
+-- Runs on every open: skip rows that would be rewritten unchanged.
+WHERE excluded.updated_at>brazap_identity_links.updated_at
+   OR (excluded.updated_at=brazap_identity_links.updated_at
+       AND excluded.phone_number IS NOT brazap_identity_links.phone_number);
 INSERT OR IGNORE INTO brazap_schema(version) VALUES(12);

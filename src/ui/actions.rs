@@ -674,8 +674,7 @@ pub(super) fn forward_picker(s: &State) -> Option<El> {
             .h_full()
             .padding(28.0)
             .center()
-            .fill(Color::BLACK.alpha(0.72))
-            .backdrop_blur(18.0)
+            .fill(Color::BLACK.alpha(0.78))
             .role("dialog")
             .label(super::locale::tr("Choose a chat to forward to"))
             .child(glass(content)),

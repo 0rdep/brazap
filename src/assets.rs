@@ -724,7 +724,11 @@ impl Service {
                 self.0.store(false, Ordering::Relaxed);
             }
         }
-        if self.avatar_warming.swap(true, Ordering::Relaxed) {
+        // The target query groups every archived group message by sender. Once a
+        // pass has finished, later reconnects in this process skip it: rows on
+        // screen still request their avatars as they show.
+        static WARMED: AtomicBool = AtomicBool::new(false);
+        if WARMED.load(Ordering::Relaxed) || self.avatar_warming.swap(true, Ordering::Relaxed) {
             return Ok(());
         }
         let _guard = Guard(&self.avatar_warming);
@@ -735,7 +739,7 @@ impl Service {
         }).await?;
         for target in targets {
             if self.connected().await.is_err() {
-                break;
+                return Ok(());
             }
             let key = format!("avatar:{}", target.jid);
             if self
@@ -754,6 +758,7 @@ impl Service {
                 .await;
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
+        WARMED.store(true, Ordering::Relaxed);
         Ok(())
     }
 }

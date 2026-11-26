@@ -9,7 +9,10 @@ use diesel::{
     prelude::*,
     sql_types::{BigInt, Text},
 };
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 #[derive(Default)]
 pub(crate) struct Identities {
@@ -339,8 +342,36 @@ impl Identities {
     }
 }
 
+tokio::task_local! {
+    /// One identity view shared by everything a scoped task reads (see
+    /// [`Archive::with_identities`]), instead of six full-table loads apiece.
+    static SHARED: Arc<Identities>;
+}
+
 impl Archive {
-    pub(crate) async fn identities(&self) -> Result<Identities> {
+    /// Runs `work` with one freshly loaded identity view: every
+    /// [`Archive::identities`] call inside returns it. For read-only
+    /// projections such as the sidebar snapshot, which would otherwise rebuild
+    /// it for the chat list, the page, statuses and calls separately.
+    pub(crate) async fn with_identities<T>(
+        &self,
+        work: impl std::future::Future<Output = T>,
+    ) -> Result<T> {
+        if SHARED.try_with(|_| ()).is_ok() {
+            return Ok(work.await);
+        }
+        let identities = Arc::new(self.load_identities().await?);
+        Ok(SHARED.scope(identities, work).await)
+    }
+
+    pub(crate) async fn identities(&self) -> Result<Arc<Identities>> {
+        if let Ok(shared) = SHARED.try_with(Arc::clone) {
+            return Ok(shared);
+        }
+        Ok(Arc::new(self.load_identities().await?))
+    }
+
+    async fn load_identities(&self) -> Result<Identities> {
         let account = self.account as i64;
         let (rows,sources,saved,locks,names,lists)=self.sql().read(move|conn| {
             let rows=diesel::sql_query("SELECT lid,phone_number FROM (SELECT lid,phone_number,updated_at FROM lid_pn_mapping WHERE device_id=? UNION ALL SELECT lid,phone_number,updated_at FROM brazap_identity_links WHERE account=?) ORDER BY updated_at DESC,lid")

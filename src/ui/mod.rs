@@ -115,6 +115,8 @@ enum Command {
     Select(String, u64),
     Viewing(Option<String>),
     Focused(bool),
+    /// Whether the window is on screen; hidden windows refresh less often.
+    Visible(bool),
     Tool(&'static str, Value),
     Send(Message, Option<MessageCursor>),
     /// Edit one of your messages: the message as shown before and its new text.
@@ -299,6 +301,8 @@ pub(super) struct State {
     busy: bool,
     authenticated: bool,
     focused: bool,
+    /// The window is on screen (not minimized, hidden in the tray or covered).
+    window_visible: bool,
     viewing_sent: Option<String>,
     second: i64,
     next_tick: Option<f64>,
@@ -462,6 +466,7 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         busy: false,
         authenticated: false,
         focused: true,
+        window_visible: true,
         viewing_sent: None,
         second: crate::model::now(),
         next_tick: None,
@@ -553,13 +558,11 @@ fn unreachable_state() -> State {
 fn setup(state: &mut State, wake: Waker) {
     let cache = ImageCache::new(wake.clone());
     // The logo is displayed at 40 points; retaining its 1536-pixel source costs ~8 MiB.
-    state.logo = image::load_from_memory(include_bytes!("../../assets/logo.png"))
+    state.logo = image::load_from_memory(include_bytes!(concat!(env!("OUT_DIR"), "/logo-192.png")))
         .ok()
         .map(|image| {
-            let pixels = image
-                .crop_imm(318, 64, 894, 894)
-                .thumbnail(192, 192)
-                .into_rgba8();
+            // build.rs crops the square mark and reduces it to 192 pixels.
+            let pixels = image.into_rgba8();
             cache.rgba(pixels.width(), pixels.height(), pixels.into_raw())
         });
     state.image_cache = Some(cache);
@@ -657,6 +660,8 @@ async fn worker(
     let mut selected = None;
     let mut viewing = None;
     let mut focused = true;
+    let mut visible = true;
+    let mut hidden_ticks = 0u32;
     let attachment_slots = Arc::new(tokio::sync::Semaphore::new(1));
     let avatar_slots = Arc::new(tokio::sync::Semaphore::new(2));
     let media_slots = Arc::new(tokio::sync::Semaphore::new(4));
@@ -935,6 +940,7 @@ async fn worker(
                     }
                     Some(Command::Viewing(chat))=>{viewing=chat;}
                     Some(Command::Focused(now))=>{focused=now;interval.reset_immediately();}
+                    Some(Command::Visible(now))=>{visible=now;hidden_ticks=0;if now {interval.reset_immediately();} continue;}
                     Some(Command::Select(chat,generation))=>{
                         selected=Some(chat.clone());
                         snapshot_retry_at=None;
@@ -1075,6 +1081,22 @@ async fn worker(
                 });
             },
             _=interval.tick()=>{
+                // Hidden in the tray or minimized: the heartbeat keeps its 700 ms
+                // pace (the service's activation lease is five seconds), while
+                // the full snapshot refreshes about every 3.5 seconds.
+                if !visible {
+                    hidden_ticks=hidden_ticks.wrapping_add(1);
+                    if hidden_ticks%5!=0 {
+                        let remote=remote.clone();let viewing=viewing.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            if let Ok(Ok(activation)) = tokio::time::timeout(Duration::from_secs(3), remote.request("brazap/desktop",json!({"pid":std::process::id(),"chat":viewing,"focused":focused}))).await
+                                && activation["activate"].as_bool() == Some(true) {
+                                emit(&events,&wake,Event::Activate(activation["chat"].as_str().map(str::to_owned)));
+                            }
+                        });
+                        continue;
+                    }
+                }
                 if snapshot_pending || snapshot_retry_at.is_some_and(|at| tokio::time::Instant::now() < at) { continue; }
                 snapshot_pending=true;
                 let generation=snapshot_generation;
@@ -1641,7 +1663,18 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
     changed |= startup::sync_art(state);
     state.update_viewing();
     changed |= state.update_picker_query(tx);
-    state.update_animations();
+    let visible = tx.window_visible();
+    if visible != state.window_visible {
+        state.window_visible = visible;
+        let _ = state.tx.send(Command::Visible(visible));
+    }
+    if visible {
+        state.update_animations();
+    } else {
+        // Minimized, covered or in the tray: stop decoding sticker frames no one
+        // sees. Each visibility change wakes this poll, which resumes them.
+        state.animations.activate(Vec::new());
+    }
     if state.diagnostics.open
         && !state.diagnostics.pending
         && elapsed >= state.diagnostics.next_sample
@@ -1887,7 +1920,23 @@ fn receive_snapshot(state: &mut State, mut snapshot: Snapshot, tx: &mut Tx) -> b
             }
         }
     }
-    if state.snapshot != snapshot {
+    // Every handled WhatsApp event (presence, receipts, typing) bumps the
+    // revision. When that is all that changed, skip the merge and the rebuild.
+    let revision = snapshot.revision;
+    snapshot.revision = state.snapshot.revision;
+    let shown_changed = state.snapshot != snapshot;
+    snapshot.revision = revision;
+    if !shown_changed {
+        if state.snapshot.revision != revision {
+            state.snapshot.revision = revision;
+            // The sticker catalog is not part of the snapshot; keep refreshing it.
+            if state.picker.open && !state.picker.loading {
+                state.load_picker_catalog(false);
+            }
+        }
+        return call_changed || recovered;
+    }
+    {
         let was_authenticated = state.authenticated;
         let initial_messages = state.timeline.is_empty() && !snapshot.messages.is_empty();
         if state.timeline.is_empty() {
@@ -1959,9 +2008,8 @@ fn receive_snapshot(state: &mut State, mut snapshot: Snapshot, tx: &mut Tx) -> b
             }
             tx.scroll_to_bottom_instant("messages");
         }
-        return true;
+        true
     }
-    call_changed || recovered
 }
 
 fn make_qr(payload: &str, cache: &ImageCache) -> Option<PairingQr> {

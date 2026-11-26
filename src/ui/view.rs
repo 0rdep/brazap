@@ -261,6 +261,9 @@ pub(super) fn title(value: impl Into<String>, size: f32) -> El {
         .font(super::locale::style(size, 620.0))
         .color(INK)
 }
+/// Blurs only the card. Full-window modal scrims are plain dark tint: Rune
+/// re-blurs a backdrop on every frame (nothing is cached) and a blur on screen
+/// turns off partial redraw, which integrated GPUs feel behind a moving video.
 pub(super) fn glass(body: El) -> El {
     panel(body.backdrop_blur(18.0))
 }

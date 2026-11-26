@@ -213,6 +213,11 @@ impl Archive {
                     .map_err(db_error)?;
                 conn.batch_execute(include_str!("../migrations/019_deleted_chats.sql"))
                     .map_err(db_error)?;
+                // Messages archived in the last two minutes must not notify again
+                // on a new launch. Account 1 (as below) keeps this an index range
+                // of `brazap_messages_search_order`, not a scan of every message.
+                conn.batch_execute("INSERT OR IGNORE INTO brazap_notification_deliveries(account,chat,sender,id) SELECT account,chat,sender,id FROM brazap_messages INDEXED BY brazap_messages_search_order WHERE account=1 AND timestamp>=CAST(strftime('%s','now') AS INTEGER)-120")
+                    .map_err(db_error)?;
                 conn.batch_execute(include_str!("../migrations/020_media_retention.sql"))
                     .map_err(db_error)?;
                 conn.batch_execute(include_str!("../migrations/021_transcripts.sql"))

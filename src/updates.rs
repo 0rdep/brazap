@@ -439,7 +439,14 @@ impl Service {
                 if service.stopping.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                if let Err(error) = service.check_updates(true).await {
+                // A verified staged update stays until install, which hashes it
+                // again; re-hashing ~100 MB every five minutes only costs disk.
+                let staged = {
+                    let state = service.updates.read().await;
+                    state.status == "ready" && state.downloaded
+                };
+                if staged {
+                } else if let Err(error) = service.check_updates(true).await {
                     log::debug!("Background update check: {error:#}");
                 }
                 drop(service);

@@ -1,7 +1,36 @@
 use std::{env, fs, path::PathBuf, process::Command};
 
+/// Display-sized copies of the logo mark and the startup artwork, so the
+/// window decodes ~200-pixel PNGs at launch instead of 1-1.5 MB originals.
+fn display_art() {
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    image::open("assets/logo.png")
+        .expect("Read the Brazap logo")
+        .crop_imm(318, 64, 894, 894)
+        .thumbnail(192, 192)
+        .save(out.join("logo-192.png"))
+        .expect("Write the display logo");
+    for name in [
+        "paper-plane",
+        "envelope",
+        "chat-bubble",
+        "phone",
+        "voice-note",
+        "photo",
+    ] {
+        let source = format!("assets/startup/{name}.png");
+        println!("cargo:rerun-if-changed={source}");
+        image::open(&source)
+            .expect("Read startup artwork")
+            .thumbnail(192, 192)
+            .save(out.join(format!("startup-{name}.png")))
+            .expect("Write startup artwork");
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=assets/logo.png");
+    display_art();
     println!("cargo:rerun-if-env-changed=WINDRES");
     println!("cargo:rerun-if-changed=assets/macos/Info.plist");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {

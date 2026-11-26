@@ -625,7 +625,17 @@ fn list_body(s: &State, searching: bool) -> El {
     if let Some(entry) = archive_entry(s) {
         panel = panel.child(entry);
     }
-    let count = s.visible_chats().len();
+    // Filter once per view: the row callbacks run for every row on each
+    // commit, and filtering there made each keystroke quadratic in chats.
+    let rows: std::rc::Rc<[usize]> = s
+        .snapshot
+        .chats
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.archived == s.show_archived && s.chat_kind.includes(c))
+        .map(|(i, _)| i)
+        .collect();
+    let count = rows.len();
     if count == 0 {
         return panel.child(
             label(
@@ -666,15 +676,31 @@ fn list_body(s: &State, searching: bool) -> El {
                     .virtual_rows(
                         count,
                         super::locale::scale(76.0),
-                        |s: &State, i| s.visible_chats()[i].jid.clone().into(),
-                        |s: &State, i| chat_row(s, s.visible_chats()[i]),
+                        {
+                            let rows = rows.clone();
+                            move |s: &State, i| {
+                                rows.get(i)
+                                    .and_then(|&n| s.snapshot.chats.get(n))
+                                    .map_or("".into(), |c| c.jid.as_str().into())
+                            }
+                        },
+                        {
+                            let rows = rows.clone();
+                            move |s: &State, i| match rows
+                                .get(i)
+                                .and_then(|&n| s.snapshot.chats.get(n))
+                            {
+                                Some(chat) => chat_row(s, chat),
+                                None => col(),
+                            }
+                        },
                     )
-                    .on_visible_rows(|s: &mut State, range| {
-                        let visible: Vec<_> = s
-                            .visible_chats()
-                            .into_iter()
-                            .skip(range.start)
-                            .take(range.len())
+                    .on_visible_rows(move |s: &mut State, range| {
+                        let visible: Vec<_> = rows
+                            .get(range)
+                            .unwrap_or_default()
+                            .iter()
+                            .filter_map(|&n| s.snapshot.chats.get(n))
                             .map(|c| (c.jid.clone(), c.photo_version))
                             .collect();
                         for (jid, version) in visible {

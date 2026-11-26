@@ -444,7 +444,7 @@ pub(super) fn menu(s: &State) -> Vec<El> {
 
 pub(super) fn confirmation(s: &State) -> Option<El> {
     let chat = s.delete_chat.as_ref()?.clone();
-    Some(el().absolute(0.0,0.0).w_full().h_full().center().fill(Color::BLACK.alpha(0.6)).backdrop_blur(14.0)
+    Some(el().absolute(0.0,0.0).w_full().h_full().center().fill(Color::BLACK.alpha(0.68))
         .role("dialog").label(super::locale::tr("Delete chat"))
         .child(glass(col().w(430.0).padding(24.0).gap(18.0)
             .child(title(super::locale::format("Delete chat with {name}?",&[("name",chat.name.clone())]),19.0).wrap())

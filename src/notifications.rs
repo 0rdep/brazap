@@ -91,13 +91,20 @@ impl Service {
         let focused = focused && crate::windows_integration::is_foreground(pid);
         self.sync_presence(focused).await;
         if let Some(chat) = chat {
-            if self.desktop_viewing(&chat).await
-                && self
-                    .archive
-                    .chat_unread(&chat)
-                    .await
-                    .is_ok_and(|unread| unread > 0)
-            {
+            // Both checks resolve the chat's aliases; load them once per poll.
+            let unread_on_screen = self
+                .archive
+                .with_identities(async {
+                    self.desktop_viewing(&chat).await
+                        && self
+                            .archive
+                            .chat_unread(&chat)
+                            .await
+                            .is_ok_and(|unread| unread > 0)
+                })
+                .await
+                .unwrap_or(false);
+            if unread_on_screen {
                 if let Err(error) = self.mark_chat_read(chat).await {
                     log::warn!("Could not persist the visible chat read: {error}");
                 }

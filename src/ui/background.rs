@@ -17,14 +17,13 @@ fn menu() -> Vec<TrayItem> {
 
 impl Background {
     pub fn attach(&mut self, app: AppHandle<State>, demo: bool) {
-        let Ok(logo) = image::load_from_memory(include_bytes!("../../assets/logo.png")) else {
+        // The same square crop as the Windows application icon (build.rs).
+        let Ok(logo) =
+            image::load_from_memory(include_bytes!(concat!(env!("OUT_DIR"), "/logo-192.png")))
+        else {
             return;
         };
-        // Use the same square crop as the Windows application icon.
-        let pixels = logo
-            .crop_imm(318, 64, 894, 894)
-            .thumbnail(64, 64)
-            .into_rgba8();
+        let pixels = logo.thumbnail(64, 64).into_rgba8();
         let title = if demo { "Brazap — Demo" } else { "Brazap" };
         let spec = TraySpec::new(
             if demo {

@@ -814,10 +814,13 @@ impl Service {
                 // metadata remains available to non-UI consumers.
             }
             Event::Messages(batch) => {
-                // Also covers event-only recoveries which bypass the durability hook.
-                self.archive
-                    .store_messages(project_inbound(&batch.messages), true)
-                    .await?;
+                // The durability hook already committed hook-fed batches; store
+                // only event-only ones (newsletters, recoveries that bypass it).
+                if !batch.hook_committed {
+                    self.archive
+                        .store_messages(project_inbound(&batch.messages), true)
+                        .await?;
+                }
                 let mut viewed = std::collections::HashSet::new();
                 for inbound in batch.messages.iter() {
                     let chat = conversation(&inbound.info.source).0;
@@ -839,7 +842,8 @@ impl Service {
                     }
                     let fresh =
                         !inbound.info.is_offline && inbound.info.unavailable_request_id.is_none();
-                    if row.view.attachment() {
+                    // Videos are large; they download when played (AGENTS.md).
+                    if row.view.attachment() && row.view.kind != "video" {
                         self.queue_media(row.view.clone(), inbound.message.as_ref().clone());
                     }
                     if fresh {
@@ -1240,11 +1244,23 @@ impl Service {
                 )
                 .await?;
         }
-        self.changed();
+        // Brazap shows neither presence nor typing, and they arrive constantly
+        // in busy groups; a revision bump would make the UI reload for nothing.
+        if !matches!(&*event, Event::Presence(_) | Event::ChatPresence(_)) {
+            self.changed();
+        }
         Ok(())
     }
 
     pub async fn snapshot(&self, selected_chat: Option<String>) -> Result<Snapshot> {
+        // Polled every 700 ms: the chat list, the page, statuses and calls share
+        // one identity view loaded for this snapshot instead of one each.
+        self.archive
+            .with_identities(self.build_snapshot(selected_chat))
+            .await?
+    }
+
+    async fn build_snapshot(&self, selected_chat: Option<String>) -> Result<Snapshot> {
         let identities = self.archive.identities().await?;
         let selected_chat = selected_chat
             .map(|chat| identities.canonical(&chat))

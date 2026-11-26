@@ -22,6 +22,11 @@ pub(crate) struct ReadTarget {
     pub timestamp: i64,
 }
 #[derive(QueryableByName)]
+struct Floor {
+    #[diesel(sql_type=diesel::sql_types::Nullable<BigInt>)]
+    value: Option<i64>,
+}
+#[derive(QueryableByName)]
 struct State {
     #[diesel(sql_type=BigInt)]
     through: i64,
@@ -110,8 +115,16 @@ impl Archive {
         let account = self.account as i64;
         let pending=self.sql().run(move|conn| {
             conn.transaction::<_,diesel::result::Error,_>(|conn| {
-                let pending:Vec<ReadTarget>=diesel::sql_query("SELECT m.sender,m.id,m.timestamp FROM brazap_messages m WHERE m.account=? AND m.chat IN (SELECT value FROM json_each(?)) AND json_extract(m.payload,'$.from_me')=0 AND json_extract(m.payload,'$.kind') NOT IN ('protocol','album') AND NOT EXISTS(SELECT 1 FROM brazap_chat_reads r WHERE r.account=m.account AND r.chat IN (SELECT value FROM json_each(?)) AND m.timestamp<r.through_timestamp) AND NOT EXISTS(SELECT 1 FROM brazap_read_messages r WHERE r.account=m.account AND r.chat IN (SELECT value FROM json_each(?)) AND r.id=m.id AND (r.sender='' OR r.sender=m.sender)) GROUP BY m.id,m.sender ORDER BY m.timestamp DESC,m.id DESC LIMIT 500")
-                    .bind::<BigInt,_>(account).bind::<Text,_>(&aliases).bind::<Text,_>(&aliases).bind::<Text,_>(&aliases).load(conn)?;
+                // Only a queued read sync uses the targets. Remote app-state reads
+                // (thousands replayed on each start) would scan the chat for nothing.
+                let pending:Vec<ReadTarget>=if queue.is_none() {Vec::new()} else {
+                    // Messages before the newest read boundary are read: a timeline
+                    // range from it, rather than testing each message of the chat.
+                    let floor:Floor=diesel::sql_query("SELECT MAX(through_timestamp) AS value FROM brazap_chat_reads WHERE account=? AND chat IN (SELECT value FROM json_each(?))")
+                        .bind::<BigInt,_>(account).bind::<Text,_>(&aliases).get_result(conn)?;
+                    diesel::sql_query("SELECT m.sender,m.id,m.timestamp FROM brazap_messages m WHERE m.account=? AND m.chat IN (SELECT value FROM json_each(?)) AND m.timestamp>=? AND json_extract(m.payload,'$.from_me')=0 AND json_extract(m.payload,'$.kind') NOT IN ('protocol','album') AND NOT EXISTS(SELECT 1 FROM brazap_read_messages r WHERE r.account=m.account AND r.chat IN (SELECT value FROM json_each(?)) AND r.id=m.id AND (r.sender='' OR r.sender=m.sender)) GROUP BY m.id,m.sender ORDER BY m.timestamp DESC,m.id DESC LIMIT 500")
+                        .bind::<BigInt,_>(account).bind::<Text,_>(&aliases).bind::<BigInt,_>(floor.value.unwrap_or(i64::MIN)).bind::<Text,_>(&aliases).load(conn)?
+                };
                 let unknown_references=through==Some(0) && !references.is_empty();
                 let old:State=diesel::sql_query("SELECT COALESCE(MAX(through_timestamp),0) AS through,COALESCE(MAX(changed_at_ms),0) AS clock,COALESCE((SELECT manual_unread FROM brazap_chat_reads WHERE account=? AND chat IN (SELECT value FROM json_each(?)) ORDER BY changed_at_ms DESC LIMIT 1),0) AS manual FROM brazap_chat_reads WHERE account=? AND chat IN (SELECT value FROM json_each(?))")
                     .bind::<BigInt,_>(account).bind::<Text,_>(&aliases).bind::<BigInt,_>(account).bind::<Text,_>(&aliases).get_result(conn)?;

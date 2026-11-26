@@ -968,7 +968,6 @@ pub(super) fn viewer(s: &State) -> Option<El> {
             .h_full()
             .padding(20.0)
             .fill(Color::BLACK.alpha(0.88))
-            .backdrop_blur(18.0)
             .center()
             .role("dialog")
             .label(super::locale::tr("Status viewer"))
