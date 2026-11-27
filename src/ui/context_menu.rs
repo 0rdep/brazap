@@ -371,6 +371,7 @@ fn message_items(s: &State, m: &Message) -> El {
         false,
         move |s, tx| {
             s.close_context_menu();
+            s.close_viewer();
             s.reply = Some(reply.clone());
             s.defer_composer_focus(tx);
         },
@@ -386,6 +387,7 @@ fn message_items(s: &State, m: &Message) -> El {
             false,
             move |s, tx| {
                 s.close_context_menu();
+                s.close_viewer();
                 s.begin_edit(target.clone(), tx);
             },
         ));
@@ -397,6 +399,7 @@ fn message_items(s: &State, m: &Message) -> El {
         false,
         move |s, _| {
             s.close_context_menu();
+            s.close_viewer();
             s.begin_forward(forward.clone());
         },
     ))

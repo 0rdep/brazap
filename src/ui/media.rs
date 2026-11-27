@@ -15,6 +15,13 @@ pub(super) fn avatar_key(jid: &str, version: i64) -> String {
 pub(super) fn thumbnail_key(m: &Message) -> String {
     format!("thumb:{}:{}:{}:{}", m.chat, m.sender, m.id, m.has_media)
 }
+/// The picker's copy of a sticker, which a sticker being sent shows until its own loads.
+fn sticker_key(m: &Message) -> Option<String> {
+    (m.kind == "sticker")
+        .then_some(m.sticker_hash.as_ref())
+        .flatten()
+        .map(|hash| format!("sticker:{hash}"))
+}
 
 pub(super) fn avatar(s: &State, jid: &str, name: &str, _version: i64, size: f32) -> El {
     let base = el()
@@ -356,9 +363,11 @@ pub(super) fn album(s: &State, message: &Message) -> El {
 }
 
 pub(super) fn tile(s: &State, message: &Message, w: f32, h: f32, scope: &str) -> El {
+    let fallback = sticker_key(message);
     let image = s
         .images
         .get(&thumbnail_key(message))
+        .or_else(|| fallback.as_ref().and_then(|key| s.images.get(key)))
         .filter(|image| image.error().is_none());
     let key = format!("media-{scope}-{}-{}", message.sender, message.id);
     let open = s.media_menu.as_ref().is_some_and(|(id, _)| id == &key);
@@ -396,7 +405,13 @@ pub(super) fn tile(s: &State, message: &Message, w: f32, h: f32, scope: &str) ->
     } else {
         SurfaceFit::Fit
     };
-    if let Some(pixels) = s.animations.pixels(&thumbnail_key(message)) {
+    if let Some(pixels) = s.animations.pixels(&thumbnail_key(message)).or_else(|| {
+        s.images
+            .get(&thumbnail_key(message))
+            .is_none()
+            .then(|| fallback.as_ref().and_then(|key| s.animations.pixels(key)))
+            .flatten()
+    }) {
         preview = preview.pixels_fit(pixels, fit);
     } else if let Some(image) = image {
         preview = preview.pixels_fit(image.pixels(), fit);
@@ -523,7 +538,13 @@ pub(super) fn viewer(s: &State) -> Option<El> {
                     |s, _| s.close_viewer(),
                 )),
         );
-    let display = el().grow(1.0).min_h(0.0).w_full().center();
+    let target = m.clone();
+    let display = el()
+        .grow(1.0)
+        .min_h(0.0)
+        .w_full()
+        .center()
+        .on_secondary_press(move |s: &mut State, p, _| s.message_menu(target.clone(), p));
     let pixels = s
         .animations
         .pixels(&key)
@@ -669,6 +690,7 @@ fn video_viewer(s: &State, message: &Message) -> El {
     let status = s.video.as_ref().map(|v| v.status()).unwrap_or_default();
     let error = s.video_error.as_ref().or(status.error.as_ref());
     let save = message.clone();
+    let target = message.clone();
     let mut display = el()
         .w_full()
         .grow(1.0)
@@ -683,7 +705,8 @@ fn video_viewer(s: &State, message: &Message) -> El {
             if let Some(video) = &s.video {
                 video.toggle();
             }
-        });
+        })
+        .on_secondary_press(move |s: &mut State, p, _| s.message_menu(target.clone(), p));
     if let Some(video) = &s.video {
         display = display.child(video.view());
     } else if let Some(poster) = s.images.get(&thumbnail_key(message)) {

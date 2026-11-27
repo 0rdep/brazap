@@ -2,7 +2,6 @@ use super::{Command, State, media, view::*};
 use crate::model::{Chat, Message};
 use rune::{Color, El, Icon, ScrollSpec, TextEdit, Tx, col, el, icon, row};
 use rune_kit::{TextInput, glyphs};
-use serde_json::json;
 
 const REACT: Icon = Icon {
     name: "react-to-message",
@@ -113,10 +112,29 @@ impl State {
             emoji
         };
         self.reaction_menu = None;
-        self.tool(
-            "react_message",
-            json!({"chat":message.chat,"target":message.cursor(),"emoji":emoji}),
-        );
+        self.error = None;
+        // Shown at once, without holding the composer while it reaches WhatsApp.
+        let key = (message.chat.clone(), message.id.clone());
+        self.pending_reactions
+            .insert(key, (emoji.clone(), std::time::Instant::now()));
+        if let Some(shown) = self
+            .timeline
+            .iter_mut()
+            .find(|m| m.chat == message.chat && m.id == message.id && m.sender == message.sender)
+        {
+            super::react_locally(shown, &emoji);
+        }
+        if self
+            .tx
+            .send(Command::React(
+                message.chat.clone(),
+                message.cursor(),
+                emoji,
+            ))
+            .is_err()
+        {
+            self.error = Some("The local service stopped".into());
+        }
     }
 }
 

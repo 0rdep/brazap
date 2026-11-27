@@ -38,7 +38,7 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
             "recent_emojis": service.archive.preference("recent_emojis".into()).await?.and_then(|value|serde_json::from_str::<Vec<String>>(&value).ok()).unwrap_or_default()
         })),
         "send_sticker" => Ok(
-            json!({"message": service.send_sticker(text_arg(&args,"chat")?.into(),text_arg(&args,"hash")?.into()).await?}),
+            json!({"message": service.send_sticker(text_arg(&args,"chat")?.into(),text_arg(&args,"hash")?.into(),args.get("message_id").and_then(Value::as_str).map(str::to_owned)).await?}),
         ),
         "remember_emoji" => {
             let emoji = text_arg(&args, "emoji")?;
@@ -315,11 +315,69 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
                 .await?,
         )?),
         "send_voice" => {
-            Ok(json!({"message":service.send_voice(serde_json::from_value(args)?).await?}))
+            // The desktop shows the message as soon as it is staged; MCP waits for the send.
+            let early = args.get("early").and_then(Value::as_bool).unwrap_or(false);
+            let upload: crate::model::VoiceUpload = serde_json::from_value(args)?;
+            let message = if early {
+                service
+                    .send_early(move |service, staged| async move {
+                        service.send_voice_with(upload, Some(staged)).await
+                    })
+                    .await?
+            } else {
+                service.send_voice(upload).await?
+            };
+            Ok(json!({"message":message}))
         }
-        "send_attachment" => Ok(
-            json!({"message":service.send_attachment(text_arg(&args,"chat")?.into(),text_arg(&args,"path")?.into(),text_arg(&args,"kind")?.into(),args.get("caption").and_then(Value::as_str).unwrap_or("").into(),args.get("view_once").and_then(Value::as_bool).unwrap_or(false),args.get("mentions").filter(|v|!v.is_null()).map(|v|serde_json::from_value(v.clone())).transpose()?.unwrap_or_default(),args.get("mention_everyone").and_then(Value::as_bool).unwrap_or(false)).await?}),
-        ),
+        "send_attachment" => {
+            let (chat, path, kind): (String, String, String) = (
+                text_arg(&args, "chat")?.into(),
+                text_arg(&args, "path")?.into(),
+                text_arg(&args, "kind")?.into(),
+            );
+            let caption: String = args
+                .get("caption")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .into();
+            let view_once = args
+                .get("view_once")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mentions: Vec<String> = args
+                .get("mentions")
+                .filter(|v| !v.is_null())
+                .map(|v| serde_json::from_value(v.clone()))
+                .transpose()?
+                .unwrap_or_default();
+            let everyone = args
+                .get("mention_everyone")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let message = if args.get("early").and_then(Value::as_bool).unwrap_or(false) {
+                service
+                    .send_early(move |service, staged| async move {
+                        service
+                            .send_attachment_with(
+                                chat,
+                                path,
+                                kind,
+                                caption,
+                                view_once,
+                                mentions,
+                                everyone,
+                                Some(staged),
+                            )
+                            .await
+                    })
+                    .await?
+            } else {
+                service
+                    .send_attachment(chat, path, kind, caption, view_once, mentions, everyone)
+                    .await?
+            };
+            Ok(json!({"message":message}))
+        }
         "save_attachment" => {
             service
                 .save_attachment(

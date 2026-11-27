@@ -397,11 +397,27 @@ fn run(
     let mut wanted_playing = true;
     let mut ready = false;
     let mut last_tick = Instant::now();
+    // A seek while paused still shows the frame at its new position.
+    let mut frame_due: Option<Instant> = None;
+    let frame_period = Duration::from_millis(if audio { 100 } else { 15 });
     loop {
-        let command = if ready && !wanted_playing && !unsafe { engine.0.IsSeeking().as_bool() } {
+        // The engine's own state decides whether frames advance: after the end it can play
+        // again on a seek without a Play call, and this loop must keep pulling then.
+        let still = ready
+            && unsafe {
+                (engine.0.IsPaused().as_bool() || engine.0.IsEnded().as_bool())
+                    && !engine.0.IsSeeking().as_bool()
+            }
+            && frame_due.is_none_or(|due| Instant::now() >= due);
+        let command = if still {
+            frame_due = None;
             receiver.recv().ok()
         } else {
-            match receiver.recv_timeout(Duration::from_millis(if audio { 100 } else { 16 })) {
+            // Wait until the next frame is due, not a fresh period after each engine event.
+            let wait = frame_period
+                .saturating_sub(last_tick.elapsed())
+                .max(Duration::from_millis(1));
+            match receiver.recv_timeout(wait) {
                 Ok(command) => Some(command),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -411,7 +427,11 @@ fn run(
             match command {
                 Some(Command::Stop) => break,
                 Some(Command::Toggle) => {
-                    wanted_playing = !wanted_playing;
+                    wanted_playing = if ready {
+                        engine.0.IsPaused().as_bool() || engine.0.IsEnded().as_bool()
+                    } else {
+                        !wanted_playing
+                    };
                     if wanted_playing {
                         if engine.0.IsEnded().as_bool() {
                             engine.0.SetCurrentTime(0.0)?;
@@ -427,6 +447,7 @@ fn run(
                     let duration = engine.0.GetDuration();
                     if time.is_finite() && duration.is_finite() {
                         engine.0.SetCurrentTime(time.clamp(0.0, duration))?;
+                        frame_due = Some(Instant::now() + Duration::from_millis(500));
                     }
                 }
                 Some(Command::Volume(volume)) => {
@@ -452,19 +473,25 @@ fn run(
                         }
                     }
                     if event == MF_MEDIA_ENGINE_EVENT_ENDED.0 as u32 {
+                        // Pause too, so a seek back after the end shows that frame and
+                        // waits for Play instead of resuming behind a paused control.
                         wanted_playing = false;
+                        engine.0.Pause()?;
                     }
                 }
                 None => {}
             }
             // Event bursts must not drive unbounded texture readbacks.
-            if last_tick.elapsed() >= Duration::from_millis(15) {
+            if last_tick.elapsed() >= frame_period {
                 if let Some(frames) = &mut frames
                     && let Some(frame) = frames.pull(&engine.0)?
                 {
                     surface
                         .push_bytes(frame, frames.count)
                         .map_err(anyhow::Error::msg)?;
+                    if !engine.0.IsSeeking().as_bool() {
+                        frame_due = None;
+                    }
                 }
                 last_tick = Instant::now();
             }
@@ -472,7 +499,7 @@ fn run(
             let position = engine.0.GetCurrentTime();
             let next = Status {
                 loading: !ready,
-                playing: ready && wanted_playing && !engine.0.IsEnded().as_bool(),
+                playing: ready && !engine.0.IsPaused().as_bool() && !engine.0.IsEnded().as_bool(),
                 ended: engine.0.IsEnded().as_bool(),
                 muted: engine.0.GetMuted().as_bool(),
                 volume: engine.0.GetVolume(),

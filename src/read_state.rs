@@ -91,6 +91,18 @@ impl Archive {
         unread: bool,
         queue: Option<bool>,
     ) -> Result<Vec<ReadTarget>> {
+        self.with_identities(self.apply_read_with(chat, through, references, at_ms, unread, queue))
+            .await?
+    }
+    async fn apply_read_with(
+        &self,
+        chat: &str,
+        through: Option<i64>,
+        references: Vec<ReadTarget>,
+        at_ms: i64,
+        unread: bool,
+        queue: Option<bool>,
+    ) -> Result<Vec<ReadTarget>> {
         self.allow_chat(chat).await?;
         let identities = self.identities().await?;
         let canonical = identities.canonical(chat);
@@ -133,6 +145,14 @@ impl Archive {
                 let boundary=through.unwrap_or(latest.value);
                 let newest=old.through.max(if unread {old.through}else{boundary});
                 let manual=if at_ms>=old.clock {i64::from(unread)} else {old.manual};
+                // A phone read replayed on each start, no newer than what is stored and
+                // reaching no further (its messages already behind the boundary), changes
+                // nothing: skip its writes and their sync.
+                if queue.is_none() && !unread && !unknown_references
+                    && references.iter().all(|r| r.timestamp>0 && r.timestamp<old.through)
+                    && at_ms<=old.clock && boundary<=old.through && manual==old.manual {
+                    return Ok(pending);
+                }
                 // A local/full-range read covers all messages already archived at
                 // its boundary; unseen messages in that second remain eligible.
                 if !unread && references.is_empty() {

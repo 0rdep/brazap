@@ -73,7 +73,10 @@ enum Command {
     Deselect,
     ManageChat(&'static str, Value),
     /// A sticker from the picker for a chat: its upload runs beside other work.
-    SendSticker(String, String),
+    /// A reaction (empty removes yours), shown at once and confirmed by the service.
+    React(String, MessageCursor, String),
+    /// Chat, sticker hash and the id its local copy shows under.
+    SendSticker(String, String, String),
     CopyMedia(u64, Message),
     /// Sticker work that takes seconds: the tool, its arguments and what to say when done.
     Sticker(&'static str, Value, &'static str),
@@ -127,6 +130,8 @@ enum Command {
     Newer(String, MessageCursor, u64),
 }
 enum Event {
+    /// A reaction's send finished: its message and the outcome.
+    Reacted((String, String), Result<(), String>),
     MediaCopied(u64, Result<rune::ClipboardContent, String>),
     StickerDone(Result<&'static str, String>),
     StatusReplied(String, Result<Message, String>),
@@ -251,6 +256,8 @@ pub(super) struct State {
     phone_country: phone::Picker,
     drafts: HashMap<String, String>,
     pending_sends: HashMap<String, (Message, Option<MessageCursor>)>,
+    /// Your reactions shown before a snapshot carries them, by chat and message id.
+    pending_reactions: HashMap<(String, String), (String, std::time::Instant)>,
     /// Each group's members for `@` mentions, asked for once per session.
     members: HashMap<String, Vec<crate::model::Member>>,
     members_pending: HashSet<String>,
@@ -430,6 +437,7 @@ pub fn run(config: Config, initial_chat: Option<String>) -> Result<()> {
         phone_country: phone::Picker::default(),
         drafts: HashMap::new(),
         pending_sends: HashMap::new(),
+        pending_reactions: HashMap::new(),
         members: HashMap::new(),
         members_pending: HashSet::new(),
         mention_index: 0,
@@ -701,12 +709,12 @@ async fn worker(
                             emit(&events,&wake,Event::Done(result));
                         });continue;
                     }
-                    Some(Command::SendSticker(chat,hash))=>{
+                    Some(Command::SendSticker(chat,hash,id))=>{
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
                         assets.spawn(async move {
-                            let result=remote.call("send_sticker",json!({"chat":chat,"hash":hash})).await
+                            let result=remote.call("send_sticker",json!({"chat":chat,"hash":hash,"message_id":id})).await
                                 .and_then(|v|Ok(serde_json::from_value(v["message"].clone())?)).map_err(|e|format!("{e:#}"));
-                            emit(&events,&wake,Event::Sent(String::new(),result));
+                            emit(&events,&wake,Event::Sent(id,result));
                         });continue;
                     }
                     Some(Command::CopyMedia(generation,message))=>{
@@ -895,7 +903,7 @@ async fn worker(
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
                         assets.spawn(async move {
                             for upload in uploads {
-                                let result=remote.call("send_attachment",json!({"chat":chat,"path":upload.path,"kind":upload.kind,"caption":upload.caption,"view_once":upload.view_once,"mentions":upload.mentions,"mention_everyone":upload.mention_everyone})).await
+                                let result=remote.call("send_attachment",json!({"chat":chat,"path":upload.path,"kind":upload.kind,"caption":upload.caption,"view_once":upload.view_once,"mentions":upload.mentions,"mention_everyone":upload.mention_everyone,"early":true})).await
                                     .and_then(|value|Ok(serde_json::from_value(value["message"].clone())?))
                                     .map_err(|e|format!("{e:#}"));
                                 let failed=result.is_err();
@@ -908,7 +916,8 @@ async fn worker(
                     Some(Command::SendVoice(generation,upload))=>{
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
                         assets.spawn(async move {
-                            let result=remote.call("send_voice",json!(upload)).await
+                            let mut args=json!(upload);args["early"]=json!(true);
+                            let result=remote.call("send_voice",args).await
                                 .and_then(|v|Ok(serde_json::from_value(v["message"].clone())?))
                                 .map_err(|e|format!("{e:#}"));
                             emit(&events,&wake,Event::VoiceSent(generation,result));
@@ -959,6 +968,14 @@ async fn worker(
                     }
                     // Nothing here waits on the service: a slow call never holds up the
                     // snapshot, images or other commands behind it.
+                    Some(Command::React(chat,target,emoji))=>{
+                        let remote=remote.clone();let events=events.clone();let wake=wake.clone();
+                        assets.spawn(async move {
+                            let key=(chat.clone(),target.id.clone());
+                            let result=remote.call("react_message",json!({"chat":chat,"target":target,"emoji":emoji})).await.map(|_|()).map_err(|e|format!("{e:#}"));
+                            emit(&events,&wake,Event::Reacted(key,result));
+                        });continue;
+                    }
                     Some(Command::Tool(name,args))=>{
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
                         assets.spawn(async move {
@@ -1519,6 +1536,15 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
                     changed = true;
                 }
             }
+            Event::Reacted(key, result) => {
+                if let Err(error) = result {
+                    // Undo the local copy; the next snapshot shows what WhatsApp has.
+                    state.pending_reactions.remove(&key);
+                    state.error = Some(error);
+                    let _ = state.tx.send(Command::Refresh);
+                }
+                changed = true;
+            }
             Event::Done(result) => {
                 state.busy = false;
                 state.error = result.err();
@@ -1548,6 +1574,16 @@ fn poll(state: &mut State, elapsed: f64, tx: &mut Tx) -> bool {
                         {
                             state.merge_messages(vec![message]);
                         }
+                    }
+                    Err(error)
+                        if state
+                            .pending_sends
+                            .get(&id)
+                            .is_some_and(|(m, _)| m.kind != "text") =>
+                    {
+                        state.drop_local_send(&id);
+                        state.error = Some(error);
+                        let _ = state.tx.send(Command::Refresh);
                     }
                     Err(error) => {
                         if let Some((message, _)) = state.pending_sends.get_mut(&id) {
@@ -2072,6 +2108,14 @@ impl State {
         for message in &incoming {
             if crate::outbox::confirmed(&message.status) {
                 self.pending_sends.remove(&message.id);
+            } else if let Some((pending, _)) = self.pending_sends.get_mut(&message.id)
+                && message.from_me
+            {
+                // The archive's copy (its media, its chat) replaces the local one; the
+                // status stays the interface's until the send confirms or fails.
+                let status = std::mem::take(&mut pending.status);
+                *pending = message.clone();
+                pending.status = status;
             }
         }
         incoming.extend(
@@ -2080,6 +2124,20 @@ impl State {
                 .filter(|(m, _)| self.selected.as_deref() == Some(&m.chat))
                 .map(|(m, _)| m.clone()),
         );
+        // Your reaction stays as you set it until a snapshot carries it (or 20 s pass).
+        self.pending_reactions
+            .retain(|_, (_, at)| at.elapsed() < Duration::from_secs(20));
+        for message in &mut incoming {
+            let key = (message.chat.clone(), message.id.clone());
+            if let Some((emoji, _)) = self.pending_reactions.get(&key) {
+                let mine = message.reactions.iter().find(|r| r.sender == "self");
+                if mine.map(|r| r.emoji.as_str()).unwrap_or("") == emoji {
+                    self.pending_reactions.remove(&key);
+                } else {
+                    react_locally(message, emoji);
+                }
+            }
+        }
         for mut message in incoming {
             if let Some(existing) = self.timeline.iter_mut().find(|m| {
                 m.chat == message.chat
@@ -2349,11 +2407,39 @@ impl State {
         tx.wake_after(Duration::from_millis(16));
     }
     /// Sends a sticker without holding up anything else, so several can go out in a row.
+    /// It shows in the chat at once, drawn from the picker's copy, while it uploads.
     fn send_sticker(&mut self, chat: String, hash: String) {
         self.error = None;
-        if self.tx.send(Command::SendSticker(chat, hash)).is_err() {
+        let message = Message {
+            id: crate::outbox::new_id(),
+            chat: chat.clone(),
+            sender: "self".into(),
+            from_me: true,
+            timestamp: crate::model::now(),
+            kind: "sticker".into(),
+            status: "sending".into(),
+            sticker_hash: Some(hash.clone()),
+            ..Default::default()
+        };
+        self.pending_sends
+            .insert(message.id.clone(), (message.clone(), None));
+        self.merge_messages(vec![message.clone()]);
+        self.detached = false;
+        if self
+            .tx
+            .send(Command::SendSticker(chat, hash, message.id.clone()))
+            .is_err()
+        {
+            self.drop_local_send(&message.id);
             self.error = Some("The local service stopped".into());
         }
+    }
+    /// Forgets a local copy that never reached the archive; a staged row that failed
+    /// comes back with the next snapshot.
+    fn drop_local_send(&mut self, id: &str) {
+        self.pending_sends.remove(id);
+        self.timeline
+            .retain(|m| !(m.id == id && m.from_me && !crate::outbox::confirmed(&m.status)));
     }
     fn tool(&mut self, name: &'static str, args: Value) {
         self.busy = true;
@@ -2957,6 +3043,11 @@ impl State {
     }
 
     fn request_thumbnail(&mut self, m: &Message) {
+        // A local copy not yet in the archive has nothing to load; asking would cache a
+        // failure under the key its archived copy may keep.
+        if !m.has_media && m.from_me && self.pending_sends.contains_key(&m.id) {
+            return;
+        }
         if matches!(m.kind.as_str(), "image" | "video" | "sticker") {
             if m.kind != "video"
                 && !m.has_media
@@ -3114,4 +3205,15 @@ fn state_call_open(s: &State) -> bool {
 #[cfg(target_os = "windows")]
 pub(crate) fn call_notification_text(value: &str, language: &str) -> String {
     locale::in_language(value, language)
+}
+
+/// Shows your reaction on a message: `emoji` replaces yours, or an empty one removes it.
+fn react_locally(message: &mut Message, emoji: &str) {
+    message.reactions.retain(|r| r.sender != "self");
+    if !emoji.is_empty() {
+        message.reactions.push(crate::model::Reaction {
+            sender: "self".into(),
+            emoji: emoji.into(),
+        });
+    }
 }

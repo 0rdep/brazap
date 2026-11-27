@@ -577,9 +577,20 @@ impl Service {
         proto: wa::Message,
         media: Option<Vec<u8>>,
     ) -> Result<Message> {
+        self.demo_send_as(chat, proto, media, None).await
+    }
+
+    /// [`Self::demo_send`] under the id the interface already shows the message with.
+    pub(crate) async fn demo_send_as(
+        &self,
+        chat: String,
+        proto: wa::Message,
+        media: Option<Vec<u8>>,
+        id: Option<String>,
+    ) -> Result<Message> {
         ensure!(self.config.demo, "Local simulation requires demo mode");
         self.archive.allow_chat(&chat).await?;
-        let id = format!("demo-{}", uuid::Uuid::new_v4());
+        let id = id.unwrap_or_else(|| format!("demo-{}", uuid::Uuid::new_v4()));
         let mut row = outgoing(chat, id, &proto);
         row.view.status = "read".into();
         let mut message = row.view.clone();

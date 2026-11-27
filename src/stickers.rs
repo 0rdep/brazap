@@ -249,16 +249,24 @@ impl Service {
         Ok(bytes)
     }
 
-    pub async fn send_sticker(&self, chat: String, hash: String) -> Result<Message> {
+    /// Sends a sticker; `id`, when given, is the id the interface already shows it with.
+    pub async fn send_sticker(
+        &self,
+        chat: String,
+        hash: String,
+        id: Option<String>,
+    ) -> Result<Message> {
         self.archive.allow_chat(&chat).await?;
+        let id = id.map(crate::outbox::checked_id).transpose()?;
         let bytes = self.sticker_bytes(hash.clone()).await?;
         if self.config.demo {
             let stored = self.archive.stored_sticker(hash).await?;
             return self
-                .demo_send(
+                .demo_send_as(
                     chat,
                     wa::Message::decode_from_slice(&stored.encoded)?,
                     Some(bytes),
+                    id,
                 )
                 .await;
         }
@@ -272,7 +280,7 @@ impl Service {
             .context_info = MessageField::default();
         // The sticker shows as sending in the chat at once; its upload follows.
         let staged = self
-            .stage_outgoing(&client, &chat.parse()?, &proto, Some(bytes.clone()))
+            .stage_outgoing(&client, &chat.parse()?, &proto, Some(bytes.clone()), id)
             .await?;
         match self.upload_sticker(&client, hash, bytes, proto).await {
             Ok(proto) => self.send_staged(client, staged, proto).await,

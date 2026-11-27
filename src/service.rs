@@ -26,6 +26,7 @@ pub struct Service {
     pub(crate) read_jobs: std::sync::Mutex<std::collections::HashSet<(String, i64)>>,
     pub(crate) outbox_locks:
         Mutex<std::collections::HashMap<(String, String), std::sync::Weak<Mutex<()>>>>,
+    pub(crate) send_order: crate::outbox::SendOrder,
     pub archive: Archive,
     pub(crate) config: Config,
     pub(crate) settings: RwLock<crate::settings::Settings>,
@@ -104,6 +105,7 @@ impl Service {
             read_slots: Semaphore::new(2),
             read_jobs: Default::default(),
             outbox_locks: Mutex::new(Default::default()),
+            send_order: Default::default(),
             config: config.clone(),
             settings: RwLock::new(settings),
             updates: RwLock::new(updates),
@@ -560,6 +562,27 @@ impl Service {
     }
 
     async fn on_event(self: &Arc<Self>, event: Arc<Event>, client: Arc<Client>) -> Result<()> {
+        // Thousands of these replay from app state on each start, each resolving the chat's
+        // aliases and lock several times; none of them changes contacts, LID mappings or locks,
+        // so one identity view serves the whole event.
+        if matches!(
+            &*event,
+            Event::MarkChatAsReadUpdate(_)
+                | Event::Receipt(_)
+                | Event::ServerAck(_)
+                | Event::PinUpdate(_)
+                | Event::MuteUpdate(_)
+                | Event::ArchiveUpdate(_)
+        ) {
+            return self
+                .archive
+                .with_identities(self.handle_event(event, client))
+                .await?;
+        }
+        self.handle_event(event, client).await
+    }
+
+    async fn handle_event(self: &Arc<Self>, event: Arc<Event>, client: Arc<Client>) -> Result<()> {
         if self.logout_in_progress.load(Ordering::Acquire)
             && matches!(
                 &*event,
@@ -1370,6 +1393,15 @@ impl Service {
     }
 
     pub async fn send_voice(&self, upload: crate::model::VoiceUpload) -> Result<Message> {
+        self.send_voice_with(upload, None).await
+    }
+
+    /// [`Self::send_voice`]; `early` gets the message as soon as it shows as sending.
+    pub(crate) async fn send_voice_with(
+        &self,
+        upload: crate::model::VoiceUpload,
+        early: Option<tokio::sync::oneshot::Sender<Message>>,
+    ) -> Result<Message> {
         self.archive.allow_chat(&upload.chat).await?;
         ensure!(
             (1..=600).contains(&upload.duration_seconds),
@@ -1430,29 +1462,77 @@ impl Service {
             return self.demo_send(upload.chat, message, media).await;
         }
         let client = self.connected().await?;
-        let uploaded = client
-            .upload(
-                bytes.clone(),
-                whatsapp_rust::download::MediaType::Audio,
-                Default::default(),
-            )
-            .await?;
-        let mut options = whatsapp_rust::media::AudioOptions::default()
-            .with_ptt(true)
-            .with_duration_seconds(upload.duration_seconds)
-            .with_waveform(upload.waveform);
-        if let Some(context) = context {
-            options = options.with_context_info(Box::new(context));
+        let turn = self.send_order.ticket();
+        let build = |uploaded: whatsapp_rust::upload::UploadResponse| -> Result<wa::Message> {
+            let mut options = whatsapp_rust::media::AudioOptions::default()
+                .with_ptt(true)
+                .with_duration_seconds(upload.duration_seconds)
+                .with_waveform(upload.waveform.clone());
+            if let Some(context) = context.clone() {
+                options = options.with_context_info(Box::new(context));
+            }
+            let message = whatsapp_rust::media::audio_message(uploaded, options);
+            // A view-once voice message is not kept: only the phone can play it.
+            if upload.view_once {
+                crate::content::into_view_once(message)
+            } else {
+                Ok(message)
+            }
+        };
+        let media = (!upload.view_once).then(|| bytes.clone());
+        let mut pending = wa::message::AudioMessage::default();
+        pending.mimetype = Some("audio/ogg; codecs=opus".into());
+        pending.ptt = Some(true);
+        pending.seconds = Some(upload.duration_seconds);
+        pending.waveform = Some(upload.waveform.clone());
+        pending.file_length = Some(bytes.len() as u64);
+        if let Some(context) = context.clone() {
+            pending.context_info = MessageField::some(context);
         }
-        let mut message = whatsapp_rust::media::audio_message(uploaded, options);
-        // A view-once voice message is not kept: only the phone can play it.
+        let mut message = wa::Message::default();
+        message.audio_message = MessageField::some(pending);
         if upload.view_once {
             message = crate::content::into_view_once(message)?;
         }
-        let media = (!upload.view_once).then_some(bytes);
-        self.send_prepared(client, jid, message, media).await
+        let staged = self
+            .stage_outgoing(&client, &jid, &message, media, None)
+            .await?;
+        if let Some(early) = early {
+            let _ = early.send(staged.clone());
+        }
+        let uploaded = client
+            .upload(
+                bytes,
+                whatsapp_rust::download::MediaType::Audio,
+                Default::default(),
+            )
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(build);
+        self.send_uploaded(client, staged, uploaded, turn).await
     }
 
+    /// Sends a staged message once its upload is done and every send started before it has
+    /// gone, or marks it failed.
+    async fn send_uploaded(
+        &self,
+        client: Arc<Client>,
+        staged: Message,
+        uploaded: Result<wa::Message>,
+        turn: crate::outbox::Turn<'_>,
+    ) -> Result<Message> {
+        let message = match uploaded {
+            Ok(message) => message,
+            Err(error) => {
+                self.fail_staged(&staged).await?;
+                return Err(error);
+            }
+        };
+        turn.wait().await;
+        self.send_staged(client, staged, message).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_attachment(
         &self,
         chat: String,
@@ -1462,6 +1542,32 @@ impl Service {
         view_once: bool,
         mentions: Vec<String>,
         mention_everyone: bool,
+    ) -> Result<Message> {
+        self.send_attachment_with(
+            chat,
+            path,
+            kind,
+            caption,
+            view_once,
+            mentions,
+            mention_everyone,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::send_attachment`]; `early` gets the message as soon as it shows as sending.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_attachment_with(
+        &self,
+        chat: String,
+        path: String,
+        kind: String,
+        caption: String,
+        view_once: bool,
+        mentions: Vec<String>,
+        mention_everyone: bool,
+        early: Option<tokio::sync::oneshot::Sender<Message>>,
     ) -> Result<Message> {
         self.archive.allow_chat(&chat).await?;
         ensure!(caption.len() <= 65_536, "Message is too long");
@@ -1516,60 +1622,77 @@ impl Service {
             "file" => whatsapp_rust::download::MediaType::Document,
             _ => bail!("Unsupported attachment kind"),
         };
-        let uploaded = client
-            .upload(bytes.clone(), media_type, Default::default())
-            .await?;
+        let turn = self.send_order.ticket();
         use whatsapp_rust::media;
-        let message = match kind.as_str() {
-            "image" => media::image_message(
-                uploaded,
-                media::ImageOptions::default()
-                    .with_mimetype(mime)
-                    .with_caption(caption),
-            ),
-            "video" => media::video_message(
-                uploaded,
-                media::VideoOptions::default()
-                    .with_mimetype(mime)
-                    .with_caption(caption),
-            ),
-            "audio" => media::audio_message(
-                uploaded,
-                media::AudioOptions::default()
-                    .with_mimetype(mime)
-                    .with_ptt(false),
-            ),
-            "sticker" => {
-                let mut sticker = wa::message::StickerMessage::default();
-                sticker.url = Some(uploaded.url);
-                sticker.direct_path = Some(uploaded.direct_path);
-                sticker.media_key = Some(uploaded.media_key.to_vec());
-                sticker.file_sha256 = Some(uploaded.file_sha256.to_vec());
-                sticker.file_enc_sha256 = Some(uploaded.file_enc_sha256.to_vec());
-                sticker.file_length = Some(uploaded.file_length);
-                sticker.mimetype = Some("image/webp".into());
-                let mut message = wa::Message::default();
-                message.sticker_message = MessageField::some(sticker);
-                message
+        let build = |uploaded: whatsapp_rust::upload::UploadResponse| -> Result<wa::Message> {
+            let (mime, caption, name) = (mime.clone(), caption.clone(), name.clone());
+            let message = match kind.as_str() {
+                "image" => media::image_message(
+                    uploaded,
+                    media::ImageOptions::default()
+                        .with_mimetype(mime)
+                        .with_caption(caption),
+                ),
+                "video" => media::video_message(
+                    uploaded,
+                    media::VideoOptions::default()
+                        .with_mimetype(mime)
+                        .with_caption(caption),
+                ),
+                "audio" => media::audio_message(
+                    uploaded,
+                    media::AudioOptions::default()
+                        .with_mimetype(mime)
+                        .with_ptt(false),
+                ),
+                "sticker" => {
+                    let mut sticker = wa::message::StickerMessage::default();
+                    sticker.url = Some(uploaded.url);
+                    sticker.direct_path = Some(uploaded.direct_path);
+                    sticker.media_key = Some(uploaded.media_key.to_vec());
+                    sticker.file_sha256 = Some(uploaded.file_sha256.to_vec());
+                    sticker.file_enc_sha256 = Some(uploaded.file_enc_sha256.to_vec());
+                    sticker.file_length = Some(uploaded.file_length);
+                    sticker.mimetype = Some("image/webp".into());
+                    let mut message = wa::Message::default();
+                    message.sticker_message = MessageField::some(sticker);
+                    message
+                }
+                _ => media::document_message(
+                    uploaded,
+                    media::DocumentOptions::default()
+                        .with_file_name(name)
+                        .with_mimetype(mime)
+                        .with_caption(caption),
+                ),
+            };
+            let mut message = message;
+            crate::content::tag_caption(&mut message, mentions.clone(), mention_everyone);
+            // Like WhatsApp, keep no copy of view-once media after sending it.
+            if view_once {
+                crate::content::into_view_once(message)
+            } else {
+                Ok(message)
             }
-            _ => media::document_message(
-                uploaded,
-                media::DocumentOptions::default()
-                    .with_file_name(name)
-                    .with_mimetype(mime)
-                    .with_caption(caption),
-            ),
         };
-        let mut message = message;
-        crate::content::tag_caption(&mut message, mentions, mention_everyone);
-        // Like WhatsApp, keep no copy of view-once media after sending it.
-        let (message, media) = if view_once {
-            (crate::content::into_view_once(message)?, None)
-        } else {
-            (message, Some(bytes))
-        };
-        self.send_prepared(client, chat.parse()?, message, media)
+        let media = (!view_once).then(|| bytes.clone());
+        let mut pending = not_uploaded(&kind, &mime, &caption, &name, bytes.len());
+        crate::content::tag_caption(&mut pending, mentions.clone(), mention_everyone);
+        if view_once {
+            pending = crate::content::into_view_once(pending)?;
+        }
+        let staged = self
+            .stage_outgoing(&client, &chat.parse()?, &pending, media, None)
+            .await?;
+        if let Some(early) = early {
+            let _ = early.send(staged.clone());
+        }
+        let uploaded = client
+            .upload(bytes, media_type, Default::default())
             .await
+            .map_err(anyhow::Error::from)
+            .and_then(build);
+        self.send_uploaded(client, staged, uploaded, turn).await
     }
 
     pub(crate) async fn send_prepared(
@@ -1579,7 +1702,9 @@ impl Service {
         message: wa::Message,
         media: Option<Vec<u8>>,
     ) -> Result<Message> {
-        let staged = self.stage_outgoing(&client, &jid, &message, media).await?;
+        let staged = self
+            .stage_outgoing(&client, &jid, &message, media, None)
+            .await?;
         self.send_staged(client, staged, message).await
     }
 
@@ -1590,11 +1715,22 @@ impl Service {
         jid: &whatsapp_rust::Jid,
         message: &wa::Message,
         media: Option<Vec<u8>>,
+        id: Option<String>,
     ) -> Result<Message> {
         self.archive.allow_chat(&jid.to_string()).await?;
         let chat = self.archive.canonical_chat(&jid.to_string()).await?;
-        let id = client.generate_message_id();
-        let mut row = outgoing(chat, id.to_string(), message);
+        let id = match id {
+            // The interface already shows the message under this id.
+            Some(id) => {
+                ensure!(
+                    self.archive.outgoing_view(&chat, &id).await?.is_none(),
+                    "Message ID already belongs to another message"
+                );
+                id
+            }
+            None => client.generate_message_id().to_string(),
+        };
+        let mut row = outgoing(chat, id, message);
         row.view.status = "sending".into();
         let mut view = row.view.clone();
         self.archive.store_messages(vec![row], true).await?;
@@ -2120,4 +2256,49 @@ pub(crate) async fn ingest_history(archive: &Archive, history: &wa::HistorySync)
         }
     }
     Ok(())
+}
+
+/// The message a media send shows as sending while it uploads: its kind, type, caption
+/// and size, without a location yet. The upload's message replaces it when it is sent.
+fn not_uploaded(kind: &str, mime: &str, caption: &str, name: &str, length: usize) -> wa::Message {
+    let mut proto = wa::Message::default();
+    let length = Some(length as u64);
+    match kind {
+        "image" => {
+            let mut m = wa::message::ImageMessage::default();
+            m.mimetype = Some(mime.into());
+            m.caption = Some(caption.into()).filter(|c: &String| !c.is_empty());
+            m.file_length = length;
+            proto.image_message = MessageField::some(m);
+        }
+        "video" => {
+            let mut m = wa::message::VideoMessage::default();
+            m.mimetype = Some(mime.into());
+            m.caption = Some(caption.into()).filter(|c: &String| !c.is_empty());
+            m.file_length = length;
+            proto.video_message = MessageField::some(m);
+        }
+        "audio" => {
+            let mut m = wa::message::AudioMessage::default();
+            m.mimetype = Some(mime.into());
+            m.ptt = Some(false);
+            m.file_length = length;
+            proto.audio_message = MessageField::some(m);
+        }
+        "sticker" => {
+            let mut m = wa::message::StickerMessage::default();
+            m.mimetype = Some(mime.into());
+            m.file_length = length;
+            proto.sticker_message = MessageField::some(m);
+        }
+        _ => {
+            let mut m = wa::message::DocumentMessage::default();
+            m.mimetype = Some(mime.into());
+            m.caption = Some(caption.into()).filter(|c: &String| !c.is_empty());
+            m.file_name = Some(name.into());
+            m.file_length = length;
+            proto.document_message = MessageField::some(m);
+        }
+    }
+    proto
 }

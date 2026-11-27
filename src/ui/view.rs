@@ -486,7 +486,6 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
     if let Some(contact) = details::contact_modal(s) {
         layer.push(contact);
     }
-    layer.extend(media::menu(s));
     layer.extend(actions::reaction_picker(s));
     if let Some(picker) = actions::forward_picker(s) {
         layer.push(picker);
@@ -494,6 +493,8 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
     if let Some(viewer) = super::stories::viewer(s).or_else(|| media::viewer(s)) {
         layer.push(viewer);
     }
+    // Above the media viewer, which opens the same menu with a right click.
+    layer.extend(media::menu(s));
     if let Some(diagnostics) = super::diagnostics::modal(s) {
         layer.push(diagnostics);
     }

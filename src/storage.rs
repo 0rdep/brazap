@@ -168,8 +168,11 @@ impl Archive {
             whatsapp_rust::store::SqliteDatabaseConfig {
                 synchronous: whatsapp_rust::store::Synchronous::Full,
                 // A selected conversation should not queue behind the full
-                // sidebar refresh or history ingestion's identity lookups.
-                read_pool_size: 2,
+                // sidebar refresh or history ingestion's identity lookups. The
+                // library's own session and app-state reads share these slots, and
+                // the start's replay and offline decryption kept the snapshot
+                // waiting past its deadline with two.
+                read_pool_size: 4,
                 ..Default::default()
             },
         )
