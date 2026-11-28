@@ -610,6 +610,7 @@ impl Service {
         kind: String,
         caption: String,
         view_once: bool,
+        album: Option<String>,
     ) -> Result<Message> {
         let path = std::path::Path::new(&path);
         let meta = tokio::fs::metadata(path)
@@ -663,6 +664,9 @@ impl Service {
                 proto.document_message = MessageField::some(m);
             }
             _ => anyhow::bail!("Unsupported attachment kind"),
+        }
+        if let Some(album) = &album {
+            crate::content::join_album(&mut proto, &chat, album);
         }
         if view_once {
             let proto = crate::content::into_view_once(proto)?;

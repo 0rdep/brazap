@@ -428,6 +428,20 @@ pub struct VoiceUpload {
     pub view_once: bool,
 }
 
+/// One photo or video of an album to send, with its own caption.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AlbumItem {
+    pub path: String,
+    pub kind: String,
+    #[serde(default)]
+    pub caption: String,
+    /// Members tagged in the caption (`@<number>` in the text), and whether it tags everyone.
+    #[serde(default)]
+    pub mentions: Vec<String>,
+    #[serde(default)]
+    pub mention_everyone: bool,
+}
+
 impl Message {
     pub fn is_call(&self) -> bool {
         matches!(self.kind.as_str(), "call" | "voice_call" | "video_call")

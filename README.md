@@ -181,10 +181,12 @@ On macOS, use `/Applications/Brazap.app/Contents/MacOS/brazap` as `command`; wit
 | Read and discover | Send and act |
 | --- | --- |
 | `get_status`, `list_chats`, `list_calls` | `send_message`, `react_message` |
-| `search`, `read_messages`, `sticker_catalog` | `forward_messages`, `send_attachment` |
+| `search`, `read_messages`, `sticker_catalog` | `forward_messages`, `send_attachment`, `send_album` |
 | `get_current_call` | `start_call`, `answer_call`, `end_call`, `mute_call`, `camera_call` |
 | `list_statuses`, `next_audio`, `transcribe_audio` | `view_status`, `reply_status` |
 | | `send_sticker`, `save_attachment`, `edit_message` |
+
+`send_album` sends 2 to 100 photos and videos as one album, like the desktop does when you attach several. WhatsApp has no caption for an album itself: each item may carry its own, and the album's caption usually goes on the first.
 
 `send_attachment` (images and videos) and `send_voice` accept `view_once: true` to send view-once media. Brazap keeps no copy of it: messages show `kind: "view_once"` without media, and saving or forwarding them is refused. Received view-once media opens only on your phone, as in WhatsApp's other linked devices.
 

@@ -1552,8 +1552,67 @@ impl Service {
             mentions,
             mention_everyone,
             None,
+            None,
         )
         .await
+    }
+
+    /// Opens an album in `chat` for `images` photos and `videos` videos, which follow
+    /// with [`Self::send_attachment_with`] under the returned album id.
+    pub async fn start_album(&self, chat: String, images: u32, videos: u32) -> Result<String> {
+        self.archive.allow_chat(&chat).await?;
+        ensure!(
+            (2..=100).contains(&(images + videos)),
+            "An album needs between 2 and 100 photos and videos"
+        );
+        let message = crate::content::album(images, videos);
+        if self.config.demo {
+            return Ok(self.demo_send(chat, message, None).await?.id);
+        }
+        let client = self.connected().await?;
+        let turn = self.send_order.ticket();
+        turn.wait().await;
+        Ok(self
+            .send_prepared(client, chat.parse()?, message, None)
+            .await?
+            .id)
+    }
+
+    /// Sends photos and videos together as one album. Each item keeps its own caption,
+    /// as WhatsApp has no caption for the album itself.
+    pub async fn send_album(
+        &self,
+        chat: String,
+        items: Vec<crate::model::AlbumItem>,
+    ) -> Result<Vec<Message>> {
+        ensure!(
+            items
+                .iter()
+                .all(|item| matches!(item.kind.as_str(), "image" | "video")),
+            "Albums hold only photos and videos"
+        );
+        let videos = items.iter().filter(|item| item.kind == "video").count() as u32;
+        let album = self
+            .start_album(chat.clone(), items.len() as u32 - videos, videos)
+            .await?;
+        let mut sent = Vec::with_capacity(items.len());
+        for item in items {
+            sent.push(
+                self.send_attachment_with(
+                    chat.clone(),
+                    item.path,
+                    item.kind,
+                    item.caption,
+                    false,
+                    item.mentions,
+                    item.mention_everyone,
+                    Some(album.clone()),
+                    None,
+                )
+                .await?,
+            );
+        }
+        Ok(sent)
     }
 
     /// [`Self::send_attachment`]; `early` gets the message as soon as it shows as sending.
@@ -1567,10 +1626,18 @@ impl Service {
         view_once: bool,
         mentions: Vec<String>,
         mention_everyone: bool,
+        album: Option<String>,
         early: Option<tokio::sync::oneshot::Sender<Message>>,
     ) -> Result<Message> {
         self.archive.allow_chat(&chat).await?;
         ensure!(caption.len() <= 65_536, "Message is too long");
+        ensure!(
+            album.is_none() || (matches!(kind.as_str(), "image" | "video") && !view_once),
+            "Albums hold only photos and videos that are not view once"
+        );
+        if let Some(album) = &album {
+            crate::outbox::checked_id(album.clone())?;
+        }
         ensure!(
             mentions.len() <= 1024
                 && mentions
@@ -1590,7 +1657,7 @@ impl Service {
         );
         if self.config.demo {
             return self
-                .demo_attachment(chat, path, kind, caption, view_once)
+                .demo_attachment(chat, path, kind, caption, view_once, album)
                 .await;
         }
         let client = self.connected().await?;
@@ -1668,6 +1735,9 @@ impl Service {
             };
             let mut message = message;
             crate::content::tag_caption(&mut message, mentions.clone(), mention_everyone);
+            if let Some(album) = &album {
+                crate::content::join_album(&mut message, &chat, album);
+            }
             // Like WhatsApp, keep no copy of view-once media after sending it.
             if view_once {
                 crate::content::into_view_once(message)
@@ -1678,6 +1748,9 @@ impl Service {
         let media = (!view_once).then(|| bytes.clone());
         let mut pending = not_uploaded(&kind, &mime, &caption, &name, bytes.len());
         crate::content::tag_caption(&mut pending, mentions.clone(), mention_everyone);
+        if let Some(album) = &album {
+            crate::content::join_album(&mut pending, &chat, album);
+        }
         if view_once {
             pending = crate::content::into_view_once(pending)?;
         }
@@ -1771,6 +1844,8 @@ impl Service {
         row.view.has_media = staged.has_media;
         self.archive.replace_staged(&row).await?;
         let mut view = row.view;
+        // The archive keeps album items as they are received; the wire wraps them.
+        let message = crate::content::album_wire(message);
         let request = whatsapp_rust::SendRequest::new(&jid, message).with_options(
             whatsapp_rust::SendOptions::default()
                 .with_message_id(whatsapp_rust::MessageId::new(id.clone())?),

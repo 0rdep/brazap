@@ -354,29 +354,51 @@ pub async fn call(service: &Arc<Service>, name: &str, args: Value) -> Result<Val
                 .get("mention_everyone")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let message = if args.get("early").and_then(Value::as_bool).unwrap_or(false) {
-                service
-                    .send_early(move |service, staged| async move {
-                        service
-                            .send_attachment_with(
-                                chat,
-                                path,
-                                kind,
-                                caption,
-                                view_once,
-                                mentions,
-                                everyone,
-                                Some(staged),
-                            )
-                            .await
-                    })
-                    .await?
-            } else {
-                service
-                    .send_attachment(chat, path, kind, caption, view_once, mentions, everyone)
-                    .await?
-            };
+            // The album opened by `start_album` this photo or video belongs to.
+            let album = args.get("album").and_then(Value::as_str).map(str::to_owned);
+            let early = args.get("early").and_then(Value::as_bool).unwrap_or(false);
+            let message = service
+                .send_early(move |service, staged| async move {
+                    service
+                        .send_attachment_with(
+                            chat,
+                            path,
+                            kind,
+                            caption,
+                            view_once,
+                            mentions,
+                            everyone,
+                            album,
+                            early.then_some(staged),
+                        )
+                        .await
+                })
+                .await?;
             Ok(json!({"message":message}))
+        }
+        "start_album" => {
+            let count = |key: &str| -> Result<u32> {
+                Ok(u32::try_from(
+                    args.get(key).and_then(Value::as_u64).unwrap_or(0),
+                )?)
+            };
+            let album = service
+                .start_album(
+                    text_arg(&args, "chat")?.into(),
+                    count("images")?,
+                    count("videos")?,
+                )
+                .await?;
+            Ok(json!({"album":album}))
+        }
+        "send_album" => {
+            let items: Vec<crate::model::AlbumItem> = serde_json::from_value(
+                args.get("items").cloned().context("items must be a list")?,
+            )?;
+            let messages = service
+                .send_album(text_arg(&args, "chat")?.into(), items)
+                .await?;
+            Ok(json!({"messages":messages}))
         }
         "save_attachment" => {
             service
@@ -652,6 +674,13 @@ pub(crate) fn tools() -> Value {
             "Upload and send a local file as an image, video, audio file, WebP sticker, or document. Captions are supported for images, videos, and documents. Images and videos can be sent view once: the recipient can open them only once, and Brazap keeps no copy and shows only a placeholder.",
             json!({"chat":{"type":"string"},"path":{"type":"string"},"kind":{"type":"string","enum":["image","video","audio","sticker","file"]},"caption":{"type":"string"},"view_once":{"type":"boolean","description":"Send an image or video as view once; rejected for other kinds"}}),
             vec!["chat", "path", "kind"],
+            false,
+        ),
+        (
+            "send_album",
+            "Upload and send 2 to 100 local photos and videos together as one album, in order. WhatsApp has no caption for the album itself: each item may have its own caption, and an album caption is usually given on its first item. Returns the sent photos and videos.",
+            json!({"chat":{"type":"string"},"items":{"type":"array","minItems":2,"maxItems":100,"items":{"type":"object","properties":{"path":{"type":"string"},"kind":{"type":"string","enum":["image","video"]},"caption":{"type":"string"}},"required":["path","kind"]}}}),
+            vec!["chat", "items"],
             false,
         ),
         (

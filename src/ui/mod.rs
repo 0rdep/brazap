@@ -36,7 +36,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rune::{App, AppSpec, Image, ImageCache, TextEdit, Tx, Waker};
 use serde_json::{Value, json};
 
@@ -902,10 +902,19 @@ async fn worker(
                     Some(Command::SendAttachments(generation,chat,uploads))=>{
                         let remote=remote.clone();let events=events.clone();let wake=wake.clone();
                         assets.spawn(async move {
+                            // Photos and videos sent together go as one album, opened before its first item.
+                            let videos=uploads.iter().filter(|u|u.album&&u.kind=="video").count();
+                            let images=uploads.iter().filter(|u|u.album).count()-videos;
+                            let mut album:Option<String>=None;
                             for upload in uploads {
-                                let result=remote.call("send_attachment",json!({"chat":chat,"path":upload.path,"kind":upload.kind,"caption":upload.caption,"view_once":upload.view_once,"mentions":upload.mentions,"mention_everyone":upload.mention_everyone,"early":true})).await
-                                    .and_then(|value|Ok(serde_json::from_value(value["message"].clone())?))
-                                    .map_err(|e|format!("{e:#}"));
+                                let result=async {
+                                    if upload.album&&album.is_none() {
+                                        let opened=remote.call("start_album",json!({"chat":chat,"images":images,"videos":videos})).await?;
+                                        album=Some(opened["album"].as_str().context("No album ID")?.to_owned());
+                                    }
+                                    let value=remote.call("send_attachment",json!({"chat":chat,"path":upload.path,"kind":upload.kind,"caption":upload.caption,"view_once":upload.view_once,"mentions":upload.mentions,"mention_everyone":upload.mention_everyone,"album":album.as_ref().filter(|_|upload.album),"early":true})).await?;
+                                    anyhow::Ok(serde_json::from_value(value["message"].clone())?)
+                                }.await.map_err(|e|format!("{e:#}"));
                                 let failed=result.is_err();
                                 emit(&events,&wake,Event::AttachmentSent(generation,upload.id,result));
                                 if failed { break; }

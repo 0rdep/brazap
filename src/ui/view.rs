@@ -1474,6 +1474,20 @@ fn message_bubble(s: &State, message: &Message) -> El {
                         .min_w(0.0),
                 ),
         );
+    } else if message.album.is_some()
+        && matches!(message.kind.as_str(), "image" | "video")
+        && media::album_items(s, message).len() > 1
+    {
+        // WhatsApp has no caption for an album itself: each photo or video may carry
+        // one, often only the first or the last. Show them all under the album.
+        for item in media::album_items(s, message) {
+            if !item.text.is_empty() {
+                let context = item.clone();
+                bubble = bubble.child(super::links::message_text(item, 14.0).on_secondary_press(
+                    move |s: &mut State, p, _| s.message_menu(context.clone(), p),
+                ));
+            }
+        }
     } else if !message.is_call() && !message.text.is_empty() && message.contacts.is_empty() {
         // Text follows the attachment, so captions sit under their media.
         let context = message.clone();

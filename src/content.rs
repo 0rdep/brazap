@@ -719,6 +719,52 @@ pub(crate) fn into_view_once(mut message: wa::Message) -> anyhow::Result<wa::Mes
     Ok(wrapped)
 }
 
+/// The message that opens an album: how many photos and videos follow it. WhatsApp
+/// keeps no caption here; each photo or video carries its own.
+pub(crate) fn album(images: u32, videos: u32) -> wa::Message {
+    let mut album = wa::message::AlbumMessage::default();
+    album.expected_image_count = Some(images);
+    album.expected_video_count = Some(videos);
+    let mut message = wa::Message::default();
+    message.album_message = MessageField::some(album);
+    message
+}
+
+/// Marks a photo or video as an item of the album `parent` sent to `chat`, the way
+/// album items are received and archived.
+pub(crate) fn join_album(message: &mut wa::Message, chat: &str, parent: &str) {
+    let mut key = wa::MessageKey::default();
+    key.remote_jid = Some(chat.into());
+    key.from_me = Some(true);
+    key.id = Some(parent.into());
+    let mut association = wa::MessageAssociation::default();
+    association.association_type = Some(wa::message_association::AssociationType::MEDIA_ALBUM);
+    association.parent_message_key = MessageField::some(key);
+    message
+        .message_context_info
+        .get_or_insert_default()
+        .message_association = MessageField::some(association);
+}
+
+/// An album item as WhatsApp Web sends it: wrapped in `associatedChildMessage`, with the
+/// album link beside it. Other messages are sent as they are.
+pub(crate) fn album_wire(message: wa::Message) -> wa::Message {
+    let parent = message
+        .message_context_info
+        .as_option()
+        .and_then(|info| info.message_association.as_option())
+        .filter(|a| {
+            a.association_type == Some(wa::message_association::AssociationType::MEDIA_ALBUM)
+        })
+        .and_then(|a| a.parent_message_key.as_option().cloned());
+    match parent {
+        Some(parent) if message.associated_child_message.is_unset() => {
+            whatsapp_rust::proto_helpers::wrap_as_album_child(message, parent)
+        }
+        _ => message,
+    }
+}
+
 pub(crate) const VIEW_ONCE_KINDS: &str =
     "Only photos, videos and voice messages can be sent as view once";
 

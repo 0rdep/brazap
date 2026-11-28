@@ -56,6 +56,9 @@ pub(super) struct Panel {
     total: usize,
     /// Send the whole batch as view once. Off whenever the preview opens.
     view_once: bool,
+    /// The item whose caption took the composer's text when the preview opened; the
+    /// text goes back to the composer if the preview is cancelled.
+    from_draft: Option<u64>,
 }
 
 impl Panel {
@@ -66,6 +69,18 @@ impl Panel {
                 .items
                 .iter()
                 .all(|item| matches!(item.kind, "image" | "video"))
+    }
+
+    /// Two or more photos and videos are sent together as one album, as phones do.
+    /// View-once media is always sent one by one.
+    fn album(&self) -> bool {
+        !(self.view_once && self.view_once_allowed())
+            && self
+                .items
+                .iter()
+                .filter(|item| matches!(item.kind, "image" | "video"))
+                .count()
+                >= 2
     }
 
     pub(super) fn caption_available(&self) -> bool {
@@ -86,6 +101,8 @@ pub(super) struct Upload {
     /// Members tagged in the caption, and whether it tags everyone.
     pub mentions: Vec<String>,
     pub mention_everyone: bool,
+    /// Sent as an item of the batch's album.
+    pub album: bool,
 }
 
 fn classify(path: &std::path::Path, document: bool) -> &'static str {
@@ -301,8 +318,19 @@ impl State {
                 sent: 0,
                 total: 0,
                 view_once: false,
+                from_draft: None,
             });
         }
+        // Text typed in the composer before attaching becomes the caption, as on phones;
+        // a message being edited stays in the composer.
+        let mut draft = (self.attachments.as_ref().unwrap().items.is_empty()
+            && self.editing.is_none()
+            && !self.draft.text.trim().is_empty())
+        .then(|| std::mem::take(&mut self.draft.text));
+        if draft.is_some() {
+            self.draft.clear();
+        }
+        let chat = self.selected.clone().unwrap();
         let panel = self.attachments.as_mut().unwrap();
         for source in sources {
             let path = match &source {
@@ -324,6 +352,21 @@ impl State {
             };
             let mut caption = TextEdit::new("");
             caption.focused = panel.items.is_empty();
+            if kind != "audio"
+                && let Some(text) = draft.take()
+            {
+                caption = TextEdit::new(text);
+                caption.focused = true;
+                panel.from_draft = Some(id);
+                panel.selected = panel.items.len();
+                if let Some(mentions) = self.draft_mentions.remove(&chat) {
+                    self.draft_mentions
+                        .insert(super::mentions::caption_key(id), mentions);
+                }
+                if let Some(item) = panel.items.iter_mut().find(|item| item.caption.focused) {
+                    item.caption.focused = false;
+                }
+            }
             panel.items.push(Item {
                 id,
                 source: path,
@@ -341,6 +384,10 @@ impl State {
             {
                 panel.items.last_mut().unwrap().error = Some("The local service stopped".into());
             }
+        }
+        // Audio files have no caption: the text stays in the composer.
+        if let Some(text) = draft {
+            self.draft = TextEdit::new(text);
         }
     }
 
@@ -378,7 +425,35 @@ impl State {
         if self.attachments.as_ref().is_some_and(|p| p.sending) {
             return;
         }
-        self.attachments = None;
+        // The caption that came from the composer goes back to its chat's draft, as last
+        // edited, unless a new draft was started there.
+        if let Some(panel) = self.attachments.take()
+            && let Some(id) = panel.from_draft
+            && let Some(item) = panel.items.iter().find(|item| item.id == id)
+            && !item.caption.text.trim().is_empty()
+        {
+            let text = item.caption.text.clone();
+            let restored = if self.selected.as_ref() == Some(&panel.chat) {
+                let empty = self.draft.text.is_empty();
+                if empty {
+                    self.draft = TextEdit::new(text);
+                }
+                empty
+            } else {
+                let saved = self.drafts.entry(panel.chat.clone()).or_default();
+                let empty = saved.is_empty();
+                if empty {
+                    *saved = text;
+                }
+                empty
+            };
+            let mentions = self
+                .draft_mentions
+                .remove(&super::mentions::caption_key(id));
+            if restored && let Some(mentions) = mentions {
+                self.draft_mentions.insert(panel.chat.clone(), mentions);
+            }
+        }
         self.draft.focused = true;
         if self.picker.for_attachment {
             self.picker.open = false;
@@ -390,6 +465,10 @@ impl State {
             return;
         };
         if panel.sending {
+            return;
+        }
+        if panel.items.len() == 1 {
+            self.cancel_attachments();
             return;
         }
         panel.items.remove(panel.selected);
@@ -431,6 +510,7 @@ impl State {
             return;
         }
         let view_once = panel.view_once && panel.view_once_allowed();
+        let album = panel.album();
         let mut uploads = Vec::new();
         for item in &mut panel.items {
             let prepared = item.prepared.as_ref().unwrap();
@@ -450,6 +530,7 @@ impl State {
                 view_once,
                 mentions: mentions.into_iter().map(|m| m.jid).collect(),
                 mention_everyone,
+                album: album && matches!(prepared.kind, "image" | "video"),
             });
         }
         panel.total = uploads.len();
